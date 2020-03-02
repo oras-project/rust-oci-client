@@ -1,5 +1,5 @@
 [package]
-name = "krustlet"
+name = "wasi-provider"
 version = "0.1.0"
 authors = [
     "Matt Butcher <matt.butcher@microsoft.com>",
@@ -14,20 +14,4 @@ edition = "2018"
 
 [dependencies]
 kube = { version = "0.16.1", features = ["openapi"] }
-env_logger = "0.6"
-failure = "0.1"
-kubelet = { path = "./crates/kubelet", version = "0.1.0" }
-wascc-provider = { path = "./crates/wascc-provider", version = "0.1.0" }
-
-[workspace]
-members = [
-    "crates/*"
-]
-
-[[bin]]
-name = "krustlet-wascc"
-path = "src/krustlet-wascc.rs"
-
-[[bin]]
-name = "krustlet-wasi"
-path = "src/krustlet-wasi.rs"
+log = "0.4"

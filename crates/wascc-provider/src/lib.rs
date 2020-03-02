@@ -1,8 +1,9 @@
-use crate::{
-    kubelet::{Phase, Provider, Status},
-    pod::{pod_status, KubePod},
-};
+#[macro_use]
+extern crate failure;
+
 use kube::client::APIClient;
+use kubelet::pod::{pod_status, KubePod};
+use kubelet::{Phase, Provider, Status};
 use log::info;
 use std::collections::HashMap;
 use wascc_host::{host, Actor, NativeCapability};
@@ -17,15 +18,15 @@ const TARGET_WASM32_WASI: &str = "wasm32-wasi";
 
 type EnvVars = std::collections::HashMap<String, String>;
 
-/// WasmRuntime provides a Kubelet runtime implementation that executes WASM binaries.
+/// WasmProvider provides a Kubelet runtime implementation that executes WASM binaries.
 ///
 /// Currently, this runtime uses WASCC as a host, loading the primary container as an actor.
 /// TODO: In the future, we will look at loading capabilities using the "sidecar" metaphor
 /// from Kubernetes.
 #[derive(Clone)]
-pub struct WasmRuntime {}
+pub struct WasccProvider {}
 
-impl Provider for WasmRuntime {
+impl Provider for WasccProvider {
     fn init(&self) -> Result<(), failure::Error> {
         let httplib = "./lib/libwascc_httpsrv.dylib";
         // The match is to unwrap an error from a thread and convert it to a type that
@@ -251,7 +252,7 @@ mod test {
     use k8s_openapi::api::core::v1::PodSpec;
     #[test]
     fn test_can_schedule() {
-        let wr = WasmRuntime {};
+        let wr = WasmProvider {};
         let mut mock = KubePod {
             spec: Default::default(),
             metadata: Default::default(),
