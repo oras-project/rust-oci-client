@@ -1,6 +1,7 @@
 use env_logger;
-use krustlet::{kubelet::Kubelet, wasm::WasmRuntime};
 use kube::config;
+use kubelet::Kubelet;
+use wascc_provider::WasccProvider;
 
 fn main() -> Result<(), failure::Error> {
     // Read the environment. Note that this tries a KubeConfig file first, then
@@ -19,7 +20,7 @@ fn main() -> Result<(), failure::Error> {
 
     // The provider is responsible for all the "back end" logic. If you are creating
     // a new Kubelet, all you need to implement is a provider.
-    let provider = WasmRuntime {};
+    let provider = WasccProvider {};
     let kubelet = Kubelet::new(provider, kubeconfig, namespace);
     kubelet.start(address)
 }
