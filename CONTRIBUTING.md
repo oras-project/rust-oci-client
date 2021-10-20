@@ -11,10 +11,10 @@ attest that you have the right to contribute that code. This is done with the
 
 ## Pull Request Management
 
-All code that is contributed to Krustlet must go through the Pull Request (PR)
-process. To contribute a PR, fork this project, create a new branch, make
-changes on that branch, and then use GitHub to open a pull request with your
-changes.
+All code that is contributed to oci-distribution must go through the Pull
+Request (PR) process. To contribute a PR, fork this project, create a new
+branch, make changes on that branch, and then use GitHub to open a pull request
+with your changes.
 
 Every PR must be reviewed by at least one Core Maintainer of the project. Once
 a PR has been marked "Approved" by a Core Maintainer (and no other core

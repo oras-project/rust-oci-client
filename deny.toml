@@ -8,7 +8,6 @@ ignore = [
 
 confidence-threshold = 1.0
 copyleft = "deny"
-
 unlicensed = "deny"
 allow-osi-fsf-free = "both"
 default = "deny"
@@ -43,21 +42,6 @@ name = "webpki"
 expression = "LicenseRef-webpki"
 license-files = [
     { path = "LICENSE", hash = 0x001c7e6c },
-]
-
-# TODO: Remove these once we bump krustlet
-[[licenses.clarify]]
-name = "krator"
-expression = "LicenseRef-krator"
-license-files = [
-    { path = "LICENSE", hash = 0x62365415 },
-]
-
-[[licenses.clarify]]
-name = "krator-derive"
-expression = "LicenseRef-krator-derive"
-license-files = [
-    { path = "LICENSE", hash = 0x62365415 },
 ]
 
 [bans]

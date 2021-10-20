@@ -1,25 +1,14 @@
-[![CII Best
-Practices](https://bestpractices.coreinfrastructure.org/projects/5292/badge)](https://bestpractices.coreinfrastructure.org/projects/5292)
+# OCI Distribution
 
-# Krustlet: Kubernetes Kubelet in Rust for running WASM
+[![oci-distribution documentation](https://docs.rs/oci-distribution/badge.svg)](https://docs.rs/oci-distribution)
 
-:postal_horn: Krustlet 1.0 coming soon!
+This Rust library implements the
+[OCI Distribution specification](https://github.com/opencontainers/distribution-spec/blob/master/spec.md),
+which is the protocol that Docker Hub and other container registries use.
 
-Krustlet acts as a Kubelet by listening on the event stream for new pods that
-the scheduler assigns to it based on specific Kubernetes
-[tolerations](https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/).
-
-The default implementation of Krustlet listens for the architecture
-`wasm32-wasi` and schedules those workloads to run in a `wasmtime`-based runtime
-instead of a container runtime.
-
-## Documentation
-
-If you're new to the project, get started with [the
-introduction](https://docs.krustlet.dev/intro). For more in-depth information about
-Krustlet, plunge right into the [topic guides](https://docs.krustlet.dev/topics).
-
-Looking for the developer guide? [Start here](https://docs.krustlet.dev/community/developers).
+The immediate goal of this crate is to provide a way to pull WASM modules from
+a Docker registry. However, our broader goal is to implement the spec in its
+entirety.
 
 ## Community, discussion, contribution, and support
 
