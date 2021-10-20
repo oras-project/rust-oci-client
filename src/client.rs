@@ -16,7 +16,7 @@ use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, To
 use anyhow::{anyhow, Context};
 use futures_util::future;
 use futures_util::stream::StreamExt;
-use hyperx::header::Header;
+use hyperx::header::{Header, Raw};
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use sha2::Digest;
@@ -296,7 +296,7 @@ impl Client {
             None => return Ok(()),
         };
 
-        let auth = WwwAuthenticate::parse_header(&dist_hdr.as_bytes().into())?;
+        let auth = WwwAuthenticate::parse_header(&Raw::from(dist_hdr.as_bytes()))?;
         // If challenge_opt is not set it means that no challenge was present, even though the header
         // was present.
         let challenge_opt = match auth.get::<BearerChallenge>() {
