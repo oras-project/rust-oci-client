@@ -5,8 +5,15 @@ use std::collections::HashMap;
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 /// The mediatype for a WASM image config.
 pub const WASM_CONFIG_MEDIA_TYPE: &str = "application/vnd.wasm.config.v1+json";
-/// The mediatype for an OCI manifest.
+/// The mediatype for an docker v2 schema 2 manifest.
 pub const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
+/// The mediatype for an docker v2 shema 2 manifest list.
+pub const IMAGE_MANIFEST_LIST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
+/// The mediatype for an OCI image index manifest.
+pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+/// The mediatype for an OCI image manifest.
+pub const OCI_IMAGE_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 /// The mediatype for an image config (manifest).
 pub const IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 /// The mediatype that Docker uses for image configs.
@@ -27,13 +34,23 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
 
 // TODO: Annotation key constants. https://github.com/opencontainers/image-spec/blob/master/annotations.md#pre-defined-annotation-keys
 
-/// The OCI manifest describes an OCI image.
+/// An image, or image index, OCI manifest
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum OciManifest {
+    /// An OCI image manifest
+    Image(OciImageManifest),
+    /// An OCI image index manifest
+    ImageIndex(OciImageIndex),
+}
+
+/// The OCI image manifest describes an OCI image.
 ///
 /// It is part of the OCI specification, and is defined here:
-/// https://github.com/opencontainers/image-spec/blob/master/manifest.md
+/// https://github.com/opencontainers/image-spec/blob/main/manifest.md
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OciManifest {
+pub struct OciImageManifest {
     /// This is a schema version.
     ///
     /// The specification does not specify the width of this integer.
@@ -66,9 +83,9 @@ pub struct OciManifest {
     pub annotations: Option<HashMap<String, String>>,
 }
 
-impl Default for OciManifest {
+impl Default for OciImageManifest {
     fn default() -> Self {
-        OciManifest {
+        OciImageManifest {
             schema_version: 2,
             media_type: None,
             config: OciDescriptor::default(),
@@ -94,7 +111,7 @@ pub struct Versioned {
 /// The OCI descriptor is a generic object used to describe other objects.
 ///
 /// It is defined in the OCI Image Specification:
-/// https://github.com/opencontainers/image-spec/blob/master/descriptor.md#properties
+/// https://github.com/opencontainers/image-spec/blob/main/descriptor.md#properties
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
@@ -128,7 +145,7 @@ pub struct OciDescriptor {
 
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the annotation rules.
-    /// https://github.com/opencontainers/image-spec/blob/master/annotations.md#rules
+    /// https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -142,6 +159,107 @@ impl Default for OciDescriptor {
             annotations: None,
         }
     }
+}
+
+/// The image index is a higher-level manifest which points to specific image manifest.
+///
+/// It is part of the OCI specification, and is defined here:
+/// https://github.com/opencontainers/image-spec/blob/main/image-index.md
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciImageIndex {
+    /// This is a schema version.
+    ///
+    /// The specification does not specify the width of this integer.
+    /// However, the only version allowed by the specification is `2`.
+    /// So we have made this a u8.
+    pub schema_version: u8,
+
+    /// This is an optional media type describing this manifest.
+    ///
+    /// It is reserved for compatibility, but the specification does not seem
+    /// to recommend setting it.
+    pub media_type: Option<String>,
+
+    /// This property contains a list of manifests for specific platforms.
+    /// The spec says this field must be present but the value may be an empty array.
+    pub manifests: Vec<ImageIndexEntry>,
+}
+
+/// The manifest entry of an `ImageIndex`.
+///
+/// It is part of the OCI specification, and is defined in the `manifests`
+/// section here:
+/// https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageIndexEntry {
+    /// The media type of this descriptor.
+    ///
+    /// Layers, config, and manifests may all have descriptors. Each
+    /// is differentiated by its mediaType.
+    ///
+    /// This REQUIRED property contains the media type of the referenced
+    /// content. Values MUST comply with RFC 6838, including the naming
+    /// requirements in its section 4.2.
+    pub media_type: String,
+    /// The SHA 256 or 512 digest of the object this describes.
+    ///
+    /// This REQUIRED property is the digest of the targeted content, conforming
+    /// to the requirements outlined in Digests. Retrieved content SHOULD be
+    /// verified against this digest when consumed via untrusted sources.
+    pub digest: String,
+    /// The size, in bytes, of the object this describes.
+    ///
+    /// This REQUIRED property specifies the size, in bytes, of the raw
+    /// content. This property exists so that a client will have an expected
+    /// size for the content before processing. If the length of the retrieved
+    /// content does not match the specified length, the content SHOULD NOT be
+    /// trusted.
+    pub size: i64,
+    /// This OPTIONAL property describes the minimum runtime requirements of the image.
+    /// This property SHOULD be present if its target is platform-specific.
+    pub platform: Option<Platform>,
+
+    /// This OPTIONAL property contains arbitrary metadata for the image index.
+    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
+    pub annotations: Option<HashMap<String, String>>,
+}
+
+/// Platform specific fields of an Image Index manifest entry.
+///
+/// It is part of the OCI specification, and is in the `platform`
+/// section here:
+/// https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Platform {
+    /// This REQUIRED property specifies the CPU architecture.
+    /// Image indexes SHOULD use, and implementations SHOULD understand, values
+    /// listed in the Go Language document for [`GOARCH`](https://golang.org/doc/install/source#environment).
+    pub architecture: String,
+    /// This REQUIRED property specifies the operating system.
+    /// Image indexes SHOULD use, and implementations SHOULD understand, values
+    /// listed in the Go Language document for [`GOOS`](https://golang.org/doc/install/source#environment).
+    pub os: String,
+    /// This OPTIONAL property specifies the version of the operating system
+    /// targeted by the referenced blob.
+    /// Implementations MAY refuse to use manifests where `os.version` is not known
+    /// to work with the host OS version.
+    /// Valid values are implementation-defined. e.g. `10.0.14393.1066` on `windows`.
+    #[serde(rename = "os.version")]
+    pub os_version: Option<String>,
+    /// This OPTIONAL property specifies an array of strings, each specifying a mandatory OS feature.
+    /// When `os` is `windows`, image indexes SHOULD use, and implementations SHOULD understand the following values:
+    /// - `win32k`: image requires `win32k.sys` on the host (Note: `win32k.sys` is missing on Nano Server)
+    /// When `os` is not `windows`, values are implementation-defined and SHOULD be submitted to this specification for standardization.
+    #[serde(rename = "os.features")]
+    pub os_features: Option<Vec<String>>,
+    /// This OPTIONAL property specifies the variant of the CPU.
+    /// Image indexes SHOULD use, and implementations SHOULD understand, `variant` values listed in the [Platform Variants](#platform-variants) table.
+    pub variant: Option<String>,
+    /// This property is RESERVED for future versions of the specification.
+    pub features: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -170,7 +288,8 @@ mod test {
 
     #[test]
     fn test_manifest() {
-        let manifest: OciManifest = serde_json::from_str(TEST_MANIFEST).expect("parsed manifest");
+        let manifest: OciImageManifest =
+            serde_json::from_str(TEST_MANIFEST).expect("parsed manifest");
         assert_eq!(2, manifest.schema_version);
         assert_eq!(
             Some(IMAGE_MANIFEST_MEDIA_TYPE.to_owned()),

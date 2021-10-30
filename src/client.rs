@@ -5,8 +5,9 @@
 
 use crate::errors::*;
 use crate::manifest::{
-    OciDescriptor, OciManifest, Versioned, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-    IMAGE_MANIFEST_MEDIA_TYPE,
+    ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest, Versioned,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
 };
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
@@ -27,10 +28,10 @@ use tracing::{debug, trace, warn};
 use www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
-    "application/vnd.docker.distribution.manifest.v2+json",
-    // TODO: support manifest lists?
-    // "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.oci.image.manifest.v1+json",
+    IMAGE_MANIFEST_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
 ];
 
 /// The data for an image or module.
@@ -157,11 +158,11 @@ impl TryFrom<ClientConfig> for Client {
 impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
-        Client::try_from(config.clone()).unwrap_or_else(|err| {
+        Client::try_from(config).unwrap_or_else(|err| {
             warn!("Cannot create OCI client from config: {:?}", err);
             warn!("Creating client with default configuration");
             Self {
-                config,
+                config: ClientConfig::default(),
                 tokens: TokenCache::new(),
                 client: reqwest::Client::new(),
             }
@@ -189,7 +190,7 @@ impl Client {
             self.auth(image, auth, op).await?;
         }
 
-        let (manifest, digest) = self._pull_manifest(image).await?;
+        let (manifest, digest) = self._pull_image_manifest(image).await?;
 
         self.validate_layers(&manifest, accepted_media_types)
             .await?;
@@ -231,7 +232,7 @@ impl Client {
         config_data: &[u8],
         config_media_type: &str,
         auth: &RegistryAuth,
-        image_manifest: Option<OciManifest>,
+        image_manifest: Option<OciImageManifest>,
     ) -> anyhow::Result<String> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
@@ -259,7 +260,7 @@ impl Client {
             .await?;
 
         // Push config and manifest to registry
-        let manifest: OciManifest = match image_manifest {
+        let manifest: OciImageManifest = match image_manifest {
             Some(m) => m,
             None => self.generate_manifest(image_data, config_data, config_media_type),
         };
@@ -301,6 +302,7 @@ impl Client {
             Some(co) => co,
             None => {
                 // Fall back to HTTP Basic Auth
+                debug!("Falling back to HTTP Basic Auth");
                 if let RegistryAuth::Basic(username, password) = authentication {
                     self.tokens.insert(
                         image,
@@ -445,7 +447,7 @@ impl Client {
 
     async fn validate_layers(
         &self,
-        manifest: &OciManifest,
+        manifest: &OciImageManifest,
         accepted_media_types: Vec<&str>,
     ) -> anyhow::Result<()> {
         if manifest.layers.is_empty() {
@@ -469,7 +471,30 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciManifest](crate::manifest::OciManifest)
+    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest)
+    /// and the manifest content digest hash.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    pub async fn pull_image_manifest(
+        &mut self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> anyhow::Result<(OciImageManifest, String)> {
+        let op = RegistryOperation::Pull;
+        if !self.tokens.contains_key(image, op) {
+            self.auth(image, auth, op).await?;
+        }
+
+        self._pull_image_manifest(image).await
+    }
+
+    /// Pull a manifest from the remote OCI Distribution service.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// A Tuple is returned containing the [Manifest](crate::manifest::Manifest)
     /// and the manifest content digest hash.
     pub async fn pull_manifest(
         &mut self,
@@ -482,6 +507,55 @@ impl Client {
         }
 
         self._pull_manifest(image).await
+    }
+
+    /// Pull an image manifest from the remote OCI Distribution service.
+    ///
+    /// If the connection has already gone through authentication, this will
+    /// use the bearer token. Otherwise, this will attempt an anonymous pull.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    async fn _pull_image_manifest(
+        &self,
+        image: &Reference,
+    ) -> anyhow::Result<(OciImageManifest, String)> {
+        let (manifest, digest) = self._pull_manifest(image).await?;
+        match manifest {
+            OciManifest::Image(image_manifest) => Ok((image_manifest, digest)),
+            OciManifest::ImageIndex(image_index_manifest) => {
+                debug!("Inspecting Image Index Manifest");
+                let digest = if let Some(resolver) = &self.config.platform_resolver {
+                    resolver(&image_index_manifest.manifests)
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
+                    ));
+                };
+
+                match digest {
+                    Some(digest) => {
+                        debug!("Selected manifest entry with digest: {}", digest);
+                        let manifest_entry_reference = Reference::with_digest(
+                            image.registry().to_string(),
+                            image.repository().to_string(),
+                            digest.clone(),
+                        );
+                        self._pull_manifest(&manifest_entry_reference)
+                            .await
+                            .and_then(|(manifest, _digest)| match manifest {
+                                OciManifest::Image(manifest) => Ok((manifest, digest)),
+                                OciManifest::ImageIndex(_) => Err(anyhow::anyhow!(
+                                    "Expected Image Manifest, received Image Index manifest."
+                                )),
+                            })
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "No entry found in image index manifest matching client's default platform"
+                    )),
+                }
+            }
+        }
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -510,10 +584,10 @@ impl Client {
 
                 self.validate_image_manifest(&text).await?;
 
-                debug!("Parsing response as OciManifest: {}", text);
-                let manifest: OciManifest = serde_json::from_str(&text).with_context(|| {
+                debug!("Parsing response as Manifest: {}", text);
+                let manifest = serde_json::from_str(&text).with_context(|| {
                     format!(
-                        "Failed to parse response from pulling manifest for '{:?}' as an OciManifest",
+                        "Failed to parse response from pulling manifest for '{:?}' as a Manifest",
                         image
                     )
                 })?;
@@ -545,7 +619,9 @@ impl Client {
             ));
         }
         if let Some(media_type) = versioned.media_type {
-            if media_type != IMAGE_MANIFEST_MEDIA_TYPE {
+            if media_type != IMAGE_MANIFEST_MEDIA_TYPE
+                && media_type != IMAGE_MANIFEST_LIST_MEDIA_TYPE
+            {
                 return Err(anyhow::anyhow!("unsupported media type: {}", media_type));
             }
         }
@@ -558,14 +634,14 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciManifest](crate::manifest::OciManifest),
+    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest),
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
     pub async fn pull_manifest_and_config(
         &mut self,
         image: &Reference,
         auth: &RegistryAuth,
-    ) -> anyhow::Result<(OciManifest, String, String)> {
+    ) -> anyhow::Result<(OciImageManifest, String, String)> {
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
             self.auth(image, auth, op).await?;
@@ -577,8 +653,8 @@ impl Client {
     async fn _pull_manifest_and_config(
         &mut self,
         image: &Reference,
-    ) -> anyhow::Result<(OciManifest, String, String)> {
-        let (manifest, digest) = self._pull_manifest(image).await?;
+    ) -> anyhow::Result<(OciImageManifest, String, String)> {
+        let (manifest, digest) = self._pull_image_manifest(image).await?;
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
@@ -718,17 +794,12 @@ impl Client {
     async fn push_manifest(
         &self,
         image: &Reference,
-        manifest: &OciManifest,
+        manifest: &OciImageManifest,
     ) -> anyhow::Result<String> {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Type",
-            "application/vnd.oci.image.manifest.v1+json"
-                .parse()
-                .unwrap(),
-        );
+        headers.insert("Content-Type", OCI_IMAGE_MEDIA_TYPE.parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
@@ -790,8 +861,8 @@ impl Client {
         image_data: &ImageData,
         config_data: &[u8],
         config_media_type: &str,
-    ) -> OciManifest {
-        let mut manifest = OciManifest::default();
+    ) -> OciImageManifest {
+        let mut manifest = OciImageManifest::default();
 
         manifest.config.media_type = config_media_type.to_string();
         manifest.config.size = config_data.len() as i64;
@@ -976,7 +1047,6 @@ pub struct Certificate {
 }
 
 /// A client configuration
-#[derive(Debug, Clone, Default)]
 pub struct ClientConfig {
     /// Which protocol the client should use
     pub protocol: ClientProtocol,
@@ -991,6 +1061,86 @@ pub struct ClientConfig {
     /// A list of extra root certificate to trust. This can be used to connect
     /// to servers using self-signed certificates
     pub extra_root_certificates: Vec<Certificate>,
+
+    /// A function that defines the client's behaviour if an Image Index Manifest
+    /// (i.e Manifest List) is encountered when pulling an image.
+    /// Defaults to [current_platform_resolver](self::current_platform_resolver),
+    /// which attempts to choose an image matching the running OS and Arch.
+    ///
+    /// If set to None, an error is raised if an Image Index manifest is received
+    /// during an image pull.
+    pub platform_resolver: Option<Box<PlatformResolverFn>>,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            protocol: ClientProtocol::default(),
+            accept_invalid_hostnames: false,
+            accept_invalid_certificates: false,
+            extra_root_certificates: Vec::new(),
+            platform_resolver: Some(Box::new(current_platform_resolver)),
+        }
+    }
+}
+
+type PlatformResolverFn = dyn Fn(&[ImageIndexEntry]) -> Option<String>;
+
+/// A platform resolver that chooses the first linux/amd64 variant, if present
+pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().map_or(false, |platform| {
+                platform.os == "linux" && platform.architecture == "amd64"
+            })
+        })
+        .map(|entry| entry.digest.clone())
+}
+
+const MACOS: &str = "macos";
+const DARWIN: &str = "darwin";
+
+fn go_os() -> &'static str {
+    // Massage Rust OS var to GO OS:
+    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.OS.html
+    // - Go: https://golang.org/doc/install/source#environment
+    match std::env::consts::OS {
+        MACOS => DARWIN,
+        other => other,
+    }
+}
+
+const X86_64: &str = "x86_64";
+const AMD64: &str = "amd64";
+const X86: &str = "x86";
+const AMD: &str = "amd";
+const ARM64: &str = "arm64";
+const AARCH64: &str = "aarch64";
+
+fn go_arch() -> &'static str {
+    // Massage Rust Architecture vars to GO equivalent:
+    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.ARCH.html
+    // - Go: https://golang.org/doc/install/source#environment
+    match std::env::consts::ARCH {
+        X86_64 => AMD64,
+        X86 => AMD,
+        AARCH64 => ARM64,
+        other => other,
+    }
+}
+
+/// A platform resolver that chooses the first variant matching the running OS/Arch, if present.
+/// Doesn't currently handle platform.variants.
+pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().map_or(false, |platform| {
+                platform.os == go_os() && platform.architecture == go_arch()
+            })
+        })
+        .map(|entry| entry.digest.clone())
 }
 
 /// The protocol that the client should use to connect
@@ -1079,7 +1229,7 @@ fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> anyhow::Result
                 debug!(%hex, "Computed digest of manifest payload.");
                 Ok(hex)
             } else {
-                Err(anyhow::anyhow!("resgistry did not return a digest header"))
+                Err(anyhow::anyhow!("registry did not return a digest header"))
             }
         }
         Some(hv) => hv
@@ -1113,8 +1263,8 @@ mod test {
         HELLO_IMAGE_DIGEST,
         HELLO_IMAGE_TAG_AND_DIGEST,
     ];
-    const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world:latest";
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
+    const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
 
     #[test]
     fn test_apply_accept() -> Result<(), anyhow::Error> {
@@ -1484,7 +1634,7 @@ mod test {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             // Currently, pull_manifest does not perform Authz, so this will fail.
             let c = Client::default();
-            c._pull_manifest(&reference)
+            c._pull_image_manifest(&reference)
                 .await
                 .expect_err("pull manifest should fail");
 
@@ -1498,7 +1648,7 @@ mod test {
             .await
             .expect("authenticated");
             let (manifest, _) = c
-                ._pull_manifest(&reference)
+                ._pull_image_manifest(&reference)
                 .await
                 .expect("pull manifest should not fail");
 
@@ -1514,7 +1664,7 @@ mod test {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             let mut c = Client::default();
             let (manifest, _) = c
-                .pull_manifest(&reference, &RegistryAuth::Anonymous)
+                .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
                 .await
                 .expect("pull manifest should not fail");
 
@@ -1587,7 +1737,7 @@ mod test {
             .await
             .expect("authenticated");
             let (manifest, _) = c
-                ._pull_manifest(&reference)
+                ._pull_image_manifest(&reference)
                 .await
                 .expect("failed to pull manifest");
 
@@ -1808,7 +1958,7 @@ mod test {
             .expect("authenticated");
 
         let (manifest, _digest) = c
-            ._pull_manifest(&image)
+            ._pull_image_manifest(&image)
             .await
             .expect("failed to pull manifest");
 
@@ -1860,7 +2010,7 @@ mod test {
             .expect("failed to pull pushed image");
 
         let (pulled_manifest, _digest) = c
-            ._pull_manifest(&push_image)
+            ._pull_image_manifest(&push_image)
             .await
             .expect("failed to pull pushed image manifest");
 
@@ -1878,11 +2028,34 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_pull_docker_io() {
+    async fn test_platform_resolution() {
+        // test that we get an error when we pull a manifest list
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
-        let mut c = Client::default();
-        let result = c.pull_manifest(&reference, &RegistryAuth::Anonymous).await;
-        assert!(result.is_ok(), "Error when pulling from DockerHub.");
+        let mut c = Client::new(ClientConfig {
+            platform_resolver: None,
+            ..Default::default()
+        });
+        let err = c
+            .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{}", err),
+            "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
+        );
+
+        c = Client::new(ClientConfig {
+            platform_resolver: Some(Box::new(linux_amd64_resolver)),
+            ..Default::default()
+        });
+        let (_manifest, digest) = c
+            .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
+            .await
+            .expect("Couldn't pull manifest");
+        assert_eq!(
+            digest,
+            "sha256:f54a58bc1aac5ea1a25d796ae155dc228b3f0e11d046ae276b39c4bf2f13d8c4"
+        );
     }
 
     #[tokio::test]
@@ -1890,7 +2063,7 @@ mod test {
         let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
         let mut c = Client::default();
         let (manifest, _manifest_str) = c
-            .pull_manifest(&reference, &RegistryAuth::Anonymous)
+            .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
             .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
