@@ -23,6 +23,7 @@ allow = [
     "LicenseRef-krator-derive",
     "CC0-1.0",
     "BSD-2-Clause",
+    "MPL-2.0"
 ]
 
 deny = [
