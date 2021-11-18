@@ -548,7 +548,8 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
- "www-authenticate",
+ "unicase 1.4.2",
+ "url 1.7.2",
 ]
 
 [[package]]
@@ -1364,14 +1365,4 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0120db82e8a1e0b9fb3345a539c478767c0048d842860994d96113d5b667bd69"
 dependencies = [
  "winapi",
-]
-
-[[package]]
-name = "www-authenticate"
-version = "0.3.0"
-source = "git+https://github.com/bacongobbler/www-authenticate?branch=hyperx-1.3-support#c9f816aefd50f983ff79fa182f547f704d60d9ea"
-dependencies = [
- "hyperx",
- "unicase 1.4.2",
- "url 1.7.2",
 ]
