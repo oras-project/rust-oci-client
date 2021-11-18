@@ -13,10 +13,11 @@ use crate::secrets::*;
 use crate::Reference;
 
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 use anyhow::{anyhow, Context};
 use futures_util::future;
 use futures_util::stream::StreamExt;
-use hyperx::header::Header;
+use hyperx::header::{Header, Raw};
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use sha2::Digest;
@@ -24,7 +25,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
-use www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     "application/vnd.docker.distribution.manifest.v2+json",
@@ -296,7 +296,7 @@ impl Client {
             None => return Ok(()),
         };
 
-        let auth = WwwAuthenticate::parse_header(&dist_hdr.as_bytes().into())?;
+        let auth = WwwAuthenticate::parse_header(&Raw::from(dist_hdr.as_bytes()))?;
         // If challenge_opt is not set it means that no challenge was present, even though the header
         // was present.
         let challenge_opt = match auth.get::<BearerChallenge>() {
