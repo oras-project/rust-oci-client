@@ -29,46 +29,6 @@ use unicase::UniCase;
 ///    algorithm=MD5,
 ///    nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
 ///    opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"`
-///
-/// # Examples
-///
-/// ```
-/// # extern crate hyperx;
-/// # extern crate www_authenticate;
-/// # use hyperx::header::Headers;
-/// # use www_authenticate::{WwwAuthenticate, DigestChallenge, Qop,
-/// # Algorithm};
-/// # fn main(){
-/// let auth = WwwAuthenticate::new(
-///     DigestChallenge {
-///         realm: Some("http-auth@example.org".into()),
-///         qop: Some(vec![Qop::Auth, Qop::AuthInt]),
-///         algorithm: Some(Algorithm::Sha256),
-///         nonce: Some("7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v".into()),
-///         opaque: Some("FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"
-///                          .into()),
-///         domain: None,
-///         stale: None,
-///         userhash: None,
-/// });
-/// let mut headers = Headers::new();
-/// headers.set(auth);
-/// # }
-/// ```
-///
-/// ```
-/// # extern crate hyperx;
-/// # extern crate www_authenticate;
-/// # use hyperx::header::Headers;
-/// # use www_authenticate::{WwwAuthenticate, BasicChallenge};
-/// # fn main(){
-/// let auth = WwwAuthenticate::new(BasicChallenge{realm: "foo".into()});
-/// let mut headers = Headers::new();
-/// headers.set(auth);
-/// let auth = headers.get::<WwwAuthenticate>().unwrap();
-/// let basics = auth.get::<BasicChallenge>().unwrap();
-/// # }
-/// ```
 #[derive(Debug, Clone)]
 pub struct WwwAuthenticate(HashMap<UniCase<CowStr>, Vec<RawChallenge>>);
 
