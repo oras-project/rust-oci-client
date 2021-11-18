@@ -166,7 +166,10 @@ impl Header for WwwAuthenticate {
         "WWW-Authenticate"
     }
 
-    fn parse_header<'a, T>(raw: &'a T) -> hyperx::Result<Self> where T: RawLike<'a> {
+    fn parse_header<'a, T>(raw: &'a T) -> hyperx::Result<Self>
+    where
+        T: RawLike<'a>,
+    {
         let mut map = HashMap::new();
         for data in raw.iter() {
             let stream = parser::Stream::new(data.as_ref());
@@ -345,13 +348,15 @@ mod raw {
             use self::RawChallenge::*;
             match *self {
                 Token68(ref token) => write!(f, "{}", token)?,
-                Fields(ref fields) => for (k, &(ref v, ref quote)) in fields.0.iter() {
-                    if need_quote(v, quote) {
-                        write!(f, "{}={:?}, ", k, v)?
-                    } else {
-                        write!(f, "{}={}, ", k, v)?
+                Fields(ref fields) => {
+                    for (k, &(ref v, ref quote)) in fields.0.iter() {
+                        if need_quote(v, quote) {
+                            write!(f, "{}={:?}, ", k, v)?
+                        } else {
+                            write!(f, "{}={}, ", k, v)?
+                        }
                     }
-                },
+                }
             }
             Ok(())
         }
@@ -726,7 +731,8 @@ mod parser {
 
     pub fn is_token_char(c: u8) -> bool {
         // See https://tools.ietf.org/html/rfc7230#section-3.2.6
-        br#"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!#$%&'*+-.^_`|~"#.contains(&c)
+        br#"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!#$%&'*+-.^_`|~"#
+            .contains(&c)
     }
 
     pub fn is_obs_text(c: u8) -> bool {
@@ -924,7 +930,8 @@ mod parser {
         }
 
         pub fn raw_token68(&self) -> Result<RawChallenge> {
-            let ret = self.token68()
+            let ret = self
+                .token68()
                 .map(ToString::to_string)
                 .map(RawChallenge::Token68)?;
             self.skip_field_sep()?;
@@ -956,7 +963,8 @@ mod parser {
         pub fn challenge(&self) -> Result<(String, RawChallenge)> {
             let scheme = self.next_token()?;
             self.take_while1(is_ws)?;
-            let challenge = self.r#try(|| self.raw_token68())
+            let challenge = self
+                .r#try(|| self.raw_token68())
                 .or_else(|_| self.raw_fields())?;
             Ok((scheme.to_string(), challenge))
         }
@@ -1160,6 +1168,4 @@ mod tests {
             userhash: None,
         }));
     }
-
-
 }

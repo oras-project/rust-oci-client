@@ -13,6 +13,7 @@ use crate::secrets::*;
 use crate::Reference;
 
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 use anyhow::{anyhow, Context};
 use futures_util::future;
 use futures_util::stream::StreamExt;
@@ -24,7 +25,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
-use crate::www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     "application/vnd.docker.distribution.manifest.v2+json",
