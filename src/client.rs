@@ -134,10 +134,7 @@ impl TryFrom<ClientConfig> for Client {
             #[cfg(feature = "native-tls")]
             () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
             #[cfg(not(feature = "native-tls"))]
-            () => {
-                warn!("Cannot change value of `accept_invalid_hostnames`: missing 'native-tls' feature");
-                client_builder
-            }
+            () => client_builder,
         };
 
         for c in &config.extra_root_certificates {
@@ -985,6 +982,7 @@ pub struct ClientConfig {
     pub protocol: ClientProtocol,
 
     /// Accept invalid hostname. Defaults to false
+    #[cfg(feature = "native-tls")]
     pub accept_invalid_hostnames: bool,
 
     /// Accept invalid certificates. Defaults to false
