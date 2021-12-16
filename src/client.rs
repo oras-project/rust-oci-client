@@ -1114,6 +1114,7 @@ mod test {
         HELLO_IMAGE_TAG_AND_DIGEST,
     ];
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world:latest";
+    const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
 
     #[test]
     fn test_apply_accept() -> Result<(), anyhow::Error> {
@@ -1889,5 +1890,16 @@ mod test {
             format!("{}", err),
             "unsupported media type: application/vnd.docker.distribution.manifest.list.v2+json"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pull_ghcr_io() {
+        let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
+        let mut c = Client::default();
+        let (manifest, _manifest_str) = c
+            .pull_manifest(&reference, &RegistryAuth::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
     }
 }

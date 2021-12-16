@@ -1,6 +1,8 @@
 use crate::reference::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// A token granted during the OAuth2-like workflow for OCI registries.
@@ -12,6 +14,22 @@ pub(crate) enum RegistryToken {
     AccessToken { access_token: String },
 }
 
+impl fmt::Debug for RegistryToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = String::from("<redacted>");
+        match self {
+            RegistryToken::Token { .. } => {
+                f.debug_struct("Token").field("token", &redacted).finish()
+            }
+            RegistryToken::AccessToken { .. } => f
+                .debug_struct("AccessToken")
+                .field("access_token", &redacted)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum RegistryTokenType {
     Bearer(RegistryToken),
     Basic(String, String),
@@ -66,9 +84,27 @@ impl TokenCache {
                         jwt::header::Header,
                         jwt::claims::Claims,
                         jwt::token::Unverified,
-                    >::parse_unverified(token_str)
+                    >::parse_unverified(&token_str)
                     {
                         Ok(token) => token.claims().registered.expiration.unwrap_or(u64::MAX),
+                        Err(jwt::Error::NoClaimsComponent) => {
+                            // the token doesn't have a claim that states a
+                            // value for the expiration. We assume it has a 60
+                            // seconds validity as indicated here:
+                            // https://docs.docker.com/registry/spec/auth/token/#requesting-a-token
+                            // > (Optional) The duration in seconds since the token was issued
+                            // > that it will remain valid. When omitted, this defaults to 60 seconds.
+                            // > For compatibility with older clients, a token should never be returned
+                            // > with less than 60 seconds to live.
+                            let now = SystemTime::now();
+                            let epoch = now
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time went backwards")
+                                .as_secs();
+                            let expiration = epoch + 60;
+                            debug!(?token, "Cannot extract expiration from token's claims, assuming a 60 seconds validity");
+                            expiration
+                        },
                         Err(error) => {
                             warn!(?error, "Invalid bearer token");
                             return;
@@ -92,7 +128,6 @@ impl TokenCache {
         let repository = reference.repository().to_string();
         match self.tokens.get(&(registry.clone(), repository.clone(), op)) {
             Some((ref token, expiration)) => {
-                use std::time::{SystemTime, UNIX_EPOCH};
                 let now = SystemTime::now();
                 let epoch = now
                     .duration_since(UNIX_EPOCH)
