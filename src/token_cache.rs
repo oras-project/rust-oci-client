@@ -84,7 +84,7 @@ impl TokenCache {
                         jwt::header::Header,
                         jwt::claims::Claims,
                         jwt::token::Unverified,
-                    >::parse_unverified(&token_str)
+                    >::parse_unverified(token_str)
                     {
                         Ok(token) => token.claims().registered.expiration.unwrap_or(u64::MAX),
                         Err(jwt::Error::NoClaimsComponent) => {
