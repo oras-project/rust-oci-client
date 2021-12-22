@@ -8,7 +8,6 @@ mod reference;
 mod regexp;
 pub mod secrets;
 mod token_cache;
-mod www_authenticate;
 
 #[doc(inline)]
 pub use client::Client;
