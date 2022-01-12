@@ -6,6 +6,7 @@ pub const REFERENCE_REGEXP: &str = r"^((?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]
 
 /// ANCHORED_NAME_REGEXP is used to parse a name value, capturing the domain and
 /// trailing components.
+#[allow(dead_code)]
 pub const ANCHORED_NAME_REGEXP: &str = r"^(?:((?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))+)?(?::[0-9]+)?)/)?([a-z0-9]+(?:(?:(?:[._]|__|[-]*)[a-z0-9]+)+)?(?:(?:/[a-z0-9]+(?:(?:(?:[._]|__|[-]*)[a-z0-9]+)+)?)+)?)$";
 
 pub fn must_compile(r: &str) -> Regex {
