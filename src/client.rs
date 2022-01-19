@@ -64,6 +64,17 @@ impl ImageData {
     }
 }
 
+/// The data returned by an OCI registry after a successful push
+/// operation is completed
+pub struct PushResponse {
+    /// Pullable url for the image
+    pub image_url: String,
+    /// Pullable url for the config
+    pub config_url: String,
+    /// Pullable url for the manifest
+    pub manifest_url: String,
+}
+
 /// The data and media type for an image layer
 #[derive(Clone)]
 pub struct ImageLayer {
@@ -233,7 +244,7 @@ impl Client {
         config_media_type: &str,
         auth: &RegistryAuth,
         image_manifest: Option<OciImageManifest>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
         if !self.tokens.contains_key(image_ref, op) {
@@ -264,11 +275,16 @@ impl Client {
             Some(m) => m,
             None => self.generate_manifest(image_data, config_data, config_media_type),
         };
-        self.push_config(image_ref, config_data, &manifest.config.digest)
+        let config_url = self
+            .push_config(image_ref, config_data, &manifest.config.digest)
             .await?;
-        self.push_manifest(image_ref, &manifest).await?;
+        let manifest_url = self.push_manifest(image_ref, &manifest).await?;
 
-        Ok(image_url)
+        Ok(PushResponse {
+            image_url,
+            config_url,
+            manifest_url,
+        })
     }
 
     /// Perform an OAuth v2 auth request if necessary.
