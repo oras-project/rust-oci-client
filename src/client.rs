@@ -28,7 +28,8 @@ use www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     "application/vnd.docker.distribution.manifest.v2+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
+    // TODO: support manifest lists?
+    // "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.manifest.v1+json",
 ];
 
@@ -492,7 +493,7 @@ impl Client {
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)? // &[IMAGE_MANIFEST_MEDIA_TYPE]
             .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder()
             .send()
@@ -526,7 +527,7 @@ impl Client {
             }
             s if s.is_server_error() => Err(anyhow::anyhow!("Server error at {}", url)),
             s => Err(anyhow::anyhow!(
-                "An unexpected error occured: code={}, message='{}'",
+                "An unexpected error occurred: code={}, message='{}'",
                 s,
                 res.text().await?
             )),
@@ -544,7 +545,6 @@ impl Client {
             ));
         }
         if let Some(media_type) = versioned.media_type {
-            // TODO: support manifest lists?
             if media_type != IMAGE_MANIFEST_MEDIA_TYPE {
                 return Err(anyhow::anyhow!("unsupported media type: {}", media_type));
             }
@@ -1881,15 +1881,8 @@ mod test {
     async fn test_pull_docker_io() {
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
         let mut c = Client::default();
-        let err = c
-            .pull_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
-            .unwrap_err();
-        // we don't support manifest list so pulling failed but this error means it did downloaded it
-        assert_eq!(
-            format!("{}", err),
-            "unsupported media type: application/vnd.docker.distribution.manifest.list.v2+json"
-        );
+        let result = c.pull_manifest(&reference, &RegistryAuth::Anonymous).await;
+        assert!(result.is_ok(), "Error when pulling from DockerHub.");
     }
 
     #[tokio::test]
