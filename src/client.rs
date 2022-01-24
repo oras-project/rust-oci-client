@@ -493,7 +493,7 @@ impl Client {
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)? // &[IMAGE_MANIFEST_MEDIA_TYPE]
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder()
             .send()
@@ -507,7 +507,7 @@ impl Client {
                 let headers = res.headers().clone();
                 let text = res.text().await?;
                 let digest = digest_header_value(headers, Some(&text))?;
-
+                println!("{}", text);
                 self.validate_image_manifest(&text).await?;
 
                 debug!("Parsing response as OciManifest: {}", text);
