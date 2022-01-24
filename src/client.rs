@@ -507,7 +507,7 @@ impl Client {
                 let headers = res.headers().clone();
                 let text = res.text().await?;
                 let digest = digest_header_value(headers, Some(&text))?;
-                println!("{}", text);
+
                 self.validate_image_manifest(&text).await?;
 
                 debug!("Parsing response as OciManifest: {}", text);
