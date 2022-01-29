@@ -6,8 +6,9 @@
 use crate::errors::*;
 use crate::manifest::{
     ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest, Versioned,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, IMAGE_MANIFEST_LIST_MEDIA_TYPE,
-    IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
 };
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
@@ -18,8 +19,10 @@ use anyhow::{anyhow, Context};
 use futures_util::future;
 use futures_util::stream::StreamExt;
 use hyperx::header::{Header, Raw};
+use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
+use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -41,6 +44,43 @@ pub struct ImageData {
     pub layers: Vec<ImageLayer>,
     /// The digest of the image or module.
     pub digest: Option<String>,
+    /// The Configuration object of the image or module.
+    pub config: Config,
+    /// The manifest of the image or module.
+    pub manifest: Option<OciImageManifest>,
+}
+
+impl ImageData {
+    fn generate_manifest(&self) -> OciImageManifest {
+        let mut manifest = OciImageManifest::default();
+
+        manifest.config.media_type = self.config.media_type.clone();
+        manifest.config.size = self.config.data.len() as i64;
+        manifest.config.digest = sha256_digest(&self.config.data);
+
+        for layer in &self.layers {
+            let digest = sha256_digest(&layer.data);
+
+            //TODO: Determine necessity of generating an image title
+            let mut annotations = HashMap::new();
+            annotations.insert(
+                "org.opencontainers.image.title".to_string(),
+                digest.to_string(),
+            );
+
+            let descriptor = OciDescriptor {
+                size: layer.data.len() as i64,
+                digest,
+                media_type: layer.media_type.clone(),
+                annotations: Some(annotations),
+                ..Default::default()
+            };
+
+            manifest.layers.push(descriptor);
+        }
+
+        manifest
+    }
 }
 
 impl ImageData {
@@ -67,8 +107,6 @@ impl ImageData {
 /// The data returned by an OCI registry after a successful push
 /// operation is completed
 pub struct PushResponse {
-    /// Pullable url for the image
-    pub image_url: String,
     /// Pullable url for the config
     pub config_url: String,
     /// Pullable url for the manifest
@@ -102,7 +140,34 @@ impl ImageLayer {
     }
 
     /// Helper function to compute the sha256 digest of an image layer
-    pub fn sha256_digest(self) -> String {
+    pub fn sha256_digest(&self) -> String {
+        sha256_digest(&self.data)
+    }
+}
+
+/// The data and media type for a configuration object
+#[derive(Clone)]
+pub struct Config {
+    /// The data of this config object
+    pub data: Vec<u8>,
+    /// The media type of this object
+    pub media_type: String,
+}
+
+impl Config {
+    /// Constructs a new Config struct with provided data and media type
+    pub fn new(data: Vec<u8>, media_type: String) -> Self {
+        Config { data, media_type }
+    }
+
+    /// Constructs a new Config struct with provided data and
+    /// media type application/vnd.oci.image.config.v1+json
+    pub fn oci_v1(data: Vec<u8>) -> Self {
+        Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string())
+    }
+
+    /// Helper function to compute the sha256 digest of this config object
+    pub fn sha256_digest(&self) -> String {
         sha256_digest(&self.data)
     }
 }
@@ -201,12 +266,12 @@ impl Client {
             self.auth(image, auth, op).await?;
         }
 
-        let (manifest, digest) = self._pull_image_manifest(image).await?;
+        let (manifest, digest, config) = self._pull_manifest_and_config(image).await?;
 
         self.validate_layers(&manifest, accepted_media_types)
             .await?;
 
-        let layers = manifest.layers.into_iter().map(|layer| {
+        let layers = manifest.layers.iter().map(|layer| {
             // This avoids moving `self` which is &mut Self
             // into the async block. We only want to capture
             // as &Self
@@ -214,8 +279,8 @@ impl Client {
             async move {
                 let mut out: Vec<u8> = Vec::new();
                 debug!("Pulling image layer");
-                this.pull_layer(image, &layer.digest, &mut out).await?;
-                Ok::<_, anyhow::Error>(ImageLayer::new(out, layer.media_type))
+                this.pull_blob(image, &layer.digest, &mut out).await?;
+                Ok::<_, anyhow::Error>(ImageLayer::new(out, layer.media_type.clone()))
             }
         });
 
@@ -223,6 +288,8 @@ impl Client {
 
         Ok(ImageData {
             layers,
+            manifest: Some(manifest),
+            config,
             digest: Some(digest),
         })
     }
@@ -240,10 +307,7 @@ impl Client {
         &mut self,
         image_ref: &Reference,
         image_data: &ImageData,
-        config_data: &[u8],
-        config_media_type: &str,
         auth: &RegistryAuth,
-        image_manifest: Option<OciImageManifest>,
     ) -> anyhow::Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
@@ -251,40 +315,45 @@ impl Client {
             self.auth(image_ref, auth, op).await?;
         }
 
-        // Start push session
-        let mut location = self.begin_push_session(image_ref).await?;
-
         // Upload layers
-        let mut start_byte = 0;
         for layer in &image_data.layers {
-            // Destructuring assignment is not yet supported
-            let (next_location, next_byte) = self
-                .push_layer(&location, image_ref, layer.data.to_vec(), start_byte)
+            self.push_blob(image_ref, layer.data.to_vec(), &layer.sha256_digest())
                 .await?;
-            location = next_location;
-            start_byte = next_byte;
         }
 
-        // End push session, upload manifest
-        let image_url = self
-            .end_push_session(&location, image_ref, &image_data.digest())
-            .await?;
-
         // Push config and manifest to registry
-        let manifest: OciImageManifest = match image_manifest {
-            Some(m) => m,
-            None => self.generate_manifest(image_data, config_data, config_media_type),
+        let manifest: OciImageManifest = match &image_data.manifest {
+            Some(m) => m.clone(),
+            None => image_data.generate_manifest(),
         };
         let config_url = self
-            .push_config(image_ref, config_data, &manifest.config.digest)
+            .push_blob(
+                image_ref,
+                image_data.config.data.to_vec(),
+                &manifest.config.digest,
+            )
             .await?;
         let manifest_url = self.push_manifest(image_ref, &manifest).await?;
 
         Ok(PushResponse {
-            image_url,
             config_url,
             manifest_url,
         })
+    }
+
+    /// Pushes a blob to the registry
+    ///
+    /// Returns the pullable location of the blob
+    async fn push_blob(
+        &self,
+        image: &Reference,
+        blob_data: Vec<u8>,
+        blob_digest: &str,
+    ) -> anyhow::Result<String> {
+        let location = self.begin_push_session(image).await?;
+        let (end_location, _) = self.push_chunk(&location, image, blob_data, 0).await?;
+        self.end_push_session(&end_location, image, blob_digest)
+            .await
     }
 
     /// Perform an OAuth v2 auth request if necessary.
@@ -663,21 +732,25 @@ impl Client {
             self.auth(image, auth, op).await?;
         }
 
-        self._pull_manifest_and_config(image).await
+        self._pull_manifest_and_config(image)
+            .await
+            .and_then(|(manifest, digest, config)| {
+                Ok((manifest, digest, String::from_utf8(config.data)?))
+            })
     }
 
     async fn _pull_manifest_and_config(
         &mut self,
         image: &Reference,
-    ) -> anyhow::Result<(OciImageManifest, String, String)> {
+    ) -> anyhow::Result<(OciImageManifest, String, Config)> {
         let (manifest, digest) = self._pull_image_manifest(image).await?;
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
-        self.pull_layer(image, &manifest.config.digest, &mut out)
+        self.pull_blob(image, &manifest.config.digest, &mut out)
             .await?;
-
-        Ok((manifest, digest, String::from_utf8(out)?))
+        let media_type = manifest.config.media_type.clone();
+        Ok((manifest, digest, Config::new(out, media_type)))
     }
 
     /// Pull a single layer from an OCI registry.
@@ -687,7 +760,7 @@ impl Client {
     /// repository and the registry, but it is not used to verify that
     /// the digest is a layer inside of the image. (The manifest is
     /// used for that.)
-    async fn pull_layer<T: AsyncWrite + Unpin>(
+    async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
         digest: &str,
@@ -746,18 +819,20 @@ impl Client {
             .await
     }
 
-    /// Pushes a single layer (blob) of an image to registry
+    /// Pushes a single chunk of a blob to a registry,
+    /// as part of a chunked blob upload.
     ///
     /// Returns the URL location for the next layer
-    async fn push_layer(
+    async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
         layer: Vec<u8>,
         start_byte: usize,
     ) -> anyhow::Result<(String, usize)> {
+        trace!("Pushing chunk. size={}, location={}", layer.len(), location);
         if layer.is_empty() {
-            return Err(anyhow::anyhow!("cannot push a layer without data"));
+            return Err(anyhow::anyhow!("cannot push a chunk without data"));
         };
         let end_byte = start_byte + layer.len() - 1;
         let mut headers = HeaderMap::new();
@@ -787,23 +862,6 @@ impl Client {
         ))
     }
 
-    /// Pushes the config as a blob to the registry
-    ///
-    /// Returns the pullable location of the config
-    async fn push_config(
-        &self,
-        image: &Reference,
-        config_data: &[u8],
-        config_digest: &str,
-    ) -> anyhow::Result<String> {
-        let location = self.begin_push_session(image).await?;
-        let (end_location, _) = self
-            .push_layer(&location, image, config_data.to_vec(), 0)
-            .await?;
-        self.end_push_session(&end_location, image, config_digest)
-            .await
-    }
-
     /// Pushes the manifest for a specified image
     ///
     /// Returns pullable manifest URL
@@ -815,13 +873,27 @@ impl Client {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", OCI_IMAGE_MEDIA_TYPE.parse().unwrap());
+        headers.insert(
+            "Content-Type",
+            manifest
+                .media_type
+                .as_deref()
+                .unwrap_or(OCI_IMAGE_MEDIA_TYPE)
+                .parse()
+                .unwrap(),
+        );
+
+        // Serialize the manifest with a canonical json formatter, as described at
+        // https://github.com/opencontainers/image-spec/blob/main/considerations.md#json
+        let mut body = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(&mut body, CanonicalFormatter::new());
+        manifest.serialize(&mut ser).unwrap();
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
-            .body(serde_json::to_string(manifest)?)
+            .body(body)
             .send()
             .await?;
 
@@ -870,42 +942,6 @@ impl Client {
         } else {
             Ok(lh.to_string())
         }
-    }
-
-    fn generate_manifest(
-        &self,
-        image_data: &ImageData,
-        config_data: &[u8],
-        config_media_type: &str,
-    ) -> OciImageManifest {
-        let mut manifest = OciImageManifest::default();
-
-        manifest.config.media_type = config_media_type.to_string();
-        manifest.config.size = config_data.len() as i64;
-        manifest.config.digest = sha256_digest(config_data);
-
-        for layer in image_data.layers.clone() {
-            let digest = sha256_digest(&layer.data);
-
-            //TODO: Determine necessity of generating an image title
-            let mut annotations = HashMap::new();
-            annotations.insert(
-                "org.opencontainers.image.title".to_string(),
-                digest.to_string(),
-            );
-
-            let descriptor = OciDescriptor {
-                size: layer.data.len() as i64,
-                digest,
-                media_type: layer.media_type,
-                annotations: Some(annotations),
-                ..Default::default()
-            };
-
-            manifest.layers.push(descriptor);
-        }
-
-        manifest
     }
 
     /// Convert a Reference to a v2 manifest URL.
@@ -1264,7 +1300,7 @@ fn sha256_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::manifest;
+    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
     use std::convert::TryFrom;
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
@@ -1282,6 +1318,10 @@ mod test {
     ];
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
+
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
 
     #[test]
     fn test_apply_accept() -> Result<(), anyhow::Error> {
@@ -1741,7 +1781,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_pull_layer() {
+    async fn test_pull_blob() {
         let mut c = Client::default();
 
         for &image in TEST_IMAGES {
@@ -1765,9 +1805,9 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_layer(&reference, &layer0.digest, &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, &layer0.digest, &mut file).await {
                     println!(
-                        "Got error on pull_layer call attempt {}. Will retry in 1s: {:?}",
+                        "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
                     );
                     last_error.replace(e);
@@ -1794,10 +1834,7 @@ mod test {
 
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
-            let mut image_data = ImageData {
-                layers: Vec::with_capacity(0),
-                digest: None,
-            };
+            let mut image_data = None;
             for i in 1..6 {
                 match Client::default()
                     .pull(
@@ -1808,7 +1845,7 @@ mod test {
                     .await
                 {
                     Ok(data) => {
-                        image_data = data;
+                        image_data = Some(data);
                         last_error = None;
                         break;
                     }
@@ -1827,6 +1864,8 @@ mod test {
                 panic!("Unable to pull layer: {:?}", e);
             }
 
+            assert!(image_data.is_some());
+            let image_data = image_data.unwrap();
             assert!(!image_data.layers.is_empty());
             assert!(image_data.digest.is_some());
         }
@@ -1859,7 +1898,7 @@ mod test {
     #[tokio::test]
     #[ignore]
     /// Requires local registry resolveable at `oci.registry.local`
-    async fn can_push_layer() {
+    async fn can_push_chunk() {
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
@@ -1879,7 +1918,7 @@ mod test {
         let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
 
         let (next_location, next_byte) = c
-            .push_layer(&location, &image, image_data[0].clone(), 0)
+            .push_chunk(&location, &image, image_data[0].clone(), 0)
             .await
             .expect("failed to push layer");
 
@@ -1901,7 +1940,7 @@ mod test {
     #[tokio::test]
     #[ignore]
     /// Requires local registry resolveable at `oci.registry.local`
-    async fn can_push_multiple_layers() {
+    async fn can_push_multiple_chunks() {
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
@@ -1929,7 +1968,7 @@ mod test {
 
         for layer in image_data.clone() {
             let (next_location, next_byte) = c
-                .push_layer(&location, &image, layer.clone(), start_byte)
+                .push_chunk(&location, &image, layer.clone(), start_byte)
                 .await
                 .expect("failed to push layer");
 
@@ -1964,6 +2003,7 @@ mod test {
     #[ignore]
     /// Requires local registry resolveable at `oci.registry.local`
     async fn test_image_roundtrip() {
+        init();
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
@@ -1997,25 +2037,9 @@ mod test {
         .await
         .expect("authenticated");
 
-        let config_data = b"{}".to_vec();
-
-        c.push(
-            &push_image,
-            &image_data,
-            &config_data,
-            manifest::WASM_CONFIG_MEDIA_TYPE,
-            &RegistryAuth::Anonymous,
-            None,
-        )
-        .await
-        .expect("failed to push image");
-
-        let new_manifest =
-            c.generate_manifest(&image_data, &config_data, manifest::WASM_CONFIG_MEDIA_TYPE);
-
-        c.push_manifest(&push_image, &new_manifest)
+        c.push(&push_image, &image_data, &RegistryAuth::Anonymous)
             .await
-            .expect("error pushing manifest");
+            .expect("failed to push image");
 
         let pulled_image_data = c
             .pull(
@@ -2084,5 +2108,36 @@ mod test {
             .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_roundtrip_multiple_layers() {
+        init();
+        let mut c = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
+            ..Default::default()
+        });
+        let src_image = Reference::try_from("registry:2.7.1").expect("failed to parse reference");
+        let dest_image = Reference::try_from("oci.registry.local/python:test")
+            .expect("failed to parse reference");
+
+        let image = c
+            .pull(
+                &src_image,
+                &RegistryAuth::Anonymous,
+                vec![IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE],
+            )
+            .await
+            .expect("Failed to pull manifest");
+        assert!(image.layers.len() > 1);
+
+        c.push(&dest_image, &image, &RegistryAuth::Anonymous)
+            .await
+            .expect("Failed to pull manifest");
+
+        c.pull_image_manifest(&dest_image, &RegistryAuth::Anonymous)
+            .await
+            .expect("Failed to pull manifest");
     }
 }

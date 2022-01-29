@@ -60,8 +60,9 @@ pub struct OciImageManifest {
 
     /// This is an optional media type describing this manifest.
     ///
-    /// It is reserved for compatibility, but the specification does not seem
-    /// to recommend setting it.
+    /// This property SHOULD be used and [remain compatible][https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix]
+    /// with earlier versions of this specification and with other similar external formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 
     /// The image configuration.
@@ -80,6 +81,7 @@ pub struct OciImageManifest {
     /// The specification says "If there are no annotations then this property
     /// MUST either be absent or be an empty map."
     /// TO accomodate either, this is optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -141,11 +143,13 @@ pub struct OciDescriptor {
     /// This OPTIONAL property specifies a list of URIs from which this
     /// object MAY be downloaded. Each entry MUST conform to RFC 3986.
     /// Entries SHOULD use the http and https schemes, as defined in RFC 7230.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
 
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the annotation rules.
     /// https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -179,6 +183,7 @@ pub struct OciImageIndex {
     ///
     /// It is reserved for compatibility, but the specification does not seem
     /// to recommend setting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 
     /// This property contains a list of manifests for specific platforms.
@@ -219,10 +224,12 @@ pub struct ImageIndexEntry {
     pub size: i64,
     /// This OPTIONAL property describes the minimum runtime requirements of the image.
     /// This property SHOULD be present if its target is platform-specific.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 
     /// This OPTIONAL property contains arbitrary metadata for the image index.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -257,8 +264,10 @@ pub struct Platform {
     pub os_features: Option<Vec<String>>,
     /// This OPTIONAL property specifies the variant of the CPU.
     /// Image indexes SHOULD use, and implementations SHOULD understand, `variant` values listed in the [Platform Variants](#platform-variants) table.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// This property is RESERVED for future versions of the specification.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
 }
 
