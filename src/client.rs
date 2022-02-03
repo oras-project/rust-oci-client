@@ -1319,10 +1319,6 @@ mod test {
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
 
-    fn init() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
     #[test]
     fn test_apply_accept() -> Result<(), anyhow::Error> {
         assert_eq!(
@@ -2003,7 +1999,7 @@ mod test {
     #[ignore]
     /// Requires local registry resolveable at `oci.registry.local`
     async fn test_image_roundtrip() {
-        init();
+        tracing_subscriber::fmt::init();
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
@@ -2113,7 +2109,7 @@ mod test {
     #[tokio::test]
     #[ignore]
     async fn test_roundtrip_multiple_layers() {
-        init();
+        tracing_subscriber::fmt::init();
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
