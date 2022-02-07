@@ -636,6 +636,7 @@ impl Client {
         }
         if let Some(media_type) = versioned.media_type {
             if media_type != IMAGE_MANIFEST_MEDIA_TYPE
+                && media_type != OCI_IMAGE_MEDIA_TYPE
                 && media_type != IMAGE_MANIFEST_LIST_MEDIA_TYPE
             {
                 return Err(anyhow::anyhow!("unsupported media type: {}", media_type));
