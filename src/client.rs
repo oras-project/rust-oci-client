@@ -1102,7 +1102,10 @@ impl Default for ClientConfig {
     }
 }
 
-type PlatformResolverFn = dyn Fn(&[ImageIndexEntry]) -> Option<String>;
+// Be explicit about the traits supported by this type. This is needed to use
+// the Client behind a dynamic reference.
+// Something similar to what is described here: https://users.rust-lang.org/t/how-to-send-function-closure-to-another-thread/43549
+type PlatformResolverFn = dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync;
 
 /// A platform resolver that chooses the first linux/amd64 variant, if present
 pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
