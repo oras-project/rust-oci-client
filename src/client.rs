@@ -1302,6 +1302,15 @@ mod test {
     use super::*;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
     use std::convert::TryFrom;
+    #[cfg(feature = "test-registry")]
+    use testcontainers::{
+        clients,
+        images::{
+            self,
+            generic::{GenericImage, WaitFor},
+        },
+        Docker,
+    };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
     const HELLO_IMAGE_TAG: &str = "webassembly.azurecr.io/hello-wasm:v1";
@@ -1891,15 +1900,24 @@ mod test {
         }
     }
 
+    #[cfg(feature = "test-registry")]
+    fn registry_image() -> GenericImage {
+        images::generic::GenericImage::new("docker.io/library/registry:2")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
+    }
+
     #[tokio::test]
-    #[ignore]
-    /// Requires local registry resolveable at `oci.registry.local`
+    #[cfg(feature = "test-registry")]
     async fn can_push_chunk() {
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image());
+        let port = test_container.get_host_port(5000).expect("no port exposed");
+
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
-        let url = "oci.registry.local/hello-wasm:v1";
+        let url = format!("localhost:{}/hello-wasm:v1", port);
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -1930,19 +1948,22 @@ mod test {
             .await
             .expect("failed to end push session");
 
-        assert_eq!(layer_location, "http://oci.registry.local/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b");
+        assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b", port));
     }
 
     #[tokio::test]
-    #[ignore]
-    /// Requires local registry resolveable at `oci.registry.local`
+    #[cfg(feature = "test-registry")]
     async fn can_push_multiple_chunks() {
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image());
+        let port = test_container.get_host_port(5000).expect("no port exposed");
+
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
         let sample_uuid = "6987887f-0196-45ee-91a1-2dfad901bea0";
-        let url = "oci.registry.local/hello-wasm:v1";
+        let url = format!("localhost:{}/hello-wasm:v1", port);
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -1992,16 +2013,19 @@ mod test {
             .await
             .expect("failed to end push session");
 
-        assert_eq!(layer_location, "http://oci.registry.local/v2/hello-wasm/blobs/sha256:5aef3de484a7d350ece6f5483047712be7c9a228998ba16242b3e50b5f16605a");
+        assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:5aef3de484a7d350ece6f5483047712be7c9a228998ba16242b3e50b5f16605a", port));
     }
 
     #[tokio::test]
-    #[ignore]
-    /// Requires local registry resolveable at `oci.registry.local`
+    #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip() {
         let _ = tracing_subscriber::fmt::try_init();
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image());
+        let port = test_container.get_host_port(5000).expect("no port exposed");
+
         let mut c = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
 
@@ -2024,7 +2048,7 @@ mod test {
             .await
             .expect("failed to pull image");
 
-        let push_image: Reference = "oci.registry.local/hello-wasm:v1".parse().unwrap();
+        let push_image: Reference = format!("localhost:{}/hello-wasm:v1", port).parse().unwrap();
         c.auth(
             &push_image,
             &RegistryAuth::Anonymous,
