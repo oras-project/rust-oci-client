@@ -51,39 +51,6 @@ pub struct ImageData {
 }
 
 impl ImageData {
-    fn generate_manifest(&self) -> OciImageManifest {
-        let mut manifest = OciImageManifest::default();
-
-        manifest.config.media_type = self.config.media_type.clone();
-        manifest.config.size = self.config.data.len() as i64;
-        manifest.config.digest = sha256_digest(&self.config.data);
-
-        for layer in &self.layers {
-            let digest = sha256_digest(&layer.data);
-
-            //TODO: Determine necessity of generating an image title
-            let mut annotations = HashMap::new();
-            annotations.insert(
-                "org.opencontainers.image.title".to_string(),
-                digest.to_string(),
-            );
-
-            let descriptor = OciDescriptor {
-                size: layer.data.len() as i64,
-                digest,
-                media_type: layer.media_type.clone(),
-                annotations: Some(annotations),
-                ..Default::default()
-            };
-
-            manifest.layers.push(descriptor);
-        }
-
-        manifest
-    }
-}
-
-impl ImageData {
     /// Helper function to compute the digest of the image layers
     pub fn sha256_digest(&self) -> String {
         sha256_digest(
@@ -306,8 +273,10 @@ impl Client {
     pub async fn push(
         &mut self,
         image_ref: &Reference,
-        image_data: &ImageData,
+        layers: Vec<ImageLayer>,
+        config: Config,
         auth: &RegistryAuth,
+        manifest: Option<OciImageManifest>,
     ) -> anyhow::Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
@@ -315,23 +284,19 @@ impl Client {
             self.auth(image_ref, auth, op).await?;
         }
 
+        let manifest: OciImageManifest = match manifest {
+            Some(m) => m,
+            None => self.generate_manifest(&layers, &config),
+        };
+
         // Upload layers
-        for layer in &image_data.layers {
-            self.push_blob(image_ref, layer.data.to_vec(), &layer.sha256_digest())
-                .await?;
+        for layer in layers {
+            let digest = layer.sha256_digest();
+            self.push_blob(image_ref, layer.data, &digest).await?;
         }
 
-        // Push config and manifest to registry
-        let manifest: OciImageManifest = match &image_data.manifest {
-            Some(m) => m.clone(),
-            None => image_data.generate_manifest(),
-        };
         let config_url = self
-            .push_blob(
-                image_ref,
-                image_data.config.data.to_vec(),
-                &manifest.config.digest,
-            )
+            .push_blob(image_ref, config.data, &manifest.config.digest)
             .await?;
         let manifest_url = self.push_manifest(image_ref, &manifest).await?;
 
@@ -942,6 +907,37 @@ impl Client {
         } else {
             Ok(lh.to_string())
         }
+    }
+
+    fn generate_manifest(&self, layers: &[ImageLayer], config: &Config) -> OciImageManifest {
+        let mut manifest = OciImageManifest::default();
+
+        manifest.config.media_type = config.media_type.to_string();
+        manifest.config.size = config.data.len() as i64;
+        manifest.config.digest = sha256_digest(&config.data);
+
+        for layer in layers {
+            let digest = sha256_digest(&layer.data);
+
+            //TODO: Determine necessity of generating an image title
+            let mut annotations = HashMap::new();
+            annotations.insert(
+                "org.opencontainers.image.title".to_string(),
+                digest.to_string(),
+            );
+
+            let descriptor = OciDescriptor {
+                size: layer.data.len() as i64,
+                digest,
+                media_type: layer.media_type.to_string(),
+                annotations: Some(annotations),
+                ..Default::default()
+            };
+
+            manifest.layers.push(descriptor);
+        }
+
+        manifest
     }
 
     /// Convert a Reference to a v2 manifest URL.
@@ -1999,7 +1995,7 @@ mod test {
     #[ignore]
     /// Requires local registry resolveable at `oci.registry.local`
     async fn test_image_roundtrip() {
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
@@ -2033,9 +2029,15 @@ mod test {
         .await
         .expect("authenticated");
 
-        c.push(&push_image, &image_data, &RegistryAuth::Anonymous)
-            .await
-            .expect("failed to push image");
+        c.push(
+            &push_image,
+            image_data.layers.clone(),
+            image_data.config.clone(),
+            &RegistryAuth::Anonymous,
+            Some(manifest.clone()),
+        )
+        .await
+        .expect("failed to push image");
 
         let pulled_image_data = c
             .pull(
@@ -2109,13 +2111,13 @@ mod test {
     #[tokio::test]
     #[ignore]
     async fn test_roundtrip_multiple_layers() {
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
         });
         let src_image = Reference::try_from("registry:2.7.1").expect("failed to parse reference");
-        let dest_image = Reference::try_from("oci.registry.local/python:test")
+        let dest_image = Reference::try_from("oci.registry.local/registry:roundtrip-test")
             .expect("failed to parse reference");
 
         let image = c
@@ -2128,9 +2130,21 @@ mod test {
             .expect("Failed to pull manifest");
         assert!(image.layers.len() > 1);
 
-        c.push(&dest_image, &image, &RegistryAuth::Anonymous)
-            .await
-            .expect("Failed to pull manifest");
+        let ImageData {
+            layers,
+            config,
+            manifest,
+            ..
+        } = image;
+        c.push(
+            &dest_image,
+            layers,
+            config,
+            &RegistryAuth::Anonymous,
+            manifest,
+        )
+        .await
+        .expect("Failed to pull manifest");
 
         c.pull_image_manifest(&dest_image, &RegistryAuth::Anonymous)
             .await
