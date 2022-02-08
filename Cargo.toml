@@ -26,9 +26,11 @@ version = "0.8.1"
 maintenance = {status = "actively-developed"}
 
 [features]
-default = ["native-tls"]
+default = ["native-tls", "test-registry"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
+# This features is used by tests that use docker to create a registry
+test-registry = []
 
 [dependencies]
 anyhow = "1.0"
@@ -52,3 +54,4 @@ olpc-cjson = "0.1.1"
 rstest = "0.11"
 hmac = "0.11"
 tracing-subscriber = "0.3.7"
+testcontainers = "0.12.0"
