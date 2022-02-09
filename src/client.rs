@@ -1093,7 +1093,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             protocol: ClientProtocol::default(),
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(feature = "native-tls")]
             accept_invalid_hostnames: false,
             accept_invalid_certificates: false,
             extra_root_certificates: Vec::new(),
