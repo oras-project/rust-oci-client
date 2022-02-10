@@ -1,6 +1,8 @@
 //! OCI Manifest
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 /// The mediatype for a WASM image config.
@@ -22,6 +24,8 @@ pub const IMAGE_DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.contain
 pub const IMAGE_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 /// The mediatype for a layer that is gzipped.
 pub const IMAGE_LAYER_GZIP_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+/// The mediatype that Docker uses for a layer that is tarred.
+pub const IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar";
 /// The mediatype that Docker uses for a layer that is gzipped.
 pub const IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE: &str =
     "application/vnd.docker.image.rootfs.diff.tar.gzip";
@@ -44,6 +48,16 @@ pub enum OciManifest {
     ImageIndex(OciImageIndex),
 }
 
+impl OciManifest {
+    /// Returns the appropriate content-type for each variant.
+    pub fn content_type(&self) -> &str {
+        match self {
+            OciManifest::Image(_) => OCI_IMAGE_MEDIA_TYPE,
+            OciManifest::ImageIndex(_) => IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+        }
+    }
+}
+
 /// The OCI image manifest describes an OCI image.
 ///
 /// It is part of the OCI specification, and is defined here:
@@ -62,6 +76,7 @@ pub struct OciImageManifest {
     ///
     /// It is reserved for compatibility, but the specification does not seem
     /// to recommend setting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 
     /// The image configuration.
@@ -80,6 +95,7 @@ pub struct OciImageManifest {
     /// The specification says "If there are no annotations then this property
     /// MUST either be absent or be an empty map."
     /// TO accomodate either, this is optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -95,6 +111,42 @@ impl Default for OciImageManifest {
     }
 }
 
+impl From<OciImageIndex> for OciManifest {
+    fn from(m: OciImageIndex) -> Self {
+        Self::ImageIndex(m)
+    }
+}
+impl From<OciImageManifest> for OciManifest {
+    fn from(m: OciImageManifest) -> Self {
+        Self::Image(m)
+    }
+}
+
+fn write_json(obj: &impl Serialize, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+        f,
+        "{}",
+        serde_json::to_string(obj).map_err(|_| std::fmt::Error)?
+    )
+}
+impl std::fmt::Display for OciManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_json(self, f)
+    }
+}
+
+impl std::fmt::Display for OciImageIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_json(self, f)
+    }
+}
+
+impl std::fmt::Display for OciImageManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_json(self, f)
+    }
+}
+
 /// Versioned provides a struct with the manifest's schemaVersion and mediaType.
 /// Incoming content with unknown schema versions can be decoded against this
 /// struct to check the version.
@@ -105,6 +157,7 @@ pub struct Versioned {
     pub schema_version: i32,
 
     /// media_type is the media type of this schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 }
 
@@ -141,11 +194,13 @@ pub struct OciDescriptor {
     /// This OPTIONAL property specifies a list of URIs from which this
     /// object MAY be downloaded. Each entry MUST conform to RFC 3986.
     /// Entries SHOULD use the http and https schemes, as defined in RFC 7230.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
 
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the annotation rules.
     /// https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -179,6 +234,7 @@ pub struct OciImageIndex {
     ///
     /// It is reserved for compatibility, but the specification does not seem
     /// to recommend setting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 
     /// This property contains a list of manifests for specific platforms.
@@ -219,10 +275,12 @@ pub struct ImageIndexEntry {
     pub size: i64,
     /// This OPTIONAL property describes the minimum runtime requirements of the image.
     /// This property SHOULD be present if its target is platform-specific.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 
     /// This OPTIONAL property contains arbitrary metadata for the image index.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
 
@@ -248,17 +306,21 @@ pub struct Platform {
     /// to work with the host OS version.
     /// Valid values are implementation-defined. e.g. `10.0.14393.1066` on `windows`.
     #[serde(rename = "os.version")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub os_version: Option<String>,
     /// This OPTIONAL property specifies an array of strings, each specifying a mandatory OS feature.
     /// When `os` is `windows`, image indexes SHOULD use, and implementations SHOULD understand the following values:
     /// - `win32k`: image requires `win32k.sys` on the host (Note: `win32k.sys` is missing on Nano Server)
     /// When `os` is not `windows`, values are implementation-defined and SHOULD be submitted to this specification for standardization.
     #[serde(rename = "os.features")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub os_features: Option<Vec<String>>,
     /// This OPTIONAL property specifies the variant of the CPU.
     /// Image indexes SHOULD use, and implementations SHOULD understand, `variant` values listed in the [Platform Variants](#platform-variants) table.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// This property is RESERVED for future versions of the specification.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
 }
 

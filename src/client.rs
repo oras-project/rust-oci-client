@@ -5,7 +5,7 @@
 
 use crate::errors::*;
 use crate::manifest::{
-    ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest, Versioned,
+    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, IMAGE_MANIFEST_LIST_MEDIA_TYPE,
     IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
 };
@@ -278,7 +278,7 @@ impl Client {
         let config_url = self
             .push_config(image_ref, config_data, &manifest.config.digest)
             .await?;
-        let manifest_url = self.push_manifest(image_ref, &manifest).await?;
+        let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
 
         Ok(PushResponse {
             image_url,
@@ -681,6 +681,20 @@ impl Client {
         Ok((manifest, digest, String::from_utf8(out)?))
     }
 
+    /// Push a manifest list to an OCI registry.
+    ///
+    /// This pushes a manifest list to an OCI registry.
+    pub async fn push_manifest_list(
+        &mut self,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        manifest: OciImageIndex,
+    ) -> anyhow::Result<String> {
+        let _response = self.auth(reference, auth, RegistryOperation::Push).await?;
+        self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
+            .await
+    }
+
     /// Pull a single layer from an OCI registry.
     ///
     /// This pulls the layer for a particular image that is identified by
@@ -811,12 +825,13 @@ impl Client {
     async fn push_manifest(
         &self,
         image: &Reference,
-        manifest: &OciImageManifest,
+        manifest: &OciManifest,
     ) -> anyhow::Result<String> {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", OCI_IMAGE_MEDIA_TYPE.parse().unwrap());
+        let content_type = manifest.content_type();
+        headers.insert("Content-Type", content_type.parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
@@ -2017,7 +2032,7 @@ mod test {
         let new_manifest =
             c.generate_manifest(&image_data, &config_data, manifest::WASM_CONFIG_MEDIA_TYPE);
 
-        c.push_manifest(&push_image, &new_manifest)
+        c.push_manifest(&push_image, &new_manifest.into())
             .await
             .expect("error pushing manifest");
 
