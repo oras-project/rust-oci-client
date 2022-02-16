@@ -325,7 +325,7 @@ impl Client {
     ///
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
-    async fn auth(
+    pub async fn auth(
         &mut self,
         image: &Reference,
         authentication: &RegistryAuth,
