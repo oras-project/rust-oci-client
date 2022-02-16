@@ -726,7 +726,7 @@ impl Client {
     /// repository and the registry, but it is not used to verify that
     /// the digest is a layer inside of the image. (The manifest is
     /// used for that.)
-    async fn pull_blob<T: AsyncWrite + Unpin>(
+    pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
         digest: &str,
