@@ -13,6 +13,8 @@ mod token_cache;
 pub use client::Client;
 #[doc(inline)]
 pub use reference::{ParseError, Reference};
+#[doc(inline)]
+pub use token_cache::RegistryOperation;
 
 #[macro_use]
 extern crate lazy_static;
