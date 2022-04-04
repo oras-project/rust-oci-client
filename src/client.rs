@@ -325,7 +325,7 @@ impl Client {
     ///
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
-    async fn auth(
+    pub async fn auth(
         &mut self,
         image: &Reference,
         authentication: &RegistryAuth,
@@ -726,7 +726,7 @@ impl Client {
     /// repository and the registry, but it is not used to verify that
     /// the digest is a layer inside of the image. (The manifest is
     /// used for that.)
-    async fn pull_blob<T: AsyncWrite + Unpin>(
+    pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
         digest: &str,
