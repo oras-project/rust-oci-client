@@ -50,27 +50,6 @@ pub struct ImageData {
     pub manifest: Option<OciImageManifest>,
 }
 
-impl ImageData {
-    /// Helper function to compute the digest of the image layers
-    pub fn sha256_digest(&self) -> String {
-        sha256_digest(
-            &self
-                .layers
-                .iter()
-                .cloned()
-                .map(|l| l.data)
-                .flatten()
-                .collect::<Vec<u8>>(),
-        )
-    }
-
-    /// Returns the image digest, either the value in the field or by computing it
-    /// If the value in the field is None, the computed value will be stored
-    pub fn digest(&self) -> String {
-        self.digest.clone().unwrap_or_else(|| self.sha256_digest())
-    }
-}
-
 /// The data returned by an OCI registry after a successful push
 /// operation is completed
 pub struct PushResponse {
