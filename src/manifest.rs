@@ -1,8 +1,6 @@
 //! OCI Manifest
 use std::collections::HashMap;
 
-use serde::Serialize;
-
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 /// The mediatype for a WASM image config.
@@ -122,28 +120,50 @@ impl From<OciImageManifest> for OciManifest {
     }
 }
 
-fn write_json(obj: &impl Serialize, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-        f,
-        "{}",
-        serde_json::to_string(obj).map_err(|_| std::fmt::Error)?
-    )
-}
 impl std::fmt::Display for OciManifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_json(self, f)
+        match self {
+            OciManifest::Image(oci_image_manifest) => write!(f, "{}", oci_image_manifest),
+            OciManifest::ImageIndex(oci_image_index) => write!(f, "{}", oci_image_index),
+        }
     }
 }
 
 impl std::fmt::Display for OciImageIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_json(self, f)
+        let media_type = self
+            .media_type
+            .clone()
+            .unwrap_or_else(|| String::from("N/A"));
+        let manifests: Vec<String> = self.manifests.iter().map(|m| m.to_string()).collect();
+        write!(
+            f,
+            "OCI Image Index( schema-version: '{}', media-type: '{}', manifests: '{}' )",
+            self.schema_version,
+            media_type,
+            manifests.join(","),
+        )
     }
 }
 
 impl std::fmt::Display for OciImageManifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_json(self, f)
+        let media_type = self
+            .media_type
+            .clone()
+            .unwrap_or_else(|| String::from("N/A"));
+        let annotations = self.annotations.clone().unwrap_or_default();
+        let layers: Vec<String> = self.layers.iter().map(|l| l.to_string()).collect();
+
+        write!(
+            f,
+            "OCI Image Manifest( schema-version: '{}', media-type: '{}', config: '{}', layers: '{:?}', annotations: '{:?}' )",
+            self.schema_version,
+            media_type,
+            self.config,
+            layers,
+            annotations,
+        )
     }
 }
 
@@ -202,6 +222,19 @@ pub struct OciDescriptor {
     /// https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Display for OciDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let urls = self.urls.clone().unwrap_or_default();
+        let annotations = self.annotations.clone().unwrap_or_default();
+
+        write!(
+            f,
+            "( media-type: '{}', digest: '{}', size: '{}', urls: '{:?}', annotations: '{:?}' )",
+            self.media_type, self.digest, self.size, urls, annotations,
+        )
+    }
 }
 
 impl Default for OciDescriptor {
@@ -284,6 +317,23 @@ pub struct ImageIndexEntry {
     pub annotations: Option<HashMap<String, String>>,
 }
 
+impl std::fmt::Display for ImageIndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let platform = self
+            .platform
+            .clone()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| String::from("N/A"));
+        let annotations = self.annotations.clone().unwrap_or_default();
+
+        write!(
+            f,
+            "(media-type: '{}', digest: '{}', size: '{}', platform: '{}', annotations: {:?})",
+            self.media_type, self.digest, self.size, platform, annotations,
+        )
+    }
+}
+
 /// Platform specific fields of an Image Index manifest entry.
 ///
 /// It is part of the OCI specification, and is in the `platform`
@@ -322,6 +372,26 @@ pub struct Platform {
     /// This property is RESERVED for future versions of the specification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let os_version = self
+            .os_version
+            .clone()
+            .unwrap_or_else(|| String::from("N/A"));
+        let os_features = self.os_features.clone().unwrap_or_default();
+        let variant = self.variant.clone().unwrap_or_else(|| String::from("N/A"));
+        let features = self.os_features.clone().unwrap_or_default();
+        write!(f, "( architecture: '{}', os: '{}', os-version: '{}', os-features: '{:?}', variant: '{}', features: '{:?}' )",
+            self.architecture,
+            self.os,
+            os_version,
+            os_features,
+            variant,
+            features,
+        )
+    }
 }
 
 #[cfg(test)]
