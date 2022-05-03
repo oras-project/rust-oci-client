@@ -616,6 +616,9 @@ impl Client {
                     .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
                 Ok((manifest, digest))
             }
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(OciDistributionError::UnauthorizedError { url })
+            }
             s if s.is_client_error() => {
                 // According to the OCI spec, we should see an error in the message body.
                 let envelope = res.json::<OciEnvelope>().await?;
