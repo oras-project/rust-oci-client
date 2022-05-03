@@ -1,36 +1,17 @@
 extern crate oci_distribution;
-use oci_distribution::{manifest, secrets::RegistryAuth, Client, Reference};
+use oci_distribution::{secrets::RegistryAuth, Client, Reference};
 
-use clap::Parser;
 use docker_credential::{CredentialRetrievalError, DockerCredential};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
-/// Pull a WebAssembly module from a OCI container registry
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Cli {
-    /// Enable verbose mode
-    #[clap(short, long)]
-    verbose: bool,
+mod cli;
+use clap::Parser;
+use cli::Cli;
 
-    /// Perform anonymous operation, by default the tool tries to reuse the docker credentials read
-    /// from the default docker file
-    #[clap(short, long)]
-    anonymous: bool,
-
-    /// Pull image from registry using HTTP instead of HTTPS
-    #[clap(short, long)]
-    insecure: bool,
-
-    /// Write contents to file
-    #[clap(short, long)]
-    output: String,
-
-    /// Name of the image to pull
-    image: String,
-}
+mod pull;
+use pull::pull_wasm;
 
 fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     let server = reference
@@ -84,21 +65,11 @@ pub async fn main() {
     let client_config = build_client_config(&cli);
     let mut client = Client::new(client_config);
 
-    let reference: Reference = cli.image.parse().expect("Not a valid image reference");
-    info!(?reference, "fetching wasm module");
-
-    let auth = build_auth(&reference, &cli);
-
-    let image_content = client
-        .pull(&reference, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
-        .await
-        .expect("Cannot pull Wasm module")
-        .layers
-        .into_iter()
-        .next()
-        .map(|layer| layer.data)
-        .expect("No data found");
-
-    std::fs::write(&cli.output, image_content).expect("Cannot write to file");
-    println!("Wasm module successfully written to {}", &cli.output);
+    match &cli.command {
+        crate::cli::Commands::Pull { output, image } => {
+            let reference: Reference = image.parse().expect("Not a valid image reference");
+            let auth = build_auth(&reference, &cli);
+            pull_wasm(&mut client, &auth, &reference, &output).await;
+        }
+    }
 }
