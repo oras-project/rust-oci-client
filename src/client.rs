@@ -23,7 +23,7 @@ use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use serde::Serialize;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -252,7 +252,7 @@ impl Client {
     pub async fn push(
         &mut self,
         image_ref: &Reference,
-        layers: Vec<ImageLayer>,
+        layers: &[ImageLayer],
         config: Config,
         auth: &RegistryAuth,
         manifest: Option<OciImageManifest>,
@@ -265,18 +265,41 @@ impl Client {
 
         let manifest: OciImageManifest = match manifest {
             Some(m) => m,
-            None => self.generate_manifest(&layers, &config),
+            None => self.generate_manifest(layers, &config),
         };
 
         // Upload layers
         for layer in layers {
             let digest = layer.sha256_digest();
-            self.push_blob(image_ref, layer.data, &digest).await?;
+            match self
+                .push_blob_chunked(image_ref, &layer.data, &digest)
+                .await
+            {
+                Err(OciDistributionError::SpecViolationError(violation)) => {
+                    warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
+                    warn!("Attempting monolithic push");
+                    self.push_blob_monolithically(image_ref, &layer.data, &digest)
+                        .await?;
+                }
+                Err(e) => return Err(e),
+                _ => {}
+            };
         }
 
-        let config_url = self
-            .push_blob(image_ref, config.data, &manifest.config.digest)
-            .await?;
+        let config_url = match self
+            .push_blob_chunked(image_ref, &config.data, &manifest.config.digest)
+            .await
+        {
+            Ok(url) => url,
+            Err(OciDistributionError::SpecViolationError(violation)) => {
+                warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
+                warn!("Attempting monolithic push");
+                self.push_blob_monolithically(image_ref, &config.data, &manifest.config.digest)
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
+
         let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
 
         Ok(PushResponse {
@@ -285,18 +308,32 @@ impl Client {
         })
     }
 
-    /// Pushes a blob to the registry
+    /// Pushes a blob to the registry as a monolith
     ///
     /// Returns the pullable location of the blob
-    async fn push_blob(
+    async fn push_blob_monolithically(
         &self,
         image: &Reference,
-        blob_data: Vec<u8>,
+        blob_data: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let location = self.begin_push_session(image).await?;
+        let location = self.begin_push_monolithical_session(image).await?;
+        self.push_monolithically(&location, image, blob_data, blob_digest)
+            .await
+    }
+
+    /// Pushes a blob to the registry as a series of chunks
+    ///
+    /// Returns the pullable location of the blob
+    async fn push_blob_chunked(
+        &self,
+        image: &Reference,
+        blob_data: &[u8],
+        blob_digest: &str,
+    ) -> Result<String> {
+        let location = self.begin_push_chunked_session(image).await?;
         let (end_location, _) = self.push_chunk(&location, image, blob_data, 0).await?;
-        self.end_push_session(&end_location, image, blob_digest)
+        self.end_push_chunked_session(&end_location, image, blob_digest)
             .await
     }
 
@@ -438,6 +475,11 @@ impl Client {
                 reqwest::StatusCode::UNAUTHORIZED => {
                     Err(OciDistributionError::UnauthorizedError { url })
                 }
+                s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
+                    "Expected HTTP Status {}, got {} instead",
+                    reqwest::StatusCode::OK,
+                    status,
+                ))),
                 s if s.is_client_error() => {
                     // According to the OCI spec, we should see an error in the message body.
                     let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
@@ -461,6 +503,11 @@ impl Client {
                 reqwest::StatusCode::UNAUTHORIZED => {
                     Err(OciDistributionError::UnauthorizedError { url })
                 }
+                s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
+                    "Expected HTTP Status {}, got {} instead",
+                    reqwest::StatusCode::OK,
+                    status,
+                ))),
                 s if s.is_client_error() => {
                     // According to the OCI spec, we should see an error in the message body.
                     let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
@@ -604,6 +651,9 @@ impl Client {
         // Obviously, HTTP servers are going to send other codes. This tries to catch the
         // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
         match res.status() {
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(OciDistributionError::UnauthorizedError { url })
+            }
             reqwest::StatusCode::OK => {
                 let headers = res.headers().clone();
                 let text = res.text().await?;
@@ -616,9 +666,11 @@ impl Client {
                     .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
                 Ok((manifest, digest))
             }
-            reqwest::StatusCode::UNAUTHORIZED => {
-                Err(OciDistributionError::UnauthorizedError { url })
-            }
+            s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
+                "Expected HTTP Status {}, got {} instead",
+                reqwest::StatusCode::OK,
+                s,
+            ))),
             s if s.is_client_error() => {
                 // According to the OCI spec, we should see an error in the message body.
                 let envelope = res.json::<OciEnvelope>().await?;
@@ -747,11 +799,29 @@ impl Client {
         Ok(())
     }
 
-    /// Begins a session to push an image to registry
+    /// Begins a session to push an image to registry in a monolithical way
     ///
     /// Returns URL with session UUID
-    async fn begin_push_session(&self, image: &Reference) -> Result<String> {
+    async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
+        debug!(?url, "begin_push_monolithical_session");
+        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
+            .apply_auth(image, RegistryOperation::Push)?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        // OCI spec requires the status code be 202 Accepted to successfully begin the push process
+        self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
+            .await
+    }
+
+    /// Begins a session to push an image to registry as a series of chunks
+    ///
+    /// Returns URL with session UUID
+    async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
+        let url = &self.to_v2_blob_upload_url(image);
+        debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
@@ -764,10 +834,10 @@ impl Client {
             .await
     }
 
-    /// Closes the push session
+    /// Closes the chunked push session
     ///
     /// Returns the pullable URL for the image
-    async fn end_push_session(
+    async fn end_push_chunked_session(
         &self,
         location: &str,
         image: &Reference,
@@ -785,6 +855,44 @@ impl Client {
             .await
     }
 
+    /// Pushes a layer to a registry as a monolithical blob.
+    ///
+    /// Returns the URL location for the next layer
+    async fn push_monolithically(
+        &self,
+        location: &str,
+        image: &Reference,
+        layer: &[u8],
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut url = url::Url::parse(location).unwrap();
+        url.query_pairs_mut().append_pair("digest", blob_digest);
+        let url = url.to_string();
+
+        debug!(size = layer.len(), location = ?url, "Pushing monolithically");
+        if layer.is_empty() {
+            return Err(OciDistributionError::PushNoDataError);
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Length",
+            format!("{}", layer.len()).parse().unwrap(),
+        );
+        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+            .apply_auth(image, RegistryOperation::Push)?
+            .into_request_builder()
+            .headers(headers)
+            .body(layer.to_vec())
+            .send()
+            .await?;
+
+        // Returns location
+        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await
+    }
+
     /// Pushes a single chunk of a blob to a registry,
     /// as part of a chunked blob upload.
     ///
@@ -793,12 +901,12 @@ impl Client {
         &self,
         location: &str,
         image: &Reference,
-        layer: Vec<u8>,
+        layer: &[u8],
         start_byte: usize,
     ) -> Result<(String, usize)> {
-        trace!("Pushing chunk. size={}, location={}", layer.len(), location);
+        debug!("Pushing chunk. size={}, location={}", layer.len(), location);
         if layer.is_empty() {
-            return Err(OciDistributionError::PushChunkNoDataError);
+            return Err(OciDistributionError::PushNoDataError);
         };
         let end_byte = start_byte + layer.len() - 1;
         let mut headers = HeaderMap::new();
@@ -816,7 +924,7 @@ impl Client {
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
-            .body(layer)
+            .body(layer.to_vec())
             .send()
             .await?;
 
@@ -844,6 +952,14 @@ impl Client {
         let mut ser = serde_json::Serializer::with_formatter(&mut body, CanonicalFormatter::new());
         manifest.serialize(&mut ser).unwrap();
 
+        // Calculate the digest of the manifest, this is useful
+        // if the remote registry is violating the OCI Distribution Specification.
+        // See below for more details.
+        let mut hasher = Sha256::new();
+        hasher.update(&body);
+        let hash = hasher.finalize();
+
+        debug!(?url, ?content_type, "push manifest");
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
@@ -852,8 +968,23 @@ impl Client {
             .send()
             .await?;
 
-        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
-            .await
+        let ret = self
+            .extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await;
+
+        if matches!(ret, Err(OciDistributionError::RegistryNoLocationError)) {
+            // The registry is violating the OCI Distribution Spec, BUT the OCI
+            // image/artifact has been uploaded successfully.
+            // The `Location` header contains the sha256 digest of the manifest,
+            // we can reuse the value we calculated before.
+            // The workaround is there because repositories such as
+            // AWS ECR are violating this aspect of the spec. This at least let the
+            // oci-distribution users interact with these registries.
+            warn!("Registry is not respecting the OCI Distribution Specification: it didn't return the Location of the uploaded Manifest inside of the response headers. Working around this issue...");
+            return Ok(format!("sha256:{:#02x}", hash));
+        }
+
+        ret
     }
 
     async fn extract_location_header(
@@ -862,12 +993,22 @@ impl Client {
         res: reqwest::Response,
         expected_status: &reqwest::StatusCode,
     ) -> Result<String> {
+        debug!(expected_status_code=?expected_status.as_u16(),
+            status_code=?res.status().as_u16(),
+            "extract location header");
         if res.status().eq(expected_status) {
             let location_header = res.headers().get("Location");
+            debug!(location=?location_header, "Location header");
             match location_header {
                 None => Err(OciDistributionError::RegistryNoLocationError),
                 Some(lh) => self.location_header_to_url(image, lh),
             }
+        } else if res.status().is_success() && expected_status.is_success() {
+            Err(OciDistributionError::SpecViolationError(format!(
+                "Expected HTTP Status {}, got {} instead",
+                expected_status,
+                res.status(),
+            )))
         } else {
             let url = res.url().to_string();
             let code = res.status().as_u16();
@@ -1926,14 +2067,14 @@ mod test {
             .expect("result from auth request");
 
         let location = c
-            .begin_push_session(&image)
+            .begin_push_chunked_session(&image)
             .await
             .expect("failed to begin push session");
 
         let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
 
         let (next_location, next_byte) = c
-            .push_chunk(&location, &image, image_data[0].clone(), 0)
+            .push_chunk(&location, &image, &image_data[0], 0)
             .await
             .expect("failed to push layer");
 
@@ -1945,7 +2086,7 @@ mod test {
         );
 
         let layer_location = c
-            .end_push_session(&next_location, &image, &sha256_digest(&image_data[0]))
+            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data[0]))
             .await
             .expect("failed to end push session");
 
@@ -1978,7 +2119,7 @@ mod test {
         ];
 
         let mut location = c
-            .begin_push_session(&image)
+            .begin_push_chunked_session(&image)
             .await
             .expect("failed to begin push session");
 
@@ -1986,7 +2127,7 @@ mod test {
 
         for layer in image_data.clone() {
             let (next_location, next_byte) = c
-                .push_chunk(&location, &image, layer.clone(), start_byte)
+                .push_chunk(&location, &image, &layer, start_byte)
                 .await
                 .expect("failed to push layer");
 
@@ -2000,7 +2141,7 @@ mod test {
         }
 
         let layer_location = c
-            .end_push_session(
+            .end_push_chunked_session(
                 &location,
                 &image,
                 &sha256_digest(
@@ -2060,7 +2201,7 @@ mod test {
 
         c.push(
             &push_image,
-            image_data.layers.clone(),
+            &image_data.layers,
             image_data.config.clone(),
             &RegistryAuth::Anonymous,
             Some(manifest.clone()),
@@ -2167,7 +2308,7 @@ mod test {
         } = image;
         c.push(
             &dest_image,
-            layers,
+            &layers,
             config,
             &RegistryAuth::Anonymous,
             manifest,
