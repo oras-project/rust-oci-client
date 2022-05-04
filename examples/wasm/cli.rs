@@ -32,4 +32,12 @@ pub(crate) enum Commands {
         /// Name of the image to pull
         image: String,
     },
+    #[clap(arg_required_else_help = true)]
+    Push {
+        /// Wasm file to push
+        module: String,
+
+        /// Name of the image to pull
+        image: String,
+    },
 }

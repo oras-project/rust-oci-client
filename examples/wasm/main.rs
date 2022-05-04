@@ -13,6 +13,9 @@ use cli::Cli;
 mod pull;
 use pull::pull_wasm;
 
+mod push;
+use push::push_wasm;
+
 fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     let server = reference
         .resolve_registry()
@@ -25,6 +28,7 @@ fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
 
     match docker_credential::get_credential(server) {
         Err(CredentialRetrievalError::ConfigNotFound) => RegistryAuth::Anonymous,
+        Err(CredentialRetrievalError::NoCredentialConfigured) => RegistryAuth::Anonymous,
         Err(e) => panic!("Error handling docker configuration file: {}", e),
         Ok(DockerCredential::UsernamePassword(username, password)) => {
             debug!("Found docker credentials");
@@ -70,6 +74,11 @@ pub async fn main() {
             let reference: Reference = image.parse().expect("Not a valid image reference");
             let auth = build_auth(&reference, &cli);
             pull_wasm(&mut client, &auth, &reference, &output).await;
+        }
+        crate::cli::Commands::Push { module, image } => {
+            let reference: Reference = image.parse().expect("Not a valid image reference");
+            let auth = build_auth(&reference, &cli);
+            push_wasm(&mut client, &auth, &reference, &module).await;
         }
     }
 }
