@@ -98,7 +98,7 @@ pub type Result<T> = std::result::Result<T, OciDistributionError>;
 /// The OCI specification defines a specific error format.
 ///
 /// This struct represents that error format, which is formally described here:
-/// https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2
+/// <https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2>
 #[derive(serde::Deserialize, Debug)]
 pub struct OciError {
     /// The error code
@@ -137,7 +137,7 @@ impl std::fmt::Display for OciEnvelope {
 
 /// OCI error codes
 ///
-/// Outlined here: https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2
+/// Outlined [here](https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2)
 #[derive(serde::Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OciErrorCode {
