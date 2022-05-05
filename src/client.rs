@@ -23,7 +23,6 @@ use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -916,9 +915,7 @@ impl Client {
         // Calculate the digest of the manifest, this is useful
         // if the remote registry is violating the OCI Distribution Specification.
         // See below for more details.
-        let mut hasher = Sha256::new();
-        hasher.update(&body);
-        let hash = hasher.finalize();
+        let manifest_hash = sha256_digest(&body);
 
         debug!(?url, ?content_type, "push manifest");
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
@@ -942,7 +939,7 @@ impl Client {
             // AWS ECR are violating this aspect of the spec. This at least let the
             // oci-distribution users interact with these registries.
             warn!("Registry is not respecting the OCI Distribution Specification: it didn't return the Location of the uploaded Manifest inside of the response headers. Working around this issue...");
-            return Ok(format!("sha256:{:#02x}", hash));
+            return Ok(manifest_hash);
         }
 
         ret
