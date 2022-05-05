@@ -4,6 +4,7 @@
 pub mod client;
 pub mod errors;
 pub mod manifest;
+pub mod oci_annotations;
 mod reference;
 mod regexp;
 pub mod secrets;

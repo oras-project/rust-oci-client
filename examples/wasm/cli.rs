@@ -34,6 +34,17 @@ pub(crate) enum Commands {
     },
     #[clap(arg_required_else_help = true)]
     Push {
+        /// OCI Annotations to be added to the manifest
+        #[clap(
+            short,
+            long,
+            parse(from_str),
+            takes_value(true),
+            required(false),
+            multiple_occurrences(true)
+        )]
+        annotations: Vec<String>,
+
         /// Wasm file to push
         module: String,
 

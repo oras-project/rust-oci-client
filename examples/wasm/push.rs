@@ -4,6 +4,7 @@ use oci_distribution::{
     secrets::RegistryAuth,
     Client, Reference,
 };
+use std::collections::HashMap;
 use tracing::info;
 
 pub(crate) async fn push_wasm(
@@ -11,6 +12,7 @@ pub(crate) async fn push_wasm(
     auth: &RegistryAuth,
     reference: &Reference,
     module: &str,
+    annotations: Option<HashMap<String, String>>,
 ) {
     info!(?reference, ?module, "pushing wasm module");
 
@@ -21,15 +23,19 @@ pub(crate) async fn push_wasm(
     let layers = vec![ImageLayer::new(
         data,
         manifest::WASM_LAYER_MEDIA_TYPE.to_string(),
+        None,
     )];
 
     let config = Config {
         data: b"{}".to_vec(),
         media_type: manifest::WASM_CONFIG_MEDIA_TYPE.to_string(),
+        annotations: None,
     };
 
+    let image_manifest = manifest::OciImageManifest::build(&layers, &config, annotations);
+
     let response = client
-        .push(&reference, &layers, config, &auth, None)
+        .push(&reference, &layers, config, &auth, Some(image_manifest))
         .await
         .map(|push_response| push_response.manifest_url)
         .expect("Cannot push Wasm module");

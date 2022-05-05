@@ -1,6 +1,8 @@
 //! OCI Manifest
 use std::collections::HashMap;
 
+use crate::client::{sha256_digest, Config, ImageLayer};
+
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 /// The mediatype for a WASM image config.
@@ -33,8 +35,6 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_MEDIA_TYPE: &str =
 /// The mediatype for a layer that is nondistributable and gzipped.
 pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
     "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
-
-// TODO: Annotation key constants. https://github.com/opencontainers/image-spec/blob/master/annotations.md#pre-defined-annotation-keys
 
 /// An image, or image index, OCI manifest
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -106,6 +106,41 @@ impl Default for OciImageManifest {
             layers: vec![],
             annotations: None,
         }
+    }
+}
+
+impl OciImageManifest {
+    /// Create a new OciImageManifest using the given parameters
+    ///
+    /// This can be useful to create an OCI Image Manifest with
+    /// custom annotations.
+    pub fn build(
+        layers: &[ImageLayer],
+        config: &Config,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Self {
+        let mut manifest = OciImageManifest::default();
+
+        manifest.config.media_type = config.media_type.to_string();
+        manifest.config.size = config.data.len() as i64;
+        manifest.config.digest = sha256_digest(&config.data);
+        manifest.annotations = annotations;
+
+        for layer in layers {
+            let digest = sha256_digest(&layer.data);
+
+            let descriptor = OciDescriptor {
+                size: layer.data.len() as i64,
+                digest,
+                media_type: layer.media_type.to_string(),
+                annotations: layer.annotations.clone(),
+                ..Default::default()
+            };
+
+            manifest.layers.push(descriptor);
+        }
+
+        manifest
     }
 }
 
@@ -273,6 +308,14 @@ pub struct OciImageIndex {
     /// This property contains a list of manifests for specific platforms.
     /// The spec says this field must be present but the value may be an empty array.
     pub manifests: Vec<ImageIndexEntry>,
+
+    /// The annotations for this manifest
+    ///
+    /// The specification says "If there are no annotations then this property
+    /// MUST either be absent or be an empty map."
+    /// TO accomodate either, this is optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// The manifest entry of an `ImageIndex`.

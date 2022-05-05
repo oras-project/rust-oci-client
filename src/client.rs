@@ -5,7 +5,7 @@
 
 use crate::errors::*;
 use crate::manifest::{
-    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
+    ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest, Versioned,
     IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
@@ -24,6 +24,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -66,23 +67,34 @@ pub struct ImageLayer {
     pub data: Vec<u8>,
     /// The media type of this layer
     pub media_type: String,
+    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
+    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 impl ImageLayer {
     /// Constructs a new ImageLayer struct with provided data and media type
-    pub fn new(data: Vec<u8>, media_type: String) -> Self {
-        ImageLayer { data, media_type }
+    pub fn new(
+        data: Vec<u8>,
+        media_type: String,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Self {
+        ImageLayer {
+            data,
+            media_type,
+            annotations,
+        }
     }
 
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(data: Vec<u8>) -> Self {
-        Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string())
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+        Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
     }
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(data: Vec<u8>) -> Self {
-        Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string())
+    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+        Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
     }
 
     /// Helper function to compute the sha256 digest of an image layer
@@ -98,18 +110,29 @@ pub struct Config {
     pub data: Vec<u8>,
     /// The media type of this object
     pub media_type: String,
+    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
+    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 impl Config {
     /// Constructs a new Config struct with provided data and media type
-    pub fn new(data: Vec<u8>, media_type: String) -> Self {
-        Config { data, media_type }
+    pub fn new(
+        data: Vec<u8>,
+        media_type: String,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Self {
+        Config {
+            data,
+            media_type,
+            annotations,
+        }
     }
 
     /// Constructs a new Config struct with provided data and
     /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(data: Vec<u8>) -> Self {
-        Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string())
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+        Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
     }
 
     /// Helper function to compute the sha256 digest of this config object
@@ -226,7 +249,11 @@ impl Client {
                 let mut out: Vec<u8> = Vec::new();
                 debug!("Pulling image layer");
                 this.pull_blob(image, &layer.digest, &mut out).await?;
-                Ok::<_, OciDistributionError>(ImageLayer::new(out, layer.media_type.clone()))
+                Ok::<_, OciDistributionError>(ImageLayer::new(
+                    out,
+                    layer.media_type.clone(),
+                    layer.annotations.clone(),
+                ))
             }
         });
 
@@ -265,7 +292,7 @@ impl Client {
 
         let manifest: OciImageManifest = match manifest {
             Some(m) => m,
-            None => self.generate_manifest(layers, &config),
+            None => OciImageManifest::build(layers, &config, None),
         };
 
         // Upload layers
@@ -686,7 +713,8 @@ impl Client {
         self.pull_blob(image, &manifest.config.digest, &mut out)
             .await?;
         let media_type = manifest.config.media_type.clone();
-        Ok((manifest, digest, Config::new(out, media_type)))
+        let annotations = manifest.annotations.clone();
+        Ok((manifest, digest, Config::new(out, media_type, annotations)))
     }
 
     /// Push a manifest list to an OCI registry.
@@ -970,37 +998,6 @@ impl Client {
         } else {
             Ok(lh.to_string())
         }
-    }
-
-    fn generate_manifest(&self, layers: &[ImageLayer], config: &Config) -> OciImageManifest {
-        let mut manifest = OciImageManifest::default();
-
-        manifest.config.media_type = config.media_type.to_string();
-        manifest.config.size = config.data.len() as i64;
-        manifest.config.digest = sha256_digest(&config.data);
-
-        for layer in layers {
-            let digest = sha256_digest(&layer.data);
-
-            //TODO: Determine necessity of generating an image title
-            let mut annotations = HashMap::new();
-            annotations.insert(
-                "org.opencontainers.image.title".to_string(),
-                digest.to_string(),
-            );
-
-            let descriptor = OciDescriptor {
-                size: layer.data.len() as i64,
-                digest,
-                media_type: layer.media_type.to_string(),
-                annotations: Some(annotations),
-                ..Default::default()
-            };
-
-            manifest.layers.push(descriptor);
-        }
-
-        manifest
     }
 
     /// Convert a Reference to a v2 manifest URL.
@@ -1397,7 +1394,7 @@ fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> Result<String>
 }
 
 /// Computes the SHA256 digest of a byte vector
-fn sha256_digest(bytes: &[u8]) -> String {
+pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", sha2::Sha256::digest(bytes))
 }
 
