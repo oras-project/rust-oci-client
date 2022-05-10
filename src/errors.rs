@@ -1,5 +1,96 @@
 //! Errors related to interacting with an OCI compliant remote store
 
+use thiserror::Error;
+
+/// Errors that can be raised while interacting with an OCI registry
+#[derive(Error, Debug)]
+pub enum OciDistributionError {
+    /// Authentication error
+    #[error("Authentication failure: {0}")]
+    AuthenticationFailure(String),
+    /// Generic error, might provide an explanation message
+    #[error("Generic error: {0:?}")]
+    GenericError(Option<String>),
+    /// Transparent wrapper around `reqwest::header::ToStrError`
+    #[error(transparent)]
+    HeaderValueError(#[from] reqwest::header::ToStrError),
+    /// IO Error
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    /// Platform resolver not specified
+    #[error("Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver")]
+    ImageIndexParsingNoPlatformResolverError,
+    /// Image manifest not found
+    #[error("Image manifest not found: {0}")]
+    ImageManifestNotFoundError(String),
+    /// Registry returned a layer with an incompatible type
+    #[error("Incompatible layer media type: {0}")]
+    IncompatibleLayerMediaTypeError(String),
+    #[error(transparent)]
+    /// Transparent wrapper around `serde_json::error::Error`
+    JsonError(#[from] serde_json::error::Error),
+    /// Manifest: JSON unmarshalling error
+    #[error("Failed to parse manifest as Versioned object: {0}")]
+    ManifestParsingError(String),
+    /// Cannot push chunk without data
+    #[error("cannot push a chunk without data")]
+    PushChunkNoDataError,
+    /// Cannot push layer object without data
+    #[error("cannot push a layer without data")]
+    PushLayerNoDataError,
+    /// No layers available to be pulled
+    #[error("No layers to pull")]
+    PullNoLayersError,
+    /// OCI registry error
+    #[error("Registry error: url {url}, envelope: {envelope}")]
+    RegistryError {
+        /// List of errors returned the by the OCI registry
+        envelope: OciEnvelope,
+        /// Request URL
+        url: String,
+    },
+    /// Registry didn't return a Digest object
+    #[error("Registry did not return a digest header")]
+    RegistryNoDigestError,
+    /// Registry didn't return a Location header
+    #[error("Registry did not return a location header")]
+    RegistryNoLocationError,
+    /// Registry token: JSON deserialization error
+    #[error("Failed to decode registry token: {0}")]
+    RegistryTokenDecodeError(String),
+    /// Transparent wrapper around `reqwest::Error`
+    #[error(transparent)]
+    RequestError(#[from] reqwest::Error),
+    /// HTTP Server error
+    #[error("Server error: url {url}, code: {code}, message: {message}")]
+    ServerError {
+        /// HTTP status code
+        code: u16,
+        /// Request URL
+        url: String,
+        /// Error message returned by the remote server
+        message: String,
+    },
+    /// HTTP auth failed - user not authorized
+    #[error("Not authorized: url {url}")]
+    UnauthorizedError {
+        /// request URL
+        url: String,
+    },
+    /// Media type not supported
+    #[error("Unsupported media type: {0}")]
+    UnsupportedMediaTypeError(String),
+    /// Schema version not supported
+    #[error("Unsupported schema version: {0}")]
+    UnsupportedSchemaVersionError(i32),
+    /// Versioned object: JSON deserialization error
+    #[error("Failed to parse manifest: {0}")]
+    VersionedParsingError(String),
+}
+
+/// Helper type to declare `Result` objects that might return a `OciDistributionError`
+pub type Result<T> = std::result::Result<T, OciDistributionError>;
+
 /// The OCI specification defines a specific error format.
 ///
 /// This struct represents that error format, which is formally described here:
@@ -27,9 +118,17 @@ impl std::fmt::Display for OciError {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub(crate) struct OciEnvelope {
+/// A struct that holds a series of OCI errors
+#[derive(serde::Deserialize, Debug)]
+pub struct OciEnvelope {
     pub(crate) errors: Vec<OciError>,
+}
+
+impl std::fmt::Display for OciEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let errors: Vec<String> = self.errors.iter().map(|e| e.to_string()).collect();
+        write!(f, "OCI API errors: [{}]", errors.join("\n"))
+    }
 }
 
 /// OCI error codes

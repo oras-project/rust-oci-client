@@ -14,8 +14,8 @@ use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::Reference;
 
+use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
-use anyhow::{anyhow, Context};
 use futures_util::future;
 use futures_util::stream::StreamExt;
 use hyperx::header::{Header, Raw};
@@ -148,9 +148,9 @@ pub trait ClientConfigSource {
 }
 
 impl TryFrom<ClientConfig> for Client {
-    type Error = anyhow::Error;
+    type Error = OciDistributionError;
 
-    fn try_from(config: ClientConfig) -> Result<Self, Self::Error> {
+    fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
         let mut client_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certificates);
 
@@ -205,7 +205,7 @@ impl Client {
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: Vec<&str>,
-    ) -> anyhow::Result<ImageData> {
+    ) -> Result<ImageData> {
         debug!("Pulling image: {:?}", image);
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
@@ -226,7 +226,7 @@ impl Client {
                 let mut out: Vec<u8> = Vec::new();
                 debug!("Pulling image layer");
                 this.pull_blob(image, &layer.digest, &mut out).await?;
-                Ok::<_, anyhow::Error>(ImageLayer::new(out, layer.media_type.clone()))
+                Ok::<_, OciDistributionError>(ImageLayer::new(out, layer.media_type.clone()))
             }
         });
 
@@ -256,7 +256,7 @@ impl Client {
         config: Config,
         auth: &RegistryAuth,
         manifest: Option<OciImageManifest>,
-    ) -> anyhow::Result<PushResponse> {
+    ) -> Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
         if !self.tokens.contains_key(image_ref, op) {
@@ -293,7 +293,7 @@ impl Client {
         image: &Reference,
         blob_data: Vec<u8>,
         blob_digest: &str,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String> {
         let location = self.begin_push_session(image).await?;
         let (end_location, _) = self.push_chunk(&location, image, blob_data, 0).await?;
         self.end_push_session(&end_location, image, blob_digest)
@@ -309,7 +309,7 @@ impl Client {
         image: &Reference,
         authentication: &RegistryAuth,
         operation: RegistryOperation,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         debug!("Authorizing for image: {:?}", image);
         // The version request will tell us where to go.
         let url = format!(
@@ -324,7 +324,8 @@ impl Client {
             None => return Ok(()),
         };
 
-        let auth = WwwAuthenticate::parse_header(&Raw::from(dist_hdr.as_bytes()))?;
+        let auth = WwwAuthenticate::parse_header(&Raw::from(dist_hdr.as_bytes()))
+            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         // If challenge_opt is not set it means that no challenge was present, even though the header
         // was present.
         let challenge_opt = match auth.get::<BearerChallenge>() {
@@ -375,8 +376,8 @@ impl Client {
                 let text = auth_res.text().await?;
                 debug!("Received response from auth request: {}", text);
                 let token: RegistryToken = serde_json::from_str(&text)
-                    .context("Failed to decode registry token from auth request")?;
-                debug!("Succesfully authorized for image '{:?}'", image);
+                    .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
+                debug!("Successfully authorized for image '{:?}'", image);
                 self.tokens
                     .insert(image, operation, RegistryTokenType::Bearer(token));
                 Ok(())
@@ -384,7 +385,7 @@ impl Client {
             _ => {
                 let reason = auth_res.text().await?;
                 debug!("Failed to authenticate for image '{:?}': {}", image, reason);
-                Err(anyhow::anyhow!("failed to authenticate: {}", reason))
+                Err(OciDistributionError::AuthenticationFailure(reason))
             }
         }
     }
@@ -401,7 +402,7 @@ impl Client {
         &mut self,
         image: &Reference,
         auth: &RegistryAuth,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String> {
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
             self.auth(image, auth, op).await?;
@@ -434,19 +435,19 @@ impl Client {
             // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
             match status {
                 reqwest::StatusCode::OK => digest_header_value(headers, Some(&text)),
-                reqwest::StatusCode::UNAUTHORIZED => anyhow::bail!("Not Authorized"),
+                reqwest::StatusCode::UNAUTHORIZED => {
+                    Err(OciDistributionError::UnauthorizedError { url })
+                }
                 s if s.is_client_error() => {
                     // According to the OCI spec, we should see an error in the message body.
-                    let err = serde_json::from_str::<OciEnvelope>(&text)?;
-                    // FIXME: This should not have to wrap the error.
-                    Err(anyhow::anyhow!("{} on {}", err.errors[0], url))
+                    let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
+                    Err(OciDistributionError::RegistryError { envelope, url })
                 }
-                s if s.is_server_error() => Err(anyhow::anyhow!("Server error at {}", url)),
-                s => Err(anyhow::anyhow!(
-                    "An unexpected error occured: code={}, message='{}'",
-                    s,
-                    text
-                )),
+                s => Err(OciDistributionError::ServerError {
+                    url,
+                    code: s.as_u16(),
+                    message: text,
+                }),
             }
         } else {
             let status = res.status();
@@ -457,19 +458,19 @@ impl Client {
             // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
             match status {
                 reqwest::StatusCode::OK => digest_header_value(headers, None),
-                reqwest::StatusCode::UNAUTHORIZED => anyhow::bail!("Not Authorized"),
+                reqwest::StatusCode::UNAUTHORIZED => {
+                    Err(OciDistributionError::UnauthorizedError { url })
+                }
                 s if s.is_client_error() => {
                     // According to the OCI spec, we should see an error in the message body.
-                    let err = serde_json::from_str::<OciEnvelope>(&text)?;
-                    // FIXME: This should not have to wrap the error.
-                    Err(anyhow::anyhow!("{} on {}", err.errors[0], url))
+                    let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
+                    Err(OciDistributionError::RegistryError { envelope, url })
                 }
-                s if s.is_server_error() => Err(anyhow::anyhow!("Server error at {}", url)),
-                s => Err(anyhow::anyhow!(
-                    "An unexpected error occured: code={}, message='{}'",
-                    s,
-                    text
-                )),
+                s => Err(OciDistributionError::ServerError {
+                    code: s.as_u16(),
+                    url,
+                    message: text,
+                }),
             }
         }
     }
@@ -478,16 +479,15 @@ impl Client {
         &self,
         manifest: &OciImageManifest,
         accepted_media_types: Vec<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         if manifest.layers.is_empty() {
-            return Err(anyhow::anyhow!("no layers to pull"));
+            return Err(OciDistributionError::PullNoLayersError);
         }
 
         for layer in &manifest.layers {
             if !accepted_media_types.iter().any(|i| i.eq(&layer.media_type)) {
-                return Err(anyhow::anyhow!(
-                    "incompatible layer media type: {}",
-                    layer.media_type
+                return Err(OciDistributionError::IncompatibleLayerMediaTypeError(
+                    layer.media_type.clone(),
                 ));
             }
         }
@@ -509,7 +509,7 @@ impl Client {
         &mut self,
         image: &Reference,
         auth: &RegistryAuth,
-    ) -> anyhow::Result<(OciImageManifest, String)> {
+    ) -> Result<(OciImageManifest, String)> {
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
             self.auth(image, auth, op).await?;
@@ -529,7 +529,7 @@ impl Client {
         &mut self,
         image: &Reference,
         auth: &RegistryAuth,
-    ) -> anyhow::Result<(OciManifest, String)> {
+    ) -> Result<(OciManifest, String)> {
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
             self.auth(image, auth, op).await?;
@@ -545,10 +545,7 @@ impl Client {
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
-    async fn _pull_image_manifest(
-        &self,
-        image: &Reference,
-    ) -> anyhow::Result<(OciImageManifest, String)> {
+    async fn _pull_image_manifest(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
         let (manifest, digest) = self._pull_manifest(image).await?;
         match manifest {
             OciManifest::Image(image_manifest) => Ok((image_manifest, digest)),
@@ -557,9 +554,7 @@ impl Client {
                 let digest = if let Some(resolver) = &self.config.platform_resolver {
                     resolver(&image_index_manifest.manifests)
                 } else {
-                    return Err(anyhow::anyhow!(
-                        "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
-                    ));
+                    return Err(OciDistributionError::ImageIndexParsingNoPlatformResolverError);
                 };
 
                 match digest {
@@ -574,13 +569,16 @@ impl Client {
                             .await
                             .and_then(|(manifest, _digest)| match manifest {
                                 OciManifest::Image(manifest) => Ok((manifest, digest)),
-                                OciManifest::ImageIndex(_) => Err(anyhow::anyhow!(
-                                    "Expected Image Manifest, received Image Index manifest."
-                                )),
+                                OciManifest::ImageIndex(_) => {
+                                    Err(OciDistributionError::ImageManifestNotFoundError(
+                                        "received Image Index manifest instead".to_string(),
+                                    ))
+                                }
                             })
                     }
-                    None => Err(anyhow::anyhow!(
-                        "No entry found in image index manifest matching client's default platform"
+                    None => Err(OciDistributionError::ImageManifestNotFoundError(
+                        "no entry found in image index manifest matching client's default platform"
+                            .to_string(),
                     )),
                 }
             }
@@ -591,7 +589,7 @@ impl Client {
     ///
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
-    async fn _pull_manifest(&self, image: &Reference) -> anyhow::Result<(OciManifest, String)> {
+    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
@@ -614,37 +612,33 @@ impl Client {
                 self.validate_image_manifest(&text).await?;
 
                 debug!("Parsing response as Manifest: {}", text);
-                let manifest = serde_json::from_str(&text).with_context(|| {
-                    format!(
-                        "Failed to parse response from pulling manifest for '{:?}' as a Manifest",
-                        image
-                    )
-                })?;
+                let manifest = serde_json::from_str(&text)
+                    .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
                 Ok((manifest, digest))
             }
             s if s.is_client_error() => {
                 // According to the OCI spec, we should see an error in the message body.
-                let err = res.json::<OciEnvelope>().await?;
-                // FIXME: This should not have to wrap the error.
-                Err(anyhow::anyhow!("{} on {}", err.errors[0], url))
+                let envelope = res.json::<OciEnvelope>().await?;
+                Err(OciDistributionError::RegistryError { envelope, url })
             }
-            s if s.is_server_error() => Err(anyhow::anyhow!("Server error at {}", url)),
-            s => Err(anyhow::anyhow!(
-                "An unexpected error occurred: code={}, message='{}'",
-                s,
-                res.text().await?
-            )),
+            s => {
+                let message = res.text().await?;
+                Err(OciDistributionError::ServerError {
+                    code: s.as_u16(),
+                    url,
+                    message,
+                })
+            }
         }
     }
 
-    async fn validate_image_manifest(&self, text: &str) -> anyhow::Result<()> {
+    async fn validate_image_manifest(&self, text: &str) -> Result<()> {
         debug!("validating manifest: {}", text);
         let versioned: Versioned = serde_json::from_str(text)
-            .with_context(|| "Failed to parse manifest as a Versioned object")?;
+            .map_err(|e| OciDistributionError::VersionedParsingError(e.to_string()))?;
         if versioned.schema_version != 2 {
-            return Err(anyhow::anyhow!(
-                "unsupported schema version: {}",
-                versioned.schema_version
+            return Err(OciDistributionError::UnsupportedSchemaVersionError(
+                versioned.schema_version,
             ));
         }
         if let Some(media_type) = versioned.media_type {
@@ -652,7 +646,7 @@ impl Client {
                 && media_type != OCI_IMAGE_MEDIA_TYPE
                 && media_type != IMAGE_MANIFEST_LIST_MEDIA_TYPE
             {
-                return Err(anyhow::anyhow!("unsupported media type: {}", media_type));
+                return Err(OciDistributionError::UnsupportedMediaTypeError(media_type));
             }
         }
 
@@ -671,7 +665,7 @@ impl Client {
         &mut self,
         image: &Reference,
         auth: &RegistryAuth,
-    ) -> anyhow::Result<(OciImageManifest, String, String)> {
+    ) -> Result<(OciImageManifest, String, String)> {
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
             self.auth(image, auth, op).await?;
@@ -680,14 +674,23 @@ impl Client {
         self._pull_manifest_and_config(image)
             .await
             .and_then(|(manifest, digest, config)| {
-                Ok((manifest, digest, String::from_utf8(config.data)?))
+                Ok((
+                    manifest,
+                    digest,
+                    String::from_utf8(config.data).map_err(|e| {
+                        OciDistributionError::GenericError(Some(format!(
+                            "Cannot not UTF8 compliant: {}",
+                            e
+                        )))
+                    })?,
+                ))
             })
     }
 
     async fn _pull_manifest_and_config(
         &mut self,
         image: &Reference,
-    ) -> anyhow::Result<(OciImageManifest, String, Config)> {
+    ) -> Result<(OciImageManifest, String, Config)> {
         let (manifest, digest) = self._pull_image_manifest(image).await?;
 
         let mut out: Vec<u8> = Vec::new();
@@ -706,7 +709,7 @@ impl Client {
         reference: &Reference,
         auth: &RegistryAuth,
         manifest: OciImageIndex,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String> {
         let _response = self.auth(reference, auth, RegistryOperation::Push).await?;
         self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
             .await
@@ -724,7 +727,7 @@ impl Client {
         image: &Reference,
         digest: &str,
         mut out: T,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
         let mut stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -744,7 +747,7 @@ impl Client {
     /// Begins a session to push an image to registry
     ///
     /// Returns URL with session UUID
-    async fn begin_push_session(&self, image: &Reference) -> anyhow::Result<String> {
+    async fn begin_push_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)?
@@ -766,8 +769,9 @@ impl Client {
         location: &str,
         image: &Reference,
         digest: &str,
-    ) -> anyhow::Result<String> {
-        let url = Url::parse_with_params(location, &[("digest", digest)])?;
+    ) -> Result<String> {
+        let url = Url::parse_with_params(location, &[("digest", digest)])
+            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
@@ -788,10 +792,10 @@ impl Client {
         image: &Reference,
         layer: Vec<u8>,
         start_byte: usize,
-    ) -> anyhow::Result<(String, usize)> {
+    ) -> Result<(String, usize)> {
         trace!("Pushing chunk. size={}, location={}", layer.len(), location);
         if layer.is_empty() {
-            return Err(anyhow::anyhow!("cannot push a chunk without data"));
+            return Err(OciDistributionError::PushChunkNoDataError);
         };
         let end_byte = start_byte + layer.len() - 1;
         let mut headers = HeaderMap::new();
@@ -824,11 +828,7 @@ impl Client {
     /// Pushes the manifest for a specified image
     ///
     /// Returns pullable manifest URL
-    async fn push_manifest(
-        &self,
-        image: &Reference,
-        manifest: &OciManifest,
-    ) -> anyhow::Result<String> {
+    async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
@@ -858,19 +858,18 @@ impl Client {
         image: &Reference,
         res: reqwest::Response,
         expected_status: &reqwest::StatusCode,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String> {
         if res.status().eq(expected_status) {
             let location_header = res.headers().get("Location");
             match location_header {
-                None => Err(anyhow::anyhow!("registry did not return a location header")),
+                None => Err(OciDistributionError::RegistryNoLocationError),
                 Some(lh) => self.location_header_to_url(image, lh),
             }
         } else {
-            Err(anyhow::anyhow!(
-                "An unexpected error occured: code={}, message='{}'",
-                res.status(),
-                res.text().await?
-            ))
+            let url = res.url().to_string();
+            let code = res.status().as_u16();
+            let message = res.text().await?;
+            Err(OciDistributionError::ServerError { url, code, message })
         }
     }
 
@@ -882,8 +881,8 @@ impl Client {
         &self,
         image: &Reference,
         location_header: &reqwest::header::HeaderValue,
-    ) -> anyhow::Result<String> {
-        let lh = location_header.to_str().map_err(anyhow::Error::new)?;
+    ) -> Result<String> {
+        let lh = location_header.to_str()?;
         if lh.starts_with("/v2/") {
             Ok(format!(
                 "{}://{}{}",
@@ -1005,11 +1004,15 @@ impl<'a> RequestBuilderWrapper<'a> {
 
 // Composable functions applicable to a `RequestBuilderWrapper`
 impl<'a> RequestBuilderWrapper<'a> {
-    fn apply_accept(&self, accept: &[&str]) -> anyhow::Result<RequestBuilderWrapper> {
+    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper> {
         let request_builder = self
             .request_builder
             .try_clone()
-            .ok_or_else(|| anyhow!("could not clone request builder"))?
+            .ok_or_else(|| {
+                OciDistributionError::GenericError(Some(
+                    "could not clone request builder".to_string(),
+                ))
+            })?
             .header("Accept", Vec::from(accept).join(", "));
 
         Ok(RequestBuilderWrapper {
@@ -1028,7 +1031,7 @@ impl<'a> RequestBuilderWrapper<'a> {
         &self,
         image: &Reference,
         op: RegistryOperation,
-    ) -> anyhow::Result<RequestBuilderWrapper> {
+    ) -> Result<RequestBuilderWrapper> {
         let mut headers = HeaderMap::new();
 
         if let Some(token) = self.client.tokens.get(image, op) {
@@ -1044,7 +1047,11 @@ impl<'a> RequestBuilderWrapper<'a> {
                         request_builder: self
                             .request_builder
                             .try_clone()
-                            .ok_or_else(|| anyhow!("could not clone request builder"))?
+                            .ok_or_else(|| {
+                                OciDistributionError::GenericError(Some(
+                                    "could not clone request builder".to_string(),
+                                ))
+                            })?
                             .headers(headers)
                             .basic_auth(username.to_string(), Some(password.to_string())),
                     });
@@ -1056,7 +1063,11 @@ impl<'a> RequestBuilderWrapper<'a> {
             request_builder: self
                 .request_builder
                 .try_clone()
-                .ok_or_else(|| anyhow!("could not clone request builder"))?
+                .ok_or_else(|| {
+                    OciDistributionError::GenericError(Some(
+                        "could not clone request builder".to_string(),
+                    ))
+                })?
                 .headers(headers),
         })
     }
@@ -1257,7 +1268,7 @@ impl Challenge for BearerChallenge {
 /// Can optionally supply a response body (i.e. the manifest itself) to
 /// fallback to manually hashing this content. This should only be done if the
 /// response body contains the image manifest.
-fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> anyhow::Result<String> {
+fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> Result<String> {
     let digest_header = headers.get("Docker-Content-Digest");
     match digest_header {
         None => {
@@ -1268,13 +1279,13 @@ fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> anyhow::Result
                 debug!(%hex, "Computed digest of manifest payload.");
                 Ok(hex)
             } else {
-                Err(anyhow::anyhow!("registry did not return a digest header"))
+                Err(OciDistributionError::RegistryNoDigestError)
             }
         }
         Some(hv) => hv
             .to_str()
             .map(|s| s.to_string())
-            .map_err(anyhow::Error::new),
+            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string()))),
     }
 }
 
@@ -1288,6 +1299,7 @@ mod test {
     use super::*;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
     use std::convert::TryFrom;
+    use std::result::Result;
     #[cfg(feature = "test-registry")]
     use testcontainers::{
         clients,
@@ -1315,7 +1327,7 @@ mod test {
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
 
     #[test]
-    fn test_apply_accept() -> Result<(), anyhow::Error> {
+    fn test_apply_accept() -> anyhow::Result<()> {
         assert_eq!(
             RequestBuilderWrapper::from_client(&Client::default(), |client| client
                 .get("https://example.com/some/module.wasm"))
@@ -1340,7 +1352,7 @@ mod test {
     }
 
     #[test]
-    fn test_apply_auth_no_token() -> Result<(), anyhow::Error> {
+    fn test_apply_auth_no_token() -> anyhow::Result<()> {
         assert!(
             !RequestBuilderWrapper::from_client(&Client::default(), |client| client
                 .get("https://example.com/some/module.wasm"))
@@ -1358,7 +1370,7 @@ mod test {
     }
 
     #[test]
-    fn test_apply_auth_bearer_token() -> Result<(), anyhow::Error> {
+    fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
         use hmac::{Hmac, NewMac};
         use jwt::SignWithKey;
         use sha2::Sha256;
