@@ -377,7 +377,7 @@ impl Client {
                 debug!("Received response from auth request: {}", text);
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
-                debug!("Succesfully authorized for image '{:?}'", image);
+                debug!("Successfully authorized for image '{:?}'", image);
                 self.tokens
                     .insert(image, operation, RegistryTokenType::Bearer(token));
                 Ok(())
