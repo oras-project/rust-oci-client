@@ -16,7 +16,7 @@ pub enum OciDistributionError {
     HeaderValueError(#[from] reqwest::header::ToStrError),
     /// IO Error
     #[error(transparent)]
-    IOError(#[from] std::io::Error),
+    IoError(#[from] std::io::Error),
     /// Platform resolver not specified
     #[error("Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver")]
     ImageIndexParsingNoPlatformResolverError,
@@ -28,7 +28,7 @@ pub enum OciDistributionError {
     IncompatibleLayerMediaTypeError(String),
     #[error(transparent)]
     /// Transparent wrapper around `serde_json::error::Error`
-    JSONError(#[from] serde_json::error::Error),
+    JsonError(#[from] serde_json::error::Error),
     /// Manifest: JSON unmarshalling error
     #[error("Failed to parse manifest as Versioned object: {0}")]
     ManifestParsingError(String),
@@ -55,7 +55,7 @@ pub enum OciDistributionError {
     /// Registry didn't return a Location header
     #[error("Registry did not return a location header")]
     RegistryNoLocationError,
-    /// Registry token: JSON unmarshalling error
+    /// Registry token: JSON deserialization error
     #[error("Failed to decode registry token: {0}")]
     RegistryTokenDecodeError(String),
     /// Transparent wrapper around `reqwest::Error`
@@ -71,7 +71,7 @@ pub enum OciDistributionError {
         /// Error message returned by the remote server
         message: String,
     },
-    /// HTTP failured - user not authorized
+    /// HTTP auth failed - user not authorized
     #[error("Not authorized: url {url}")]
     UnauthorizedError {
         /// request URL
@@ -83,7 +83,7 @@ pub enum OciDistributionError {
     /// Schema version not supported
     #[error("Unsupported schema version: {0}")]
     UnsupportedSchemaVersionError(i32),
-    /// Versioned object: JSON unmarshalling error
+    /// Versioned object: JSON deserialization error
     #[error("Failed to parse manifest: {0}")]
     VersionedParsingError(String),
 }
