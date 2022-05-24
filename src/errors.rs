@@ -32,9 +32,9 @@ pub enum OciDistributionError {
     /// Manifest: JSON unmarshalling error
     #[error("Failed to parse manifest as Versioned object: {0}")]
     ManifestParsingError(String),
-    /// Cannot push chunk without data
-    #[error("cannot push a chunk without data")]
-    PushChunkNoDataError,
+    /// Cannot push a blob without data
+    #[error("cannot push a blob without data")]
+    PushNoDataError,
     /// Cannot push layer object without data
     #[error("cannot push a layer without data")]
     PushLayerNoDataError,
@@ -71,6 +71,10 @@ pub enum OciDistributionError {
         /// Error message returned by the remote server
         message: String,
     },
+    /// The [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
+    /// is not respected by the remote registry
+    #[error("OCI distribution spec violation: {0}")]
+    SpecViolationError(String),
     /// HTTP auth failed - user not authorized
     #[error("Not authorized: url {url}")]
     UnauthorizedError {
