@@ -1,6 +1,11 @@
 //! OCI Manifest
 use std::collections::HashMap;
 
+use crate::{
+    client::{Config, ImageLayer},
+    sha256_digest,
+};
+
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 /// The mediatype for a WASM image config.
@@ -34,8 +39,6 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_MEDIA_TYPE: &str =
 pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
     "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
 
-// TODO: Annotation key constants. https://github.com/opencontainers/image-spec/blob/master/annotations.md#pre-defined-annotation-keys
-
 /// An image, or image index, OCI manifest
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(untagged)]
@@ -58,8 +61,7 @@ impl OciManifest {
 
 /// The OCI image manifest describes an OCI image.
 ///
-/// It is part of the OCI specification, and is defined here:
-/// https://github.com/opencontainers/image-spec/blob/main/manifest.md
+/// It is part of the OCI specification, and is defined [here](https://github.com/opencontainers/image-spec/blob/main/manifest.md)
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciImageManifest {
@@ -72,7 +74,7 @@ pub struct OciImageManifest {
 
     /// This is an optional media type describing this manifest.
     ///
-    /// This property SHOULD be used and [remain compatible][https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix]
+    /// This property SHOULD be used and [remain compatible](https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix)
     /// with earlier versions of this specification and with other similar external formats.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
@@ -106,6 +108,41 @@ impl Default for OciImageManifest {
             layers: vec![],
             annotations: None,
         }
+    }
+}
+
+impl OciImageManifest {
+    /// Create a new OciImageManifest using the given parameters
+    ///
+    /// This can be useful to create an OCI Image Manifest with
+    /// custom annotations.
+    pub fn build(
+        layers: &[ImageLayer],
+        config: &Config,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Self {
+        let mut manifest = OciImageManifest::default();
+
+        manifest.config.media_type = config.media_type.to_string();
+        manifest.config.size = config.data.len() as i64;
+        manifest.config.digest = sha256_digest(&config.data);
+        manifest.annotations = annotations;
+
+        for layer in layers {
+            let digest = sha256_digest(&layer.data);
+
+            let descriptor = OciDescriptor {
+                size: layer.data.len() as i64,
+                digest,
+                media_type: layer.media_type.to_string(),
+                annotations: layer.annotations.clone(),
+                ..Default::default()
+            };
+
+            manifest.layers.push(descriptor);
+        }
+
+        manifest
     }
 }
 
@@ -183,8 +220,7 @@ pub struct Versioned {
 
 /// The OCI descriptor is a generic object used to describe other objects.
 ///
-/// It is defined in the OCI Image Specification:
-/// https://github.com/opencontainers/image-spec/blob/main/descriptor.md#properties
+/// It is defined in the [OCI Image Specification](https://github.com/opencontainers/image-spec/blob/main/descriptor.md#properties):
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
@@ -219,7 +255,7 @@ pub struct OciDescriptor {
 
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the annotation rules.
-    /// https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules
+    /// <https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
@@ -251,8 +287,7 @@ impl Default for OciDescriptor {
 
 /// The image index is a higher-level manifest which points to specific image manifest.
 ///
-/// It is part of the OCI specification, and is defined here:
-/// https://github.com/opencontainers/image-spec/blob/main/image-index.md
+/// It is part of the OCI specification, and is defined [here](https://github.com/opencontainers/image-spec/blob/main/image-index.md):
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciImageIndex {
@@ -273,13 +308,20 @@ pub struct OciImageIndex {
     /// This property contains a list of manifests for specific platforms.
     /// The spec says this field must be present but the value may be an empty array.
     pub manifests: Vec<ImageIndexEntry>,
+
+    /// The annotations for this manifest
+    ///
+    /// The specification says "If there are no annotations then this property
+    /// MUST either be absent or be an empty map."
+    /// TO accomodate either, this is optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// The manifest entry of an `ImageIndex`.
 ///
 /// It is part of the OCI specification, and is defined in the `manifests`
-/// section here:
-/// https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
+/// section [here](https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions):
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageIndexEntry {
@@ -337,8 +379,7 @@ impl std::fmt::Display for ImageIndexEntry {
 /// Platform specific fields of an Image Index manifest entry.
 ///
 /// It is part of the OCI specification, and is in the `platform`
-/// section here:
-/// https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
+/// section [here](https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions):
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Platform {

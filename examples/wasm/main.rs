@@ -1,7 +1,7 @@
-extern crate oci_distribution;
-use oci_distribution::{secrets::RegistryAuth, Client, Reference};
+use oci_distribution::{annotations, secrets::RegistryAuth, Client, Reference};
 
 use docker_credential::{CredentialRetrievalError, DockerCredential};
+use std::collections::HashMap;
 use tracing::{debug, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -75,10 +75,40 @@ pub async fn main() {
             let auth = build_auth(&reference, &cli);
             pull_wasm(&mut client, &auth, &reference, &output).await;
         }
-        crate::cli::Commands::Push { module, image } => {
+        crate::cli::Commands::Push {
+            module,
+            image,
+            annotations,
+        } => {
             let reference: Reference = image.parse().expect("Not a valid image reference");
             let auth = build_auth(&reference, &cli);
-            push_wasm(&mut client, &auth, &reference, &module).await;
+
+            let annotations = if annotations.is_empty() {
+                let mut values: HashMap<String, String> = HashMap::new();
+                values.insert(
+                    annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
+                    module.clone(),
+                );
+                Some(values)
+            } else {
+                let mut values: HashMap<String, String> = HashMap::new();
+                for annotation in annotations {
+                    let tmp: Vec<_> = annotation.splitn(2, '=').collect();
+                    if tmp.len() == 2 {
+                        values.insert(String::from(tmp[0]), String::from(tmp[1]));
+                    }
+                }
+                if !values.contains_key(&annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string()) {
+                    values.insert(
+                        annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
+                        module.clone(),
+                    );
+                }
+
+                Some(values)
+            };
+
+            push_wasm(&mut client, &auth, &reference, &module, annotations).await;
         }
     }
 }
