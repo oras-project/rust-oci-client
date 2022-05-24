@@ -1,4 +1,4 @@
-use oci_distribution::{oci_annotations, secrets::RegistryAuth, Client, Reference};
+use oci_distribution::{annotations, secrets::RegistryAuth, Client, Reference};
 
 use docker_credential::{CredentialRetrievalError, DockerCredential};
 use std::collections::HashMap;
@@ -86,7 +86,7 @@ pub async fn main() {
             let annotations = if annotations.is_empty() {
                 let mut values: HashMap<String, String> = HashMap::new();
                 values.insert(
-                    oci_annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
+                    annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
                     module.clone(),
                 );
                 Some(values)
@@ -98,11 +98,9 @@ pub async fn main() {
                         values.insert(String::from(tmp[0]), String::from(tmp[1]));
                     }
                 }
-                if !values
-                    .contains_key(&oci_annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string())
-                {
+                if !values.contains_key(&annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string()) {
                     values.insert(
-                        oci_annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
+                        annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
                         module.clone(),
                     );
                 }
