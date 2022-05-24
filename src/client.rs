@@ -467,58 +467,16 @@ impl Client {
             let headers = res.headers().clone();
             trace!(headers=?res.headers(), "Got Headers");
             let text = res.text().await?;
-            // The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
-            // Obviously, HTTP servers are going to send other codes. This tries to catch the
-            // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-            match status {
-                reqwest::StatusCode::OK => digest_header_value(headers, Some(&text)),
-                reqwest::StatusCode::UNAUTHORIZED => {
-                    Err(OciDistributionError::UnauthorizedError { url })
-                }
-                s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
-                    "Expected HTTP Status {}, got {} instead",
-                    reqwest::StatusCode::OK,
-                    status,
-                ))),
-                s if s.is_client_error() => {
-                    // According to the OCI spec, we should see an error in the message body.
-                    let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
-                    Err(OciDistributionError::RegistryError { envelope, url })
-                }
-                s => Err(OciDistributionError::ServerError {
-                    url,
-                    code: s.as_u16(),
-                    message: text,
-                }),
-            }
+            validate_registry_response(status, &text, &url)?;
+
+            digest_header_value(headers, Some(&text))
         } else {
             let status = res.status();
             let headers = res.headers().clone();
             let text = res.text().await?;
-            // The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
-            // Obviously, HTTP servers are going to send other codes. This tries to catch the
-            // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-            match status {
-                reqwest::StatusCode::OK => digest_header_value(headers, None),
-                reqwest::StatusCode::UNAUTHORIZED => {
-                    Err(OciDistributionError::UnauthorizedError { url })
-                }
-                s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
-                    "Expected HTTP Status {}, got {} instead",
-                    reqwest::StatusCode::OK,
-                    status,
-                ))),
-                s if s.is_client_error() => {
-                    // According to the OCI spec, we should see an error in the message body.
-                    let envelope = serde_json::from_str::<OciEnvelope>(&text)?;
-                    Err(OciDistributionError::RegistryError { envelope, url })
-                }
-                s => Err(OciDistributionError::ServerError {
-                    code: s.as_u16(),
-                    url,
-                    message: text,
-                }),
-            }
+            validate_registry_response(status, &text, &url)?;
+
+            digest_header_value(headers, None)
         }
     }
 
@@ -646,45 +604,20 @@ impl Client {
             .into_request_builder()
             .send()
             .await?;
+        let headers = res.headers().clone();
+        let status = res.status();
+        let text = res.text().await?;
 
-        // The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
-        // Obviously, HTTP servers are going to send other codes. This tries to catch the
-        // obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-        match res.status() {
-            reqwest::StatusCode::UNAUTHORIZED => {
-                Err(OciDistributionError::UnauthorizedError { url })
-            }
-            reqwest::StatusCode::OK => {
-                let headers = res.headers().clone();
-                let text = res.text().await?;
-                let digest = digest_header_value(headers, Some(&text))?;
+        validate_registry_response(status, &text, &url)?;
 
-                self.validate_image_manifest(&text).await?;
+        let digest = digest_header_value(headers, Some(&text))?;
 
-                debug!("Parsing response as Manifest: {}", text);
-                let manifest = serde_json::from_str(&text)
-                    .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
-                Ok((manifest, digest))
-            }
-            s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
-                "Expected HTTP Status {}, got {} instead",
-                reqwest::StatusCode::OK,
-                s,
-            ))),
-            s if s.is_client_error() => {
-                // According to the OCI spec, we should see an error in the message body.
-                let envelope = res.json::<OciEnvelope>().await?;
-                Err(OciDistributionError::RegistryError { envelope, url })
-            }
-            s => {
-                let message = res.text().await?;
-                Err(OciDistributionError::ServerError {
-                    code: s.as_u16(),
-                    url,
-                    message,
-                })
-            }
-        }
+        self.validate_image_manifest(&text).await?;
+
+        debug!("Parsing response as Manifest: {}", text);
+        let manifest = serde_json::from_str(&text)
+            .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
+        Ok((manifest, digest))
     }
 
     async fn validate_image_manifest(&self, text: &str) -> Result<()> {
@@ -1113,6 +1046,36 @@ impl Client {
             reference.repository(),
             "uploads/",
         )
+    }
+}
+
+/// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
+/// Obviously, HTTP servers are going to send other codes. This tries to catch the
+/// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
+fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str) -> Result<()> {
+    match status {
+        reqwest::StatusCode::OK => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
+            url: url.to_string(),
+        }),
+        s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
+            "Expected HTTP Status {}, got {} instead",
+            reqwest::StatusCode::OK,
+            status,
+        ))),
+        s if s.is_client_error() => {
+            // According to the OCI spec, we should see an error in the message body.
+            let envelope = serde_json::from_str::<OciEnvelope>(text)?;
+            Err(OciDistributionError::RegistryError {
+                envelope,
+                url: url.to_string(),
+            })
+        }
+        s => Err(OciDistributionError::ServerError {
+            code: s.as_u16(),
+            url: url.to_string(),
+            message: text.to_string(),
+        }),
     }
 }
 
