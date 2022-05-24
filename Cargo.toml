@@ -51,6 +51,7 @@ www-authenticate = "0.4.0"
 olpc-cjson = "0.1.1"
 
 [dev-dependencies]
+async-std = "1.11.0"
 anyhow = "1.0"
 clap = { version = "3.1.0", features = ["derive"] }
 rstest = "0.11"

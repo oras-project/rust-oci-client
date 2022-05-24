@@ -14,7 +14,9 @@ pub(crate) async fn push_wasm(
 ) {
     info!(?reference, ?module, "pushing wasm module");
 
-    let data = std::fs::read(module).expect("Cannot read Wasm module from disk");
+    let data = async_std::fs::read(module)
+        .await
+        .expect("Cannot read Wasm module from disk");
 
     let layers = vec![ImageLayer::new(
         data,
