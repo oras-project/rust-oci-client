@@ -1,7 +1,10 @@
 //! OCI Manifest
 use std::collections::HashMap;
 
-use crate::client::{sha256_digest, Config, ImageLayer};
+use crate::{
+    client::{Config, ImageLayer},
+    sha256_digest,
+};
 
 /// The mediatype for WASM layers.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";

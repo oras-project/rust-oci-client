@@ -12,6 +12,7 @@ use crate::manifest::{
 };
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
+use crate::sha256_digest;
 use crate::Reference;
 
 use crate::errors::{OciDistributionError, Result};
@@ -1388,11 +1389,6 @@ fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> Result<String>
             .map(|s| s.to_string())
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string()))),
     }
-}
-
-/// Computes the SHA256 digest of a byte vector
-pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
 }
 
 #[cfg(test)]
