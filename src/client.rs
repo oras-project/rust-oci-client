@@ -397,10 +397,11 @@ impl Client {
     ) -> Result<()> {
         debug!("Authorizing for image: {:?}", image);
         // The version request will tell us where to go.
+        let registry = image.resolve_registry();
         let url = format!(
             "{}://{}/v2/",
-            self.config.protocol.scheme_for(image.resolve_registry()),
-            image.resolve_registry()
+            self.config.protocol.scheme_for(registry),
+            registry
         );
         debug!(?url);
         let res = self.client.get(&url).send().await?;
@@ -452,7 +453,7 @@ impl Client {
             .client
             .get(realm)
             .query(&query)
-            .apply_authentication(authentication)
+            .apply_authentication(registry, authentication)
             .send()
             .await?;
 
