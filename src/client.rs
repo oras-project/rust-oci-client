@@ -38,6 +38,8 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 ];
 
+const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+
 /// The data for an image or module.
 #[derive(Clone)]
 pub struct ImageData {
@@ -155,11 +157,22 @@ impl Config {
 ///
 /// For true anonymous access, you can skip `auth()`. This is not recommended
 /// unless you are sure that the remote registry does not require Oauth2.
-#[derive(Default)]
 pub struct Client {
     config: ClientConfig,
     tokens: TokenCache,
     client: reqwest::Client,
+    push_chunk_size: usize,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self {
+            config: ClientConfig::default(),
+            tokens: TokenCache::new(),
+            client: reqwest::Client::new(),
+            push_chunk_size: PUSH_CHUNK_MAX_SIZE,
+        }
+    }
 }
 
 /// A source that can provide a `ClientConfig`.
@@ -196,6 +209,7 @@ impl TryFrom<ClientConfig> for Client {
             config,
             tokens: TokenCache::new(),
             client: client_builder.build()?,
+            push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         })
     }
 }
@@ -210,6 +224,7 @@ impl Client {
                 config: ClientConfig::default(),
                 tokens: TokenCache::new(),
                 client: reqwest::Client::new(),
+                push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             }
         })
     }
@@ -358,9 +373,15 @@ impl Client {
         blob_data: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let location = self.begin_push_chunked_session(image).await?;
-        let (end_location, _) = self.push_chunk(&location, image, blob_data, 0).await?;
-        self.end_push_chunked_session(&end_location, image, blob_digest)
+        let mut location = self.begin_push_chunked_session(image).await?;
+        let mut start: usize = 0;
+        loop {
+            (location, start) = self.push_chunk(&location, image, blob_data, start).await?;
+            if start >= blob_data.len() {
+                break;
+            }
+        }
+        self.end_push_chunked_session(&location, image, blob_digest)
             .await
     }
 
@@ -857,35 +878,46 @@ impl Client {
     /// Pushes a single chunk of a blob to a registry,
     /// as part of a chunked blob upload.
     ///
-    /// Returns the URL location for the next layer
+    /// Returns the URL location for the next chunk
     async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
-        layer: &[u8],
+        blob_data: &[u8],
         start_byte: usize,
     ) -> Result<(String, usize)> {
-        debug!("Pushing chunk. size={}, location={}", layer.len(), location);
-        if layer.is_empty() {
+        if blob_data.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
         };
-        let end_byte = start_byte + layer.len() - 1;
+        let end_byte = if (start_byte + self.push_chunk_size) < blob_data.len() {
+            start_byte + self.push_chunk_size - 1
+        } else {
+            blob_data.len() - 1
+        };
+        let body = blob_data[start_byte..end_byte + 1].to_vec();
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
             format!("{}-{}", start_byte, end_byte).parse().unwrap(),
         );
-        headers.insert(
-            "Content-Length",
-            format!("{}", layer.len()).parse().unwrap(),
-        );
+        headers.insert("Content-Length", format!("{}", body.len()).parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+        debug!(
+            ?start_byte,
+            ?end_byte,
+            blob_data_len = blob_data.len(),
+            body_len = body.len(),
+            ?location,
+            ?headers,
+            "Pushing chunk"
+        );
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
             .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
-            .body(layer.to_vec())
+            .body(body)
             .send()
             .await?;
 
@@ -2057,7 +2089,8 @@ mod test {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
-        let sample_uuid = "6987887f-0196-45ee-91a1-2dfad901bea0";
+        // set a super small chunk size - done to force multiple pushes
+        c.push_chunk_size = 3;
         let url = format!("localhost:{}/hello-wasm:v1", port);
         let image: Reference = url.parse().unwrap();
 
@@ -2065,50 +2098,22 @@ mod test {
             .await
             .expect("result from auth request");
 
-        let image_data: Vec<Vec<u8>> = vec![
-            b"iamawebassemblymodule".to_vec(),
-            b"anotherwebassemblymodule".to_vec(),
-            b"lastlayerwasm".to_vec(),
-        ];
+        let image_data: Vec<u8> =
+            b"i am a big webassembly mode that needs chunked uploads".to_vec();
+        let image_digest = sha256_digest(&image_data);
 
-        let mut location = c
-            .begin_push_chunked_session(&image)
+        let location = c
+            .push_blob_chunked(&image, &image_data, &image_digest)
             .await
             .expect("failed to begin push session");
 
-        let mut start_byte = 0;
-
-        for layer in image_data.clone() {
-            let (next_location, next_byte) = c
-                .push_chunk(&location, &image, &layer, start_byte)
-                .await
-                .expect("failed to push layer");
-
-            // Each next location should be valid and include a UUID
-            // Each next byte should be the byte after the pushed layer
-            assert!(next_location.len() >= url.len() + sample_uuid.len());
-            assert_eq!(next_byte, start_byte + layer.len());
-
-            location = next_location;
-            start_byte = next_byte;
-        }
-
-        let layer_location = c
-            .end_push_chunked_session(
-                &location,
-                &image,
-                &sha256_digest(
-                    &image_data
-                        .clone()
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<u8>>(),
-                ),
+        assert_eq!(
+            location,
+            format!(
+                "http://localhost:{}/v2/hello-wasm/blobs/{}",
+                port, image_digest
             )
-            .await
-            .expect("failed to end push session");
-
-        assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:5aef3de484a7d350ece6f5483047712be7c9a228998ba16242b3e50b5f16605a", port));
+        );
     }
 
     #[tokio::test]
