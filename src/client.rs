@@ -972,7 +972,13 @@ impl Client {
             // AWS ECR are violating this aspect of the spec. This at least let the
             // oci-distribution users interact with these registries.
             warn!("Registry is not respecting the OCI Distribution Specification: it didn't return the Location of the uploaded Manifest inside of the response headers. Working around this issue...");
-            return Ok(manifest_hash);
+
+            let url_base = url
+                .strip_suffix(image.tag().unwrap_or("latest"))
+                .expect("The manifest URL always ends with the image tag suffix");
+            let url_by_digest = format!("{}{}", url_base, manifest_hash);
+
+            return Ok(url_by_digest);
         }
 
         ret
