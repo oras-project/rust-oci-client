@@ -747,7 +747,7 @@ impl Client {
         auth: &RegistryAuth,
         manifest: OciImageIndex,
     ) -> Result<String> {
-        let _response = self.auth(reference, auth, RegistryOperation::Push).await?;
+        self.auth(reference, auth, RegistryOperation::Push).await?;
         self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
             .await
     }
@@ -1334,7 +1334,7 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
 }
 
 /// The protocol that the client should use to connect
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientProtocol {
     #[allow(missing_docs)]
     Http,
