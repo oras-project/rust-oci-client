@@ -16,14 +16,14 @@ default = "deny"
 # See https://spdx.org/licenses/ for list of possible licenses
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
 allow = [
+    "BSD-2-Clause",
+    "LicenseRef-krator",
+    "LicenseRef-krator-derive",
     "LicenseRef-ring",
     "LicenseRef-webpki",
     "LicenseRef-webpki-roots",
-    "LicenseRef-krator",
-    "LicenseRef-krator-derive",
-    "CC0-1.0",
-    "BSD-2-Clause",
-    "MPL-2.0"
+    "MPL-2.0",
+    "Unicode-DFS-2016",
 ]
 
 deny = [
