@@ -138,7 +138,7 @@ impl std::fmt::Display for OciEnvelope {
 /// OCI error codes
 ///
 /// Outlined [here](https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2)
-#[derive(serde::Deserialize, Debug, PartialEq)]
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OciErrorCode {
     /// Blob unknown to registry
