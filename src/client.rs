@@ -1471,11 +1471,8 @@ mod test {
     #[cfg(feature = "test-registry")]
     use testcontainers::{
         clients,
-        images::{
-            self,
-            generic::{GenericImage, WaitFor},
-        },
-        Docker,
+        core::WaitFor,
+        images::{self, generic::GenericImage},
     };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
@@ -1542,7 +1539,7 @@ mod test {
 
     #[test]
     fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
-        use hmac::{Hmac, NewMac};
+        use hmac::{Hmac, Mac};
         use jwt::SignWithKey;
         use sha2::Sha256;
         let mut client = Client::default();
@@ -2071,13 +2068,13 @@ mod test {
 
     #[cfg(feature = "test-registry")]
     fn registry_image() -> GenericImage {
-        images::generic::GenericImage::new("docker.io/library/registry:2")
+        images::generic::GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[cfg(feature = "test-registry")]
     fn registry_image_basic_auth(auth_path: &str) -> GenericImage {
-        images::generic::GenericImage::new("docker.io/library/registry:2")
+        images::generic::GenericImage::new("docker.io/library/registry", "2")
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
@@ -2090,7 +2087,7 @@ mod test {
     async fn can_push_chunk() {
         let docker = clients::Cli::default();
         let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2135,7 +2132,7 @@ mod test {
     async fn can_push_multiple_chunks() {
         let docker = clients::Cli::default();
         let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2202,10 +2199,10 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
-        test_container: &testcontainers::Container<'_, clients::Cli, GenericImage>,
+        test_container: &testcontainers::Container<'_, GenericImage>,
     ) {
         let _ = tracing_subscriber::fmt::try_init();
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
