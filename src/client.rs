@@ -1364,8 +1364,6 @@ impl ClientProtocol {
 struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
-    #[allow(dead_code)]
-    pub scope: Option<String>,
 }
 
 impl TryFrom<&HeaderValue> for BearerChallenge {
@@ -1377,22 +1375,18 @@ impl TryFrom<&HeaderValue> for BearerChallenge {
                 .to_str()
                 .map_err(|e| format!("cannot convert header value to string: {:?}", e))?,
         );
-        let challenge_opt: Vec<BearerChallenge> = parser
+        parser
             .filter_map(|parser_res| {
                 if let Ok(chalenge_ref) = parser_res {
                     let bearer_challenge = BearerChallenge::try_from(&chalenge_ref);
-                    bearer_challenge.map_or_else(|_e| None, Some)
+                    bearer_challenge.ok()
                 } else {
                     None
                 }
             })
-            .collect();
-
-        if challenge_opt.is_empty() {
-            Err("Cannot find Bearer challenge".to_string())
-        } else {
-            Ok(challenge_opt[0].clone())
-        }
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Cannot find Bearer challenge".to_string())
     }
 }
 
@@ -1408,7 +1402,6 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
         }
         let mut realm = None;
         let mut service = None;
-        let mut scope = None;
         for (k, v) in &value.params {
             if k.eq_ignore_ascii_case("realm") {
                 realm = Some(v.to_unescaped());
@@ -1417,10 +1410,6 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
             if k.eq_ignore_ascii_case("service") {
                 service = Some(v.to_unescaped());
             }
-
-            if k.eq_ignore_ascii_case("scope") {
-                scope = Some(v.to_unescaped());
-            }
         }
 
         let realm = realm.ok_or("missing required parameter realm")?;
@@ -1428,7 +1417,6 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
         Ok(BearerChallenge {
             realm: realm.into_boxed_str(),
             service,
-            scope,
         })
     }
 }
