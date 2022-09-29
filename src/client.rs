@@ -841,7 +841,7 @@ impl Client {
         layer: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let mut url = url::Url::parse(location).unwrap();
+        let mut url = Url::parse(location).unwrap();
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
