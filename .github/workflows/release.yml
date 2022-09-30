@@ -8,6 +8,6 @@ jobs:
     name: publish to crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3.0.2
       - name: publish oci-distribution to crates.io
         run: cargo publish --token ${{ secrets.CargoToken }}
