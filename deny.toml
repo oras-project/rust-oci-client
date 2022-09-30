@@ -1,7 +1,10 @@
 [advisories]
 ignore = [
     # We are using some deprecated versions to support Windows
-    "RUSTSEC-2020-0016"
+    "RUSTSEC-2020-0016",
+
+    # a chrono issue, this is just a test dependency
+    "RUSTSEC-2020-0071",
 ]
 
 [licenses]

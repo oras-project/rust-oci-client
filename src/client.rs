@@ -19,7 +19,8 @@ use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
 use futures_util::stream::StreamExt;
-use hyperx::header::{Header, Raw};
+use http::HeaderValue;
+use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
@@ -29,7 +30,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
-use www_authenticate::{Challenge, ChallengeFields, RawChallenge, WwwAuthenticate};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     IMAGE_MANIFEST_MEDIA_TYPE,
@@ -409,15 +409,10 @@ impl Client {
             None => return Ok(()),
         };
 
-        let auth = WwwAuthenticate::parse_header(&Raw::from(dist_hdr.as_bytes()))
-            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
-        // If challenge_opt is not set it means that no challenge was present, even though the header
-        // was present.
-        let challenge_opt = match auth.get::<BearerChallenge>() {
-            Some(co) => co,
-            None => {
-                // Fall back to HTTP Basic Auth
-                debug!("Falling back to HTTP Basic Auth");
+        let challenge = match BearerChallenge::try_from(dist_hdr) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(error = ?e, "Falling back to HTTP Basic Auth");
                 if let RegistryAuth::Basic(username, password) = authentication {
                     self.tokens.insert(
                         image,
@@ -435,8 +430,7 @@ impl Client {
             RegistryOperation::Push => format!("repository:{}:pull,push", image.repository()),
         };
 
-        let challenge = &challenge_opt[0];
-        let realm = challenge.realm.as_ref().unwrap();
+        let realm = challenge.realm.as_ref();
         let service = challenge.service.as_ref();
         let mut query = vec![("scope", &scope)];
 
@@ -847,7 +841,7 @@ impl Client {
         layer: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let mut url = url::Url::parse(location).unwrap();
+        let mut url = Url::parse(location).unwrap();
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
@@ -1366,41 +1360,64 @@ impl ClientProtocol {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct BearerChallenge {
-    pub realm: Option<String>,
+    pub realm: Box<str>,
     pub service: Option<String>,
-    pub scope: Option<String>,
 }
 
-impl Challenge for BearerChallenge {
-    fn challenge_name() -> &'static str {
-        "Bearer"
-    }
+impl TryFrom<&HeaderValue> for BearerChallenge {
+    type Error = String;
 
-    fn from_raw(raw: RawChallenge) -> Option<Self> {
-        match raw {
-            RawChallenge::Token68(_) => None,
-            RawChallenge::Fields(mut map) => Some(BearerChallenge {
-                realm: map.remove("realm"),
-                scope: map.remove("scope"),
-                service: map.remove("service"),
-            }),
-        }
+    fn try_from(value: &HeaderValue) -> std::result::Result<Self, Self::Error> {
+        let parser = ChallengeParser::new(
+            value
+                .to_str()
+                .map_err(|e| format!("cannot convert header value to string: {:?}", e))?,
+        );
+        parser
+            .filter_map(|parser_res| {
+                if let Ok(chalenge_ref) = parser_res {
+                    let bearer_challenge = BearerChallenge::try_from(&chalenge_ref);
+                    bearer_challenge.ok()
+                } else {
+                    None
+                }
+            })
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Cannot find Bearer challenge".to_string())
     }
+}
 
-    fn into_raw(self) -> RawChallenge {
-        let mut map = ChallengeFields::new();
-        if let Some(realm) = self.realm {
-            map.insert_static_quoting("realm", realm);
+impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
+    type Error = String;
+
+    fn try_from(value: &ChallengeRef<'_>) -> std::result::Result<Self, Self::Error> {
+        if !value.scheme.eq_ignore_ascii_case("Bearer") {
+            return Err(format!(
+                "BearerChallenge doesn't support challenge scheme {:?}",
+                value.scheme
+            ));
         }
-        if let Some(scope) = self.scope {
-            map.insert_static_quoting("scope", scope);
+        let mut realm = None;
+        let mut service = None;
+        for (k, v) in &value.params {
+            if k.eq_ignore_ascii_case("realm") {
+                realm = Some(v.to_unescaped());
+            }
+
+            if k.eq_ignore_ascii_case("service") {
+                service = Some(v.to_unescaped());
+            }
         }
-        if let Some(service) = self.service {
-            map.insert_static_quoting("service", service);
-        }
-        RawChallenge::Fields(map)
+
+        let realm = realm.ok_or("missing required parameter realm")?;
+
+        Ok(BearerChallenge {
+            realm: realm.into_boxed_str(),
+            service,
+        })
     }
 }
 
@@ -1434,15 +1451,16 @@ mod test {
     use super::*;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
     use std::convert::TryFrom;
+    use std::fs;
+    use std::path;
     use std::result::Result;
+    use tempfile::TempDir;
+
     #[cfg(feature = "test-registry")]
     use testcontainers::{
         clients,
-        images::{
-            self,
-            generic::{GenericImage, WaitFor},
-        },
-        Docker,
+        core::WaitFor,
+        images::{self, generic::GenericImage},
     };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
@@ -1460,6 +1478,9 @@ mod test {
     ];
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
+    const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
+    const HTPASSWD_USERNAME: &str = "testuser";
+    const HTPASSWD_PASSWORD: &str = "testpassword";
 
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
@@ -1506,7 +1527,7 @@ mod test {
 
     #[test]
     fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
-        use hmac::{Hmac, NewMac};
+        use hmac::{Hmac, Mac};
         use jwt::SignWithKey;
         use sha2::Sha256;
         let mut client = Client::default();
@@ -2035,7 +2056,17 @@ mod test {
 
     #[cfg(feature = "test-registry")]
     fn registry_image() -> GenericImage {
-        images::generic::GenericImage::new("docker.io/library/registry:2")
+        images::generic::GenericImage::new("docker.io/library/registry", "2")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
+    }
+
+    #[cfg(feature = "test-registry")]
+    fn registry_image_basic_auth(auth_path: &str) -> GenericImage {
+        images::generic::GenericImage::new("docker.io/library/registry", "2")
+            .with_env_var("REGISTRY_AUTH", "htpasswd")
+            .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
+            .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
+            .with_volume(auth_path, "/auth")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
@@ -2044,7 +2075,7 @@ mod test {
     async fn can_push_chunk() {
         let docker = clients::Cli::default();
         let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2089,7 +2120,7 @@ mod test {
     async fn can_push_multiple_chunks() {
         let docker = clients::Cli::default();
         let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2124,11 +2155,42 @@ mod test {
 
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_image_roundtrip() {
-        let _ = tracing_subscriber::fmt::try_init();
+    async fn test_image_roundtrip_anon_auth() {
         let docker = clients::Cli::default();
         let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port(5000).expect("no port exposed");
+
+        test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_image_roundtrip_basic_auth() {
+        let auth_dir = TempDir::new().expect("cannot create tmp directory");
+        let htpasswd_path = path::Path::join(auth_dir.path(), "htpasswd");
+        fs::write(htpasswd_path, HTPASSWD).expect("cannot write htpasswd file");
+
+        let docker = clients::Cli::default();
+        let image = registry_image_basic_auth(
+            auth_dir
+                .path()
+                .to_str()
+                .expect("cannot convert htpasswd_path to string"),
+        );
+        let test_container = docker.run(image);
+
+        let auth =
+            RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
+
+        test_image_roundtrip(&auth, &test_container).await;
+    }
+
+    #[cfg(feature = "test-registry")]
+    async fn test_image_roundtrip(
+        registry_auth: &RegistryAuth,
+        test_container: &testcontainers::Container<'_, GenericImage>,
+    ) {
+        let _ = tracing_subscriber::fmt::try_init();
+        let port = test_container.get_host_port_ipv4(5000);
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
@@ -2136,7 +2198,7 @@ mod test {
         });
 
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
-        c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+        c.auth(&image, &registry_auth, RegistryOperation::Pull)
             .await
             .expect("authenticated");
 
@@ -2146,28 +2208,20 @@ mod test {
             .expect("failed to pull manifest");
 
         let image_data = c
-            .pull(
-                &image,
-                &RegistryAuth::Anonymous,
-                vec![manifest::WASM_LAYER_MEDIA_TYPE],
-            )
+            .pull(&image, registry_auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
             .await
             .expect("failed to pull image");
 
         let push_image: Reference = format!("localhost:{}/hello-wasm:v1", port).parse().unwrap();
-        c.auth(
-            &push_image,
-            &RegistryAuth::Anonymous,
-            RegistryOperation::Push,
-        )
-        .await
-        .expect("authenticated");
+        c.auth(&push_image, registry_auth, RegistryOperation::Push)
+            .await
+            .expect("authenticated");
 
         c.push(
             &push_image,
             &image_data.layers,
             image_data.config.clone(),
-            &RegistryAuth::Anonymous,
+            registry_auth,
             Some(manifest.clone()),
         )
         .await
@@ -2176,7 +2230,7 @@ mod test {
         let pulled_image_data = c
             .pull(
                 &push_image,
-                &RegistryAuth::Anonymous,
+                registry_auth,
                 vec![manifest::WASM_LAYER_MEDIA_TYPE],
             )
             .await
