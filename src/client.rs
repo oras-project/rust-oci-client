@@ -17,6 +17,7 @@ use crate::Reference;
 
 use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use futures::stream::TryStreamExt;
 use futures_util::future;
 use futures_util::stream::StreamExt;
 use http::HeaderValue;
@@ -28,7 +29,8 @@ use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, trace, warn};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -773,6 +775,28 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Stream a single layer from an OCI registry.
+    ///
+    /// This is a streaming version of [`Client::pull_blob`].
+    /// Returns [`AsyncRead`](tokio::io::AsyncRead).
+    pub async fn async_pull_blob(
+        &self,
+        image: &Reference,
+        digest: &str,
+    ) -> Result<impl AsyncRead + Unpin> {
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
+        let stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_auth(image, RegistryOperation::Pull)?
+            .into_request_builder()
+            .send()
+            .await?
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+        Ok(FuturesAsyncReadCompatExt::compat(stream.into_async_read()))
     }
 
     /// Begins a session to push an image to registry in a monolithical way
@@ -1980,6 +2004,41 @@ mod test {
             if let Some(e) = last_error {
                 panic!("Unable to pull layer: {:?}", e);
             }
+
+            // The manifest says how many bytes we should expect.
+            assert_eq!(file.len(), layer0.size as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_pull_blob() {
+        let mut c = Client::default();
+
+        for &image in TEST_IMAGES {
+            let reference = Reference::try_from(image).expect("failed to parse reference");
+            c.auth(
+                &reference,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("authenticated");
+            let (manifest, _) = c
+                ._pull_image_manifest(&reference)
+                .await
+                .expect("failed to pull manifest");
+
+            // Pull one specific layer
+            let mut file: Vec<u8> = Vec::new();
+            let layer0 = &manifest.layers[0];
+
+            let mut async_reader = c
+                .async_pull_blob(&reference, &layer0.digest)
+                .await
+                .expect("failed to pull blob with async read");
+            tokio::io::AsyncReadExt::read_to_end(&mut async_reader, &mut file)
+                .await
+                .unwrap();
 
             // The manifest says how many bytes we should expect.
             assert_eq!(file.len(), layer0.size as usize);
