@@ -1,6 +1,7 @@
 //! Types for working with registry access secrets
 
 /// A method for authenticating to a registry
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub enum RegistryAuth {
     /// Access the registry anonymously
     Anonymous,
