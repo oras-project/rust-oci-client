@@ -2197,10 +2197,11 @@ mod test {
             ..Default::default()
         });
 
+        // pulling webassembly.azurecr.io/hello-wasm:v1
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
-        c.auth(&image, &registry_auth, RegistryOperation::Pull)
+        c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
             .await
-            .expect("authenticated");
+            .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = c
             ._pull_image_manifest(&image)
