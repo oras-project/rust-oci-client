@@ -54,7 +54,7 @@ unicase = "2.6"
 async-std = "1.12"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
-rstest = "0.15.0"
+rstest = "0.16.0"
 docker_credential = "1.0"
 hmac = "0.12"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
