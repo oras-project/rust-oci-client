@@ -3,6 +3,7 @@
 //! *Note*: This client is very feature poor. We hope to expand this to be a complete
 //! OCI distribution client in the future.
 
+use crate::config::ConfigFile;
 use crate::errors::*;
 use crate::manifest::{
     ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest, Versioned,
@@ -137,6 +138,20 @@ impl Config {
     /// media type application/vnd.oci.image.config.v1+json
     pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
         Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
+    }
+
+    /// Construct a new Config struct with provided [`ConfigFile`] and
+    /// media type `application/vnd.oci.image.config.v1+json`
+    pub fn oci_v1_from_config_file(
+        config_file: ConfigFile,
+        annotations: Option<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let data = serde_json::to_vec(&config_file)?;
+        Ok(Self::new(
+            data,
+            IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+            annotations,
+        ))
     }
 
     /// Helper function to compute the sha256 digest of this config object
