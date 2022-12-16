@@ -5,6 +5,7 @@ use sha2::Digest;
 
 pub mod annotations;
 pub mod client;
+pub mod config;
 pub mod errors;
 pub mod manifest;
 mod reference;
