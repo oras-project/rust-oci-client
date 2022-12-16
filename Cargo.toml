@@ -35,6 +35,7 @@ trust-dns = ["reqwest/trust-dns"]
 test-registry = []
 
 [dependencies]
+chrono = { version = "0.4.23", features = ["serde"] }
 futures = "0.3"
 futures-util = "0.3"
 http = "0.2"
@@ -54,6 +55,7 @@ tracing = { version = "0.1", features = ['log'] }
 unicase = "2.6"
 
 [dev-dependencies]
+assert-json-diff = "2.0.2"
 async-std = "1.12"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
