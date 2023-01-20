@@ -204,16 +204,20 @@ impl TryFrom<ClientConfig> for Client {
     type Error = OciDistributionError;
 
     fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
-        let mut client_builder = reqwest::Client::builder()
-            .danger_accept_invalid_certs(config.accept_invalid_certificates);
+        #[allow(unused_mut)]
+        let mut client_builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut client_builder =
+            client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
 
         client_builder = match () {
-            #[cfg(feature = "native-tls")]
+            #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
             () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
-            #[cfg(not(feature = "native-tls"))]
+            #[cfg(any(not(feature = "native-tls"), target_arch = "wasm32"))]
             () => client_builder,
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
         for c in &config.extra_root_certificates {
             let cert = match c.encoding {
                 CertificateEncoding::Der => reqwest::Certificate::from_der(c.data.as_slice())?,
