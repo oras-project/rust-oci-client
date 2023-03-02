@@ -2,6 +2,10 @@
 
 [![oci-distribution documentation](https://docs.rs/oci-distribution/badge.svg)](https://docs.rs/oci-distribution)
 
+> HEADS UP! If you have contributed to this repository or already have cloned the git repo, we recently
+> cleaned out our git history of some large blobs. However, this means we mucked with history. Please
+> reclone the repository to avoid any problems when contributing. See #18 for more details
+
 This Rust library implements the
 [OCI Distribution specification](https://github.com/opencontainers/distribution-spec/blob/master/spec.md),
 which is the protocol that Docker Hub and other container registries use.
