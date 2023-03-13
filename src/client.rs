@@ -696,6 +696,7 @@ impl Client {
             if media_type != IMAGE_MANIFEST_MEDIA_TYPE
                 && media_type != OCI_IMAGE_MEDIA_TYPE
                 && media_type != IMAGE_MANIFEST_LIST_MEDIA_TYPE
+                && media_type != OCI_IMAGE_INDEX_MEDIA_TYPE
             {
                 return Err(OciDistributionError::UnsupportedMediaTypeError(media_type));
             }
