@@ -18,9 +18,8 @@ use crate::Reference;
 
 use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
-use futures::stream::TryStreamExt;
 use futures_util::future;
-use futures_util::stream::StreamExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
@@ -42,6 +41,8 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 ];
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+
+const MAX_PARALLEL_PUSH_AND_PULL: usize = 16;
 
 /// The data for an image or module.
 #[derive(Clone)]
@@ -276,24 +277,26 @@ impl Client {
         self.validate_layers(&manifest, accepted_media_types)
             .await?;
 
-        let layers = manifest.layers.iter().map(|layer| {
-            // This avoids moving `self` which is &mut Self
-            // into the async block. We only want to capture
-            // as &Self
-            let this = &self;
-            async move {
-                let mut out: Vec<u8> = Vec::new();
-                debug!("Pulling image layer");
-                this.pull_blob(image, &layer.digest, &mut out).await?;
-                Ok::<_, OciDistributionError>(ImageLayer::new(
-                    out,
-                    layer.media_type.clone(),
-                    layer.annotations.clone(),
-                ))
-            }
-        });
-
-        let layers = future::try_join_all(layers).await?;
+        let layers = stream::iter(&manifest.layers)
+            .map(|layer| {
+                // This avoids moving `self` which is &mut Self
+                // into the async block. We only want to capture
+                // as &Self
+                let this = &self;
+                async move {
+                    let mut out: Vec<u8> = Vec::new();
+                    debug!("Pulling image layer");
+                    this.pull_blob(image, &layer.digest, &mut out).await?;
+                    Ok::<_, OciDistributionError>(ImageLayer::new(
+                        out,
+                        layer.media_type.clone(),
+                        layer.annotations.clone(),
+                    ))
+                }
+            })
+            .buffer_unordered(MAX_PARALLEL_PUSH_AND_PULL)
+            .try_collect()
+            .await?;
 
         Ok(ImageData {
             layers,
@@ -332,22 +335,35 @@ impl Client {
         };
 
         // Upload layers
-        for layer in layers {
-            let digest = layer.sha256_digest();
-            match self
-                .push_blob_chunked(image_ref, &layer.data, &digest)
-                .await
-            {
-                Err(OciDistributionError::SpecViolationError(violation)) => {
-                    warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
-                    warn!("Attempting monolithic push");
-                    self.push_blob_monolithically(image_ref, &layer.data, &digest)
-                        .await?;
+        stream::iter(layers)
+            .map(|layer| {
+                let this = &self;
+                async move {
+                    let digest = layer.sha256_digest();
+                    match this
+                        .push_blob_chunked(image_ref, &layer.data, &digest)
+                        .await
+                    {
+                        Err(OciDistributionError::SpecViolationError(violation)) => {
+                            warn!(
+                                ?violation,
+                                "Registry is not respecting the OCI Distribution \
+                                       Specification when doing chunked push operations"
+                            );
+                            warn!("Attempting monolithic push");
+                            this.push_blob_monolithically(image_ref, &layer.data, &digest)
+                                .await?;
+                        }
+                        Err(e) => return Err(e),
+                        _ => {}
+                    };
+
+                    Ok(())
                 }
-                Err(e) => return Err(e),
-                _ => {}
-            };
-        }
+            })
+            .buffer_unordered(MAX_PARALLEL_PUSH_AND_PULL)
+            .try_for_each(future::ok)
+            .await?;
 
         let config_url = match self
             .push_blob_chunked(image_ref, &config.data, &manifest.config.digest)
