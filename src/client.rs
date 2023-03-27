@@ -42,8 +42,11 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
 
-const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
-const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
+/// Default value for `ClientConfig::max_concurrent_upload`
+pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
+
+/// Default value for `ClientConfig::max_concurrent_download`
+pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 
 /// The data for an image or module.
 #[derive(Clone)]
@@ -267,23 +270,6 @@ impl Client {
         auth: &RegistryAuth,
         accepted_media_types: Vec<&str>,
     ) -> Result<ImageData> {
-        self.pull_with_max_concurrency(
-            image,
-            auth,
-            accepted_media_types,
-            DEFAULT_MAX_CONCURRENT_DOWNLOAD,
-        )
-        .await
-    }
-
-    /// Like `pull`, but with a specified concurrent layer download limit.
-    pub async fn pull_with_max_concurrency(
-        &mut self,
-        image: &Reference,
-        auth: &RegistryAuth,
-        accepted_media_types: Vec<&str>,
-        max_concurrent_download: usize,
-    ) -> Result<ImageData> {
         debug!("Pulling image: {:?}", image);
         let op = RegistryOperation::Pull;
         if !self.tokens.contains_key(image, op) {
@@ -312,7 +298,7 @@ impl Client {
                     ))
                 }
             })
-            .buffer_unordered(max_concurrent_download)
+            .buffer_unordered(self.config.max_concurrent_download)
             .try_collect()
             .await?;
 
@@ -340,27 +326,6 @@ impl Client {
         config: Config,
         auth: &RegistryAuth,
         manifest: Option<OciImageManifest>,
-    ) -> Result<PushResponse> {
-        self.push_with_max_concurrency(
-            image_ref,
-            layers,
-            config,
-            auth,
-            manifest,
-            DEFAULT_MAX_CONCURRENT_UPLOAD,
-        )
-        .await
-    }
-
-    /// Like `push`, but with a specified concurrent layer upload limit.
-    pub async fn push_with_max_concurrency(
-        &mut self,
-        image_ref: &Reference,
-        layers: &[ImageLayer],
-        config: Config,
-        auth: &RegistryAuth,
-        manifest: Option<OciImageManifest>,
-        max_concurrent_upload: usize,
     ) -> Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
@@ -400,7 +365,7 @@ impl Client {
                     Ok(())
                 }
             })
-            .buffer_unordered(max_concurrent_upload)
+            .buffer_unordered(self.config.max_concurrent_upload)
             .try_for_each(future::ok)
             .await?;
 
@@ -1349,6 +1314,18 @@ pub struct ClientConfig {
     /// If set to None, an error is raised if an Image Index manifest is received
     /// during an image pull.
     pub platform_resolver: Option<Box<PlatformResolverFn>>,
+
+    /// Maximum number of concurrent uploads to perform during a `push`
+    /// operation.
+    ///
+    /// This defaults to [`DEFAULT_MAX_CONCURRENT_UPLOAD`].
+    pub max_concurrent_upload: usize,
+
+    /// Maximum number of concurrent downloads to perform during a `pull`
+    /// operation.
+    ///
+    /// This defaults to [`DEFAULT_MAX_CONCURRENT_DOWNLOAD`].
+    pub max_concurrent_download: usize,
 }
 
 impl Default for ClientConfig {
@@ -1360,6 +1337,8 @@ impl Default for ClientConfig {
             accept_invalid_certificates: false,
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
+            max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
+            max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
         }
     }
 }
