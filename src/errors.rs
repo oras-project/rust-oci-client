@@ -125,7 +125,8 @@ impl std::fmt::Display for OciError {
 /// A struct that holds a series of OCI errors
 #[derive(serde::Deserialize, Debug)]
 pub struct OciEnvelope {
-    pub(crate) errors: Vec<OciError>,
+    /// List of OCI registry errors
+    pub errors: Vec<OciError>,
 }
 
 impl std::fmt::Display for OciEnvelope {
