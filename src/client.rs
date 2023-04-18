@@ -18,9 +18,8 @@ use crate::Reference;
 
 use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
-use futures::stream::TryStreamExt;
 use futures_util::future;
-use futures_util::stream::StreamExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
@@ -42,6 +41,12 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 ];
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+
+/// Default value for `ClientConfig::max_concurrent_upload`
+pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
+
+/// Default value for `ClientConfig::max_concurrent_download`
+pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 
 /// The data for an image or module.
 #[derive(Clone)]
@@ -276,24 +281,26 @@ impl Client {
         self.validate_layers(&manifest, accepted_media_types)
             .await?;
 
-        let layers = manifest.layers.iter().map(|layer| {
-            // This avoids moving `self` which is &mut Self
-            // into the async block. We only want to capture
-            // as &Self
-            let this = &self;
-            async move {
-                let mut out: Vec<u8> = Vec::new();
-                debug!("Pulling image layer");
-                this.pull_blob(image, &layer.digest, &mut out).await?;
-                Ok::<_, OciDistributionError>(ImageLayer::new(
-                    out,
-                    layer.media_type.clone(),
-                    layer.annotations.clone(),
-                ))
-            }
-        });
-
-        let layers = future::try_join_all(layers).await?;
+        let layers = stream::iter(&manifest.layers)
+            .map(|layer| {
+                // This avoids moving `self` which is &mut Self
+                // into the async block. We only want to capture
+                // as &Self
+                let this = &self;
+                async move {
+                    let mut out: Vec<u8> = Vec::new();
+                    debug!("Pulling image layer");
+                    this.pull_blob(image, &layer.digest, &mut out).await?;
+                    Ok::<_, OciDistributionError>(ImageLayer::new(
+                        out,
+                        layer.media_type.clone(),
+                        layer.annotations.clone(),
+                    ))
+                }
+            })
+            .buffer_unordered(self.config.max_concurrent_download)
+            .try_collect()
+            .await?;
 
         Ok(ImageData {
             layers,
@@ -332,22 +339,35 @@ impl Client {
         };
 
         // Upload layers
-        for layer in layers {
-            let digest = layer.sha256_digest();
-            match self
-                .push_blob_chunked(image_ref, &layer.data, &digest)
-                .await
-            {
-                Err(OciDistributionError::SpecViolationError(violation)) => {
-                    warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
-                    warn!("Attempting monolithic push");
-                    self.push_blob_monolithically(image_ref, &layer.data, &digest)
-                        .await?;
+        stream::iter(layers)
+            .map(|layer| {
+                let this = &self;
+                async move {
+                    let digest = layer.sha256_digest();
+                    match this
+                        .push_blob_chunked(image_ref, &layer.data, &digest)
+                        .await
+                    {
+                        Err(OciDistributionError::SpecViolationError(violation)) => {
+                            warn!(
+                                ?violation,
+                                "Registry is not respecting the OCI Distribution \
+                                       Specification when doing chunked push operations"
+                            );
+                            warn!("Attempting monolithic push");
+                            this.push_blob_monolithically(image_ref, &layer.data, &digest)
+                                .await?;
+                        }
+                        Err(e) => return Err(e),
+                        _ => {}
+                    };
+
+                    Ok(())
                 }
-                Err(e) => return Err(e),
-                _ => {}
-            };
-        }
+            })
+            .buffer_unordered(self.config.max_concurrent_upload)
+            .try_for_each(future::ok)
+            .await?;
 
         let config_url = match self
             .push_blob_chunked(image_ref, &config.data, &manifest.config.digest)
@@ -1294,6 +1314,18 @@ pub struct ClientConfig {
     /// If set to None, an error is raised if an Image Index manifest is received
     /// during an image pull.
     pub platform_resolver: Option<Box<PlatformResolverFn>>,
+
+    /// Maximum number of concurrent uploads to perform during a `push`
+    /// operation.
+    ///
+    /// This defaults to [`DEFAULT_MAX_CONCURRENT_UPLOAD`].
+    pub max_concurrent_upload: usize,
+
+    /// Maximum number of concurrent downloads to perform during a `pull`
+    /// operation.
+    ///
+    /// This defaults to [`DEFAULT_MAX_CONCURRENT_DOWNLOAD`].
+    pub max_concurrent_download: usize,
 }
 
 impl Default for ClientConfig {
@@ -1305,6 +1337,8 @@ impl Default for ClientConfig {
             accept_invalid_certificates: false,
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
+            max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
+            max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
         }
     }
 }
