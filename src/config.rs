@@ -366,19 +366,6 @@ mod tests {
         ]
     }"#;
 
-    const MINIMAL_CONFIG: &str = r#"
-    {
-        "architecture": "amd64",
-        "os": "linux",
-        "rootfs": {
-          "diff_ids": [
-            "sha256:c6f988f4874bb0add23a778f753c65efe992244e148a1d2ec2a8b664fb66bbd1",
-            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
-          ],
-          "type": "layers"
-        }
-    }"#;
-
     fn example_config() -> ConfigFile {
         let config = Config {
             user: Some("alice".into()),
@@ -447,6 +434,19 @@ mod tests {
         }
     }
 
+    const MINIMAL_CONFIG: &str = r#"
+    {
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {
+          "diff_ids": [
+            "sha256:c6f988f4874bb0add23a778f753c65efe992244e148a1d2ec2a8b664fb66bbd1",
+            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+          ],
+          "type": "layers"
+        }
+    }"#;
+
     fn minimal_config() -> ConfigFile {
         let rootfs = Rootfs {
             r#type: "layers".into(),
@@ -467,6 +467,66 @@ mod tests {
         }
     }
 
+    const MINIMAL_CONFIG2: &str = r#"
+    {
+        "architecture":"arm64",
+        "config":{
+            "Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "WorkingDir":"/"
+        },
+        "created":"2023-04-21T11:53:28.176613804Z",
+        "history":[{
+            "created":"2023-04-21T11:53:28.176613804Z",
+            "created_by":"COPY ./src/main.rs / # buildkit",
+            "comment":"buildkit.dockerfile.v0"
+        }],
+        "os":"linux",
+        "rootfs":{
+            "type":"layers",
+            "diff_ids":[
+                "sha256:267fbf1f5a9377e40a2dc65b355000111e000a35ac77f7b19a59f587d4dd778e"
+            ]
+        }
+    }"#;
+
+    fn minimal_config2() -> ConfigFile {
+        let config = Some(Config {
+            env: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()],
+            working_dir: Some("/".into()),
+            ..Config::default()
+        });
+        let history = Some(vec![History {
+            created: Some(
+                Utc.datetime_from_str("2023-04-21T11:53:28.176613804Z", "%+")
+                    .expect("parse time failed"),
+            ),
+            author: None,
+            created_by: Some("COPY ./src/main.rs / # buildkit".into()),
+            comment: Some("buildkit.dockerfile.v0".into()),
+            empty_layer: None,
+        }]);
+
+        let rootfs = Rootfs {
+            r#type: "layers".into(),
+            diff_ids: vec![
+                "sha256:267fbf1f5a9377e40a2dc65b355000111e000a35ac77f7b19a59f587d4dd778e".into(),
+            ],
+        };
+
+        ConfigFile {
+            architecture: Architecture::Arm64,
+            os: Os::Linux,
+            config,
+            rootfs,
+            history,
+            created: Some(
+                Utc.datetime_from_str("2023-04-21T11:53:28.176613804Z", "%+")
+                    .expect("parse time failed"),
+            ),
+            author: None,
+        }
+    }
+
     #[test]
     fn deserialize_example() {
         let example = example_config();
@@ -482,6 +542,13 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_minimal2() {
+        let example = minimal_config2();
+        let parsed: ConfigFile = serde_json::from_str(MINIMAL_CONFIG2).expect("parsed failed");
+        assert_eq!(example, parsed);
+    }
+
+    #[test]
     fn serialize_example() {
         let serialized = serde_json::to_value(&example_config()).expect("serialize failed");
         let parsed: Value = serde_json::from_str(EXAMPLE_CONFIG).expect("parsed failed");
@@ -492,6 +559,13 @@ mod tests {
     fn serialize_minimal() {
         let serialized = serde_json::to_value(&minimal_config()).expect("serialize failed");
         let parsed: Value = serde_json::from_str(MINIMAL_CONFIG).expect("parsed failed");
+        assert_json_eq!(serialized, parsed);
+    }
+
+    #[test]
+    fn serialize_minimal2() {
+        let serialized = serde_json::to_value(&minimal_config2()).expect("serialize failed");
+        let parsed: Value = serde_json::from_str(MINIMAL_CONFIG2).expect("parsed failed");
         assert_json_eq!(serialized, parsed);
     }
 }
