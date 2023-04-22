@@ -90,6 +90,9 @@ pub enum OciDistributionError {
     /// Versioned object: JSON deserialization error
     #[error("Failed to parse manifest: {0}")]
     VersionedParsingError(String),
+    #[error(transparent)]
+    /// Transparent wrapper around `std::string::FromUtf8Error`
+    FromUtf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Helper type to declare `Result` objects that might return a `OciDistributionError`

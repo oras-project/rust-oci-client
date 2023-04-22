@@ -169,7 +169,8 @@ impl TryFrom<Config> for ConfigFile {
     type Error = crate::errors::OciDistributionError;
 
     fn try_from(config: Config) -> Result<Self> {
-        let config_file: ConfigFile = serde_json::from_slice(&config.data)?;
+        let config = String::from_utf8(config.data)?;
+        let config_file: ConfigFile = serde_json::from_str(&config)?;
         Ok(config_file)
     }
 }
