@@ -122,8 +122,16 @@ pub struct ConfigFile {
     pub rootfs: Rootfs,
 
     /// Describes the history of each layer.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub history: Vec<History>,
+    #[serde(skip_serializing_if = "is_option_vec_empty")]
+    pub history: Option<Vec<History>>,
+}
+
+fn is_option_vec_empty<T>(opt_vec: &Option<Vec<T>>) -> bool {
+    if let Some(vec) = opt_vec {
+        vec.is_empty()
+    } else {
+        true
+    }
 }
 
 /// Helper struct to be serialized into and deserialized from `{}`
@@ -131,25 +139,34 @@ pub struct ConfigFile {
 struct Empty {}
 
 /// Helper to deserialize a `map[string]struct{}` of golang
-fn hashset_from_str<'de, D: Deserializer<'de>>(d: D) -> Result<HashSet<String>, D::Error> {
-    let res = <HashMap<String, Empty>>::deserialize(d)?
-        .into_keys()
-        .collect();
+fn optional_hashset_from_str<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<HashSet<String>>, D::Error> {
+    let res = <Option<HashMap<String, Empty>>>::deserialize(d)?.map(|h| h.into_keys().collect());
     Ok(res)
 }
 
-/// Helper to serialize a time
-fn serialize_hashset<S>(hashset: &HashSet<String>, s: S) -> Result<S::Ok, S::Error>
+/// Helper to serialize an optional hashset
+fn serialize_optional_hashset<T, S>(
+    value: &Option<HashSet<T>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
+    T: Serialize,
     S: Serializer,
 {
-    let empty = Empty {};
-    let mut map = s.serialize_map(Some(hashset.len()))?;
-    for k in hashset {
-        map.serialize_entry(k, &empty)?;
-    }
+    match value {
+        Some(set) => {
+            let empty = Empty {};
+            let mut map = serializer.serialize_map(Some(set.len()))?;
+            for k in set {
+                map.serialize_entry(k, &empty)?;
+            }
 
-    map.end()
+            map.end()
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 /// The execution parameters which SHOULD be used as a base when running a container using the image.
@@ -173,11 +190,11 @@ pub struct Config {
     /// These values act as defaults and are merged with any
     /// specified when creating a container.
     #[serde(
-        skip_serializing_if = "HashSet::is_empty",
-        deserialize_with = "hashset_from_str",
-        serialize_with = "serialize_hashset"
+        skip_serializing_if = "is_option_hashset_empty",
+        deserialize_with = "optional_hashset_from_str",
+        serialize_with = "serialize_optional_hashset"
     )]
-    pub exposed_ports: HashSet<String>,
+    pub exposed_ports: Option<HashSet<String>>,
 
     /// Entries are in the format of `VARNAME=VARVALUE`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -194,11 +211,11 @@ pub struct Config {
 
     /// A set of directories describing where the process is likely write data specific to a container instance.
     #[serde(
-        skip_serializing_if = "HashSet::is_empty",
-        deserialize_with = "hashset_from_str",
-        serialize_with = "serialize_hashset"
+        skip_serializing_if = "is_option_hashset_empty",
+        deserialize_with = "optional_hashset_from_str",
+        serialize_with = "serialize_optional_hashset"
     )]
-    pub volumes: HashSet<String>,
+    pub volumes: Option<HashSet<String>>,
 
     /// Sets the current working directory of the entrypoint
     /// process in the container.
@@ -207,14 +224,30 @@ pub struct Config {
 
     /// The field contains arbitrary metadata for the container.
     /// This property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/v1.0/annotations.md#rules).
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub labels: HashMap<String, String>,
+    #[serde(skip_serializing_if = "is_option_hashmap_empty")]
+    pub labels: Option<HashMap<String, String>>,
 
     /// The field contains the system call signal that will be sent
     /// to the container to exit. The signal can be a signal name
     /// in the format `SIGNAME`, for instance `SIGKILL` or `SIGRTMIN+3`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+}
+
+fn is_option_hashset_empty<T>(opt_hash: &Option<HashSet<T>>) -> bool {
+    if let Some(hash) = opt_hash {
+        hash.is_empty()
+    } else {
+        true
+    }
+}
+
+fn is_option_hashmap_empty<T, V>(opt_hash: &Option<HashMap<T, V>>) -> bool {
+    if let Some(hash) = opt_hash {
+        hash.is_empty()
+    } else {
+        true
+    }
 }
 
 /// Default value of the type of a [`Rootfs`]
@@ -333,10 +366,23 @@ mod tests {
         ]
     }"#;
 
+    const MINIMAL_CONFIG: &str = r#"
+    {
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {
+          "diff_ids": [
+            "sha256:c6f988f4874bb0add23a778f753c65efe992244e148a1d2ec2a8b664fb66bbd1",
+            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+          ],
+          "type": "layers"
+        }
+    }"#;
+
     fn example_config() -> ConfigFile {
         let config = Config {
             user: Some("alice".into()),
-            exposed_ports: HashSet::from_iter(vec!["8080/tcp".into()]),
+            exposed_ports: Some(HashSet::from_iter(vec!["8080/tcp".into()])),
             env: vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "FOO=oci_is_a".into(),
@@ -348,12 +394,12 @@ mod tests {
                 "/etc/my-app.d/default.cfg".into(),
             ],
             entrypoint: vec!["/bin/my-app-binary".into()],
-            volumes: HashSet::from_iter(vec![
+            volumes: Some(HashSet::from_iter(vec![
                 "/var/job-result-data".into(),
                 "/var/log/my-app-logs".into(),
-            ]),
+            ])),
             working_dir: Some("/home/alice".into()),
-            labels: HashMap::from_iter(vec![
+            labels: Some(HashMap::from_iter(vec![
                 (
                     "com.example.project.git.url".into(),
                     "https://example.com/project.git".into(),
@@ -362,7 +408,7 @@ mod tests {
                     "com.example.project.git.commit".into(),
                     "45a939b2999782a3f005621a8d0f29aa387e1d6b".into(),
                 ),
-            ]),
+            ])),
             stop_signal: None,
         };
         let rootfs = Rootfs {
@@ -373,7 +419,7 @@ mod tests {
             ],
         };
 
-        let history = vec![History {
+        let history = Some(vec![History {
             created: Some(Utc.datetime_from_str("2015-10-31T22:22:54.690851953Z", "%+").expect("parse time failed")),
             author: None,
             created_by: Some("/bin/sh -c #(nop) ADD file:a3bc1e842b69636f9df5256c49c5374fb4eef1e281fe3f282c65fb853ee171c5 in /".into()),
@@ -386,7 +432,7 @@ mod tests {
             created_by: Some("/bin/sh -c #(nop) CMD [\"sh\"]".into()),
             comment: None,
             empty_layer: Some(true),
-        }];
+        }]);
         ConfigFile {
             created: Some(
                 Utc.datetime_from_str("2015-10-31T22:22:56.015925234Z", "%+")
@@ -401,17 +447,51 @@ mod tests {
         }
     }
 
+    fn minimal_config() -> ConfigFile {
+        let rootfs = Rootfs {
+            r#type: "layers".into(),
+            diff_ids: vec![
+                "sha256:c6f988f4874bb0add23a778f753c65efe992244e148a1d2ec2a8b664fb66bbd1".into(),
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef".into(),
+            ],
+        };
+
+        ConfigFile {
+            architecture: Architecture::Amd64,
+            os: Os::Linux,
+            config: None,
+            rootfs,
+            history: None,
+            created: None,
+            author: None,
+        }
+    }
+
     #[test]
-    fn deserialize() {
+    fn deserialize_example() {
         let example = example_config();
         let parsed: ConfigFile = serde_json::from_str(EXAMPLE_CONFIG).expect("parsed failed");
         assert_eq!(example, parsed);
     }
 
     #[test]
-    fn serialize() {
+    fn deserialize_minimal() {
+        let example = minimal_config();
+        let parsed: ConfigFile = serde_json::from_str(MINIMAL_CONFIG).expect("parsed failed");
+        assert_eq!(example, parsed);
+    }
+
+    #[test]
+    fn serialize_example() {
         let serialized = serde_json::to_value(&example_config()).expect("serialize failed");
         let parsed: Value = serde_json::from_str(EXAMPLE_CONFIG).expect("parsed failed");
+        assert_json_eq!(serialized, parsed);
+    }
+
+    #[test]
+    fn serialize_minimal() {
+        let serialized = serde_json::to_value(&minimal_config()).expect("serialize failed");
+        let parsed: Value = serde_json::from_str(MINIMAL_CONFIG).expect("parsed failed");
         assert_json_eq!(serialized, parsed);
     }
 }
