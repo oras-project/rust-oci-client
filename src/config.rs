@@ -192,28 +192,30 @@ pub struct Config {
     #[serde(
         skip_serializing_if = "is_option_hashset_empty",
         deserialize_with = "optional_hashset_from_str",
-        serialize_with = "serialize_optional_hashset"
+        serialize_with = "serialize_optional_hashset",
+        default
     )]
     pub exposed_ports: Option<HashSet<String>>,
 
     /// Entries are in the format of `VARNAME=VARVALUE`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<String>,
+    #[serde(skip_serializing_if = "is_option_vec_empty")]
+    pub env: Option<Vec<String>>,
 
     /// Default arguments to the entrypoint of the container.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cmd: Vec<String>,
+    #[serde(skip_serializing_if = "is_option_vec_empty")]
+    pub cmd: Option<Vec<String>>,
 
     /// A list of arguments to use as the command to execute when
     /// the container starts..
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub entrypoint: Vec<String>,
+    #[serde(skip_serializing_if = "is_option_vec_empty")]
+    pub entrypoint: Option<Vec<String>>,
 
     /// A set of directories describing where the process is likely write data specific to a container instance.
     #[serde(
         skip_serializing_if = "is_option_hashset_empty",
         deserialize_with = "optional_hashset_from_str",
-        serialize_with = "serialize_optional_hashset"
+        serialize_with = "serialize_optional_hashset",
+        default
     )]
     pub volumes: Option<HashSet<String>>,
 
@@ -370,17 +372,17 @@ mod tests {
         let config = Config {
             user: Some("alice".into()),
             exposed_ports: Some(HashSet::from_iter(vec!["8080/tcp".into()])),
-            env: vec![
+            env: Some(vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 "FOO=oci_is_a".into(),
                 "BAR=well_written_spec".into(),
-            ],
-            cmd: vec![
+            ]),
+            cmd: Some(vec![
                 "--foreground".into(),
                 "--config".into(),
                 "/etc/my-app.d/default.cfg".into(),
-            ],
-            entrypoint: vec!["/bin/my-app-binary".into()],
+            ]),
+            entrypoint: Some(vec!["/bin/my-app-binary".into()]),
             volumes: Some(HashSet::from_iter(vec![
                 "/var/job-result-data".into(),
                 "/var/log/my-app-logs".into(),
@@ -491,7 +493,9 @@ mod tests {
 
     fn minimal_config2() -> ConfigFile {
         let config = Some(Config {
-            env: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()],
+            env: Some(vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+            ]),
             working_dir: Some("/".into()),
             ..Config::default()
         });
