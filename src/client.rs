@@ -2051,25 +2051,61 @@ mod test {
 
     #[tokio::test]
     async fn test_list_tags() {
-        let reference = Reference::try_from("docker.io/nginx").expect("Can't fail in theory");
-        let auth = RegistryAuth::Anonymous;
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image_edge());
+        let port = test_container.get_host_port_ipv4(5000);
+        let auth =
+            RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        let mut client = Client::default();
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
 
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        client
+            .auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _digest) = client
+            ._pull_image_manifest(&image)
+            .await
+            .expect("failed to pull manifest");
+
+        let image_data = client
+            .pull(&image, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
+            .await
+            .expect("failed to pull image");
+
+        for i in 0..=3 {
+            let push_image: Reference = format!("localhost:{}/hello-wasm:1.0.{}", port, i)
+                .parse()
+                .unwrap();
+            client
+                .auth(&push_image, &auth, RegistryOperation::Push)
+                .await
+                .expect("authenticated");
+            client
+                .push(
+                    &push_image,
+                    &image_data.layers,
+                    image_data.config.clone(),
+                    &auth,
+                    Some(manifest.clone()),
+                )
+                .await
+                .expect("Failed to push Image");
+        }
+
+        let image: Reference = format!("localhost:{}/hello-wasm:1.0.1", port)
+            .parse()
+            .unwrap();
         let response = client
-            .list_tags(&reference, &auth, Some(5), Some("1.13.10"))
+            .list_tags(&image, &RegistryAuth::Anonymous, Some(2), Some("1.0.1"))
             .await
             .expect("Cannot list Tags");
-        assert_eq!(
-            response.tags,
-            vec![
-                "1.13.10-alpine",
-                "1.13.10-alpine-perl",
-                "1.13.10-perl",
-                "1.13.11",
-                "1.13.11-alpine"
-            ]
-        )
+        assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
     }
 
     #[tokio::test]
@@ -2316,6 +2352,17 @@ mod test {
                 .await
                 .is_err());
         }
+    }
+
+    // This is the latest build of distribution/distribution from the `main` branch
+    // Until distribution v3 is relased, this is the only way to have this fix
+    // https://github.com/distribution/distribution/pull/3143
+    //
+    // We require this fix only when testing the capability to list tags
+    #[cfg(feature = "test-registry")]
+    fn registry_image_edge() -> GenericImage {
+        images::generic::GenericImage::new("distribution/distribution", "edge")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[cfg(feature = "test-registry")]
