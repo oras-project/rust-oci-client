@@ -20,6 +20,7 @@ use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::Stream;
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
@@ -29,8 +30,7 @@ use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -821,12 +821,12 @@ impl Client {
     /// Stream a single layer from an OCI registry.
     ///
     /// This is a streaming version of [`Client::pull_blob`].
-    /// Returns [`AsyncRead`](tokio::io::AsyncRead).
-    pub async fn async_pull_blob(
+    /// Returns [`Stream`](futures_util::Stream).
+    pub async fn pull_blob_stream(
         &self,
         image: &Reference,
         digest: &str,
-    ) -> Result<impl AsyncRead + Unpin> {
+    ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
         let stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -837,7 +837,7 @@ impl Client {
             .bytes_stream()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-        Ok(FuturesAsyncReadCompatExt::compat(stream.into_async_read()))
+        Ok(stream)
     }
 
     /// Begins a session to push an image to registry in a monolithical way
@@ -1534,6 +1534,8 @@ mod test {
     use std::path;
     use std::result::Result;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+    use tokio_util::io::StreamReader;
 
     #[cfg(feature = "test-registry")]
     use testcontainers::{
@@ -2066,7 +2068,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_async_pull_blob() {
+    async fn test_pull_blob_stream() {
         let mut c = Client::default();
 
         for &image in TEST_IMAGES {
@@ -2087,11 +2089,12 @@ mod test {
             let mut file: Vec<u8> = Vec::new();
             let layer0 = &manifest.layers[0];
 
-            let mut async_reader = c
-                .async_pull_blob(&reference, &layer0.digest)
+            let layer_stream = c
+                .pull_blob_stream(&reference, &layer0.digest)
                 .await
-                .expect("failed to pull blob with async read");
-            tokio::io::AsyncReadExt::read_to_end(&mut async_reader, &mut file)
+                .expect("failed to pull blob stream");
+
+            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream), &mut file)
                 .await
                 .unwrap();
 
