@@ -808,6 +808,7 @@ impl Client {
             .into_request_builder()
             .send()
             .await?
+            .error_for_status()?
             .bytes_stream();
 
         while let Some(bytes) = stream.next().await {
