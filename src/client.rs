@@ -1380,6 +1380,8 @@ const X86: &str = "x86";
 const AMD: &str = "amd";
 const ARM64: &str = "arm64";
 const AARCH64: &str = "aarch64";
+const POWERPC64: &str = "powerpc64";
+const PPC64LE: &str = "ppc64le";
 
 fn go_arch() -> &'static str {
     // Massage Rust Architecture vars to GO equivalent:
@@ -1389,6 +1391,7 @@ fn go_arch() -> &'static str {
         X86_64 => AMD64,
         X86 => AMD,
         AARCH64 => ARM64,
+        POWERPC64 => PPC64LE,
         other => other,
     }
 }
