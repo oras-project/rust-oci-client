@@ -90,6 +90,18 @@ pub struct OciImageManifest {
     /// required, assuming an empty vector can be used if necessary.
     pub layers: Vec<OciDescriptor>,
 
+    /// The OCI artifact type
+    ///
+    /// This OPTIONAL property contains the type of an artifact when the manifest is used for an
+    /// artifact. This MUST be set when config.mediaType is set to the empty value. If defined,
+    /// the value MUST comply with RFC 6838, including the naming requirements in its section 4.2,
+    /// and MAY be registered with IANA. Implementations storing or copying image manifests
+    /// MUST NOT error on encountering an artifactType that is unknown to the implementation.
+    ///
+    /// Introduced in OCI Image Format spec v1.1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+
     /// The annotations for this manifest
     ///
     /// The specification says "If there are no annotations then this property
@@ -106,6 +118,7 @@ impl Default for OciImageManifest {
             media_type: None,
             config: OciDescriptor::default(),
             layers: vec![],
+            artifact_type: None,
             annotations: None,
         }
     }
@@ -194,10 +207,11 @@ impl std::fmt::Display for OciImageManifest {
 
         write!(
             f,
-            "OCI Image Manifest( schema-version: '{}', media-type: '{}', config: '{}', layers: '{:?}', annotations: '{:?}' )",
+            "OCI Image Manifest( schema-version: '{}', media-type: '{}', config: '{}', artifact-type: '{:?}', layers: '{:?}', annotations: '{:?}' )",
             self.schema_version,
             media_type,
             self.config,
+            self.artifact_type,
             layers,
             annotations,
         )
@@ -446,6 +460,7 @@ mod test {
             "size": 2,
             "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
         },
+        "artifactType": "application/vnd.wasm.component.v1+wasm",
         "layers": [
             {
                 "mediaType": "application/vnd.wasm.content.layer.v1+wasm",
@@ -475,6 +490,10 @@ mod test {
         assert_eq!(
             "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned(),
             config.digest
+        );
+        assert_eq!(
+            "application/vnd.wasm.component.v1+wasm".to_owned(),
+            manifest.artifact_type.unwrap()
         );
 
         assert_eq!(1, manifest.layers.len());
