@@ -298,6 +298,7 @@ impl Client {
                     ))
                 }
             })
+            .boxed() // Workaround to rustc issue https://github.com/rust-lang/rust/issues/104382
             .buffer_unordered(self.config.max_concurrent_download)
             .try_collect()
             .await?;
@@ -365,6 +366,7 @@ impl Client {
                     Ok(())
                 }
             })
+            .boxed() // Workaround to rustc issue https://github.com/rust-lang/rust/issues/104382
             .buffer_unordered(self.config.max_concurrent_upload)
             .try_for_each(future::ok)
             .await?;
