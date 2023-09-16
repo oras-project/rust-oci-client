@@ -993,7 +993,7 @@ impl Client {
     /// Pushes the manifest for a specified image
     ///
     /// Returns pullable manifest URL
-    async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
+    pub async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
