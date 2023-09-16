@@ -51,10 +51,16 @@ pub enum OciManifest {
 
 impl OciManifest {
     /// Returns the appropriate content-type for each variant.
-    pub fn content_type(&self) -> &str {
+    pub fn content_type(&self) -> String {
         match self {
-            OciManifest::Image(_) => OCI_IMAGE_MEDIA_TYPE,
-            OciManifest::ImageIndex(_) => IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+            OciManifest::Image(image) => image
+                .clone()
+                .media_type
+                .unwrap_or(String::from(OCI_IMAGE_MEDIA_TYPE)),
+            OciManifest::ImageIndex(image) => image
+                .clone()
+                .media_type
+                .unwrap_or(String::from(IMAGE_MANIFEST_LIST_MEDIA_TYPE)),
         }
     }
 }
