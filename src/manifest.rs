@@ -51,16 +51,14 @@ pub enum OciManifest {
 
 impl OciManifest {
     /// Returns the appropriate content-type for each variant.
-    pub fn content_type(&self) -> String {
+    pub fn content_type(&self) -> &str {
         match self {
             OciManifest::Image(image) => image
-                .clone()
-                .media_type
-                .unwrap_or(String::from(OCI_IMAGE_MEDIA_TYPE)),
+                .media_type.as_deref()
+                .unwrap_or(OCI_IMAGE_MEDIA_TYPE),
             OciManifest::ImageIndex(image) => image
-                .clone()
-                .media_type
-                .unwrap_or(String::from(IMAGE_MANIFEST_LIST_MEDIA_TYPE)),
+                .media_type.as_deref()
+                .unwrap_or(IMAGE_MANIFEST_LIST_MEDIA_TYPE),
         }
     }
 }
@@ -458,6 +456,7 @@ impl std::fmt::Display for Platform {
 #[cfg(test)]
 mod test {
     use super::*;
+
     const TEST_MANIFEST: &str = r#"{
         "schemaVersion": 2,
         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
