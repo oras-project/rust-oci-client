@@ -306,11 +306,11 @@ pub struct History {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
     use assert_json_diff::assert_json_eq;
     use chrono::{TimeZone, Utc};
+    use rstest::*;
     use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
 
     use super::{Architecture, Config, ConfigFile, History, Os, Rootfs};
 
@@ -531,45 +531,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deserialize_example() {
-        let example = example_config();
-        let parsed: ConfigFile = serde_json::from_str(EXAMPLE_CONFIG).expect("parsed failed");
-        assert_eq!(example, parsed);
+    #[rstest]
+    #[case(example_config(), EXAMPLE_CONFIG)]
+    #[case(minimal_config(), MINIMAL_CONFIG)]
+    #[case(minimal_config2(), MINIMAL_CONFIG2)]
+    fn deserialize_test(#[case] config: ConfigFile, #[case] expected: &str) {
+        let parsed: ConfigFile = serde_json::from_str(expected).expect("parsed failed");
+        assert_eq!(config, parsed);
     }
 
-    #[test]
-    fn deserialize_minimal() {
-        let example = minimal_config();
-        let parsed: ConfigFile = serde_json::from_str(MINIMAL_CONFIG).expect("parsed failed");
-        assert_eq!(example, parsed);
-    }
-
-    #[test]
-    fn deserialize_minimal2() {
-        let example = minimal_config2();
-        let parsed: ConfigFile = serde_json::from_str(MINIMAL_CONFIG2).expect("parsed failed");
-        assert_eq!(example, parsed);
-    }
-
-    #[test]
-    fn serialize_example() {
-        let serialized = serde_json::to_value(&example_config()).expect("serialize failed");
-        let parsed: Value = serde_json::from_str(EXAMPLE_CONFIG).expect("parsed failed");
-        assert_json_eq!(serialized, parsed);
-    }
-
-    #[test]
-    fn serialize_minimal() {
-        let serialized = serde_json::to_value(&minimal_config()).expect("serialize failed");
-        let parsed: Value = serde_json::from_str(MINIMAL_CONFIG).expect("parsed failed");
-        assert_json_eq!(serialized, parsed);
-    }
-
-    #[test]
-    fn serialize_minimal2() {
-        let serialized = serde_json::to_value(&minimal_config2()).expect("serialize failed");
-        let parsed: Value = serde_json::from_str(MINIMAL_CONFIG2).expect("parsed failed");
+    #[rstest]
+    #[case(example_config(), EXAMPLE_CONFIG)]
+    #[case(minimal_config(), MINIMAL_CONFIG)]
+    #[case(minimal_config2(), MINIMAL_CONFIG2)]
+    fn serialize_test(#[case] config: ConfigFile, #[case] expected: &str) {
+        let serialized = serde_json::to_value(&config).expect("serialize failed");
+        let parsed: Value = serde_json::from_str(expected).expect("parsed failed");
         assert_json_eq!(serialized, parsed);
     }
 }
