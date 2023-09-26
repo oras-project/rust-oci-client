@@ -1024,8 +1024,6 @@ impl Client {
     ///
     /// Returns pullable manifest URL
     pub async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
-        let url = self.to_v2_manifest_url(image);
-
         let mut headers = HeaderMap::new();
         let content_type = manifest.content_type();
         headers.insert("Content-Type", content_type.parse().unwrap());
@@ -2427,7 +2425,7 @@ mod test {
         let test_container = docker.run(registry_image());
         let port = test_container.get_host_port_ipv4(5000);
 
-        let mut c = Client::new(ClientConfig {
+        let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
