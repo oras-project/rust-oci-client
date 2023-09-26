@@ -61,6 +61,9 @@ pub enum OciDistributionError {
     /// Transparent wrapper around `reqwest::Error`
     #[error(transparent)]
     RequestError(#[from] reqwest::Error),
+    /// Cannot parse URL
+    #[error("Error parsing Url {0}")]
+    UrlParseError(String),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {

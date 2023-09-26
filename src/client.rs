@@ -1002,7 +1002,11 @@ impl Client {
         digest: &str,
     ) -> Result<()> {
         let base_url = self.to_v2_blob_upload_url(image);
-        let url = format!("{}?mount={}&from={}", base_url, digest, source.repository());
+        let url = Url::parse_with_params(
+            &base_url,
+            &[("mount", digest), ("from", source.repository())],
+        )
+        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
             .apply_auth(image, RegistryOperation::Push)?
