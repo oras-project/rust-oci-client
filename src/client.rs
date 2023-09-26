@@ -165,6 +165,18 @@ impl Config {
     }
 }
 
+impl TryFrom<Config> for ConfigFile {
+    type Error = crate::errors::OciDistributionError;
+
+    fn try_from(config: Config) -> Result<Self> {
+        let config = String::from_utf8(config.data)
+            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
+        let config_file: ConfigFile = serde_json::from_str(&config)
+            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
+        Ok(config_file)
+    }
+}
+
 /// The OCI client connects to an OCI registry and fetches OCI images.
 ///
 /// An OCI registry is a container registry that adheres to the OCI Distribution
