@@ -133,8 +133,7 @@ struct Empty {}
 /// Helper to deserialize a `map[string]struct{}` of golang
 fn hashset_from_str<'de, D: Deserializer<'de>>(d: D) -> Result<HashSet<String>, D::Error> {
     let res = <HashMap<String, Empty>>::deserialize(d)?
-        .into_iter()
-        .map(|(k, _)| k)
+        .into_keys()
         .collect();
     Ok(res)
 }

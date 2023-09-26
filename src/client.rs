@@ -993,7 +993,7 @@ impl Client {
     /// Pushes the manifest for a specified image
     ///
     /// Returns pullable manifest URL
-    async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
+    pub async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
         let url = self.to_v2_manifest_url(image);
 
         let mut headers = HeaderMap::new();
@@ -1412,20 +1412,15 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
 }
 
 /// The protocol that the client should use to connect
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ClientProtocol {
     #[allow(missing_docs)]
     Http,
     #[allow(missing_docs)]
+    #[default]
     Https,
     #[allow(missing_docs)]
     HttpsExcept(Vec<String>),
-}
-
-impl Default for ClientProtocol {
-    fn default() -> Self {
-        ClientProtocol::Https
-    }
 }
 
 impl ClientProtocol {
@@ -1468,7 +1463,6 @@ impl TryFrom<&HeaderValue> for BearerChallenge {
                     None
                 }
             })
-            .into_iter()
             .next()
             .ok_or_else(|| "Cannot find Bearer challenge".to_string())
     }
