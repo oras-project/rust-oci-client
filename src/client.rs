@@ -364,6 +364,7 @@ impl Client {
                     Result::Ok(())
                 }
             })
+            .boxed() // Workaround to rustc issue https://github.com/rust-lang/rust/issues/104382
             .buffer_unordered(self.config.max_concurrent_upload)
             .try_for_each(future::ok)
             .await?;
