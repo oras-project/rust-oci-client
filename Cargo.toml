@@ -63,6 +63,6 @@ docker_credential = "1.0"
 hmac = "0.12"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
-testcontainers = "0.14"
+testcontainers = "0.15"
 tokio = { version = "1.21", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7.4", features = ["compat"] }
