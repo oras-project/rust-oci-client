@@ -27,6 +27,7 @@ maintenance = {status = "actively-developed"}
 
 [features]
 default = ["native-tls", "test-registry"]
+extension-rss = []
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]

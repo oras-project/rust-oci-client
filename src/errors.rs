@@ -96,6 +96,27 @@ pub enum OciDistributionError {
     #[error("Failed to convert Config into ConfigFile: {0}")]
     /// Transparent wrapper around `std::string::FromUtf8Error`
     ConfigConversionError(String),
+
+    /// Client is attempting to fetch signatures using an image reference which does not include a digest
+    #[cfg(feature = "extension-rss")]
+    #[error("Cannot fetch signatures without digest")]
+    FetchSignatureNoDigestError,
+    /// Signature list: JSON deserialization error
+    #[cfg(feature = "extension-rss")]
+    #[error("Failed to parse signature list: {0}")]
+    SignatureParsingError(String),
+    /// Signature schema version not supported
+    #[cfg(feature = "extension-rss")]
+    #[error("Unsupported schema version: {0}")]
+    UnsupportedSignatureSchemaVersionError(u8),
+    /// Signature type is unsupported
+    #[cfg(feature = "extension-rss")]
+    #[error("Unsupported signature type: {0}")]
+    UnsupportedSignatureTypeError(String),
+    /// Signature name format is unsupported
+    #[cfg(feature = "extension-rss")]
+    #[error("Unsupported signature name: {0}")]
+    UnsupportedSignatureNameError(String),
 }
 
 /// Helper type to declare `Result` objects that might return a `OciDistributionError`

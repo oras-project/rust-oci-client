@@ -13,6 +13,9 @@ mod regexp;
 pub mod secrets;
 mod token_cache;
 
+#[cfg(feature = "extension-rss")]
+pub mod signatures;
+
 #[doc(inline)]
 pub use client::Client;
 #[doc(inline)]

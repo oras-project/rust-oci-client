@@ -34,6 +34,14 @@ use std::convert::TryFrom;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "extension-rss")]
+use crate::signatures::{
+    RegistrySignatures, SIGANTURE_NAME_UID_LENGTH, SIGNATURE_SCHEMA, SIGNATURE_TYPE,
+    X_REGISTRY_SUPPORTS_SIGNATURES_HEADER,
+};
+#[cfg(feature = "extension-rss")]
+use reqwest::header::HeaderValue as ReqwestHeaderValue;
+
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     IMAGE_MANIFEST_MEDIA_TYPE,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE,
@@ -1148,6 +1156,106 @@ impl Client {
         ret
     }
 
+    #[cfg(feature = "extension-rss")]
+    async fn registry_supports_signatures_api_extension(
+        &mut self,
+        image: &Reference,
+    ) -> Result<bool> {
+        let url = self.to_registry_v2_url(image);
+        debug!("HEAD headers from {}", url);
+        let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
+            .apply_auth(image, RegistryOperation::Pull)?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        trace!(headers=?res.headers(), "Got Headers");
+
+        Ok(res.headers().get(X_REGISTRY_SUPPORTS_SIGNATURES_HEADER)
+            == Some(&ReqwestHeaderValue::from_static("1")))
+    }
+
+    /// Fetches the signatures stored in the registry for an image digest if the registry supports the X-Registry-Supports-Signatures API extension.
+    ///
+    /// If the registry does not support the X-Registry-Supports-Signatures API extension this function returns an empty list of signatures
+    #[cfg(feature = "extension-rss")]
+    pub async fn fetch_signatures(
+        &mut self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<RegistrySignatures> {
+        let op = RegistryOperation::Pull;
+        if !self.tokens.contains_key(image, op) {
+            self.auth(image, auth, op).await?;
+        }
+
+        let mut registry_signatures = RegistrySignatures::default();
+        if self
+            .registry_supports_signatures_api_extension(image)
+            .await?
+        {
+            if let Some(digest) = image.digest() {
+                let url = self.to_v2_extension_signature_url(image, digest);
+                debug!("GET digest sigantures from {}", url);
+                let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+                    .apply_auth(image, RegistryOperation::Pull)?
+                    .into_request_builder()
+                    .send()
+                    .await?;
+
+                let status = res.status();
+                let text = res.text().await?;
+
+                validate_registry_response(status, &text, &url)?;
+
+                debug!("Parsing response as RegistrySignatures: {}", text);
+                registry_signatures = serde_json::from_str(&text)
+                    .map_err(|e| OciDistributionError::SignatureParsingError(e.to_string()))?;
+
+                self.validate_registry_signatures(registry_signatures.clone(), digest)?;
+            } else {
+                return Err(OciDistributionError::FetchSignatureNoDigestError);
+            }
+        }
+
+        Ok(registry_signatures)
+    }
+
+    #[cfg(feature = "extension-rss")]
+    fn validate_registry_signatures(
+        &mut self,
+        registry_signatures: RegistrySignatures,
+        digest: &str,
+    ) -> Result<()> {
+        for signature in registry_signatures.signatures.iter() {
+            if signature.schema_version != SIGNATURE_SCHEMA {
+                return Err(
+                    OciDistributionError::UnsupportedSignatureSchemaVersionError(
+                        signature.schema_version,
+                    ),
+                );
+            }
+
+            if signature.signature_type != SIGNATURE_TYPE {
+                return Err(OciDistributionError::UnsupportedSignatureTypeError(
+                    signature.signature_type.clone(),
+                ));
+            }
+
+            let name_parts: Vec<&str> = signature.name.split('@').collect();
+            if name_parts.len() != 2
+                || name_parts[0] != digest
+                || name_parts[1].len() != usize::from(SIGANTURE_NAME_UID_LENGTH)
+            {
+                return Err(OciDistributionError::UnsupportedSignatureNameError(
+                    signature.name.clone(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn extract_location_header(
         &self,
         image: &Reference,
@@ -1223,6 +1331,32 @@ impl Client {
                 reference.tag().unwrap_or("latest")
             )
         }
+    }
+
+    /// Convert a Reference to an XRSS signature URL
+    #[cfg(feature = "extension-rss")]
+    fn to_v2_extension_signature_url(&self, reference: &Reference, digest: &str) -> String {
+        format!(
+            "{}://{}/extensions/v2/{}/signatures/{}",
+            self.config
+                .protocol
+                .scheme_for(reference.resolve_registry()),
+            reference.resolve_registry(),
+            reference.repository(),
+            digest,
+        )
+    }
+
+    /// Convert a reference to the base URL of the registry's OCI distribution v2 API
+    #[cfg(feature = "extension-rss")]
+    fn to_registry_v2_url(&self, reference: &Reference) -> String {
+        format!(
+            "{}://{}/v2/",
+            self.config
+                .protocol
+                .scheme_for(reference.resolve_registry()),
+            reference.resolve_registry(),
+        )
     }
 
     /// Convert a Reference to a v2 blob (layer) URL.
@@ -1672,9 +1806,17 @@ mod test {
     ];
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
+    const UK_ICR_IO_IMAGE_SIGNED: &str = "uk.icr.io/mattarno_image_push/busybox@sha256:023917ec6a886d0e8e15f28fb543515a5fcd8d938edb091e8147db4efed388ee";
+    const UK_ICR_IO_USERNAME: &str = "iamapikey";
     const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
     const HTPASSWD_USERNAME: &str = "testuser";
     const HTPASSWD_PASSWORD: &str = "testpassword";
+
+    #[cfg(feature = "extension-rss")]
+    const UK_ICR_IO_IMAGE_UNSIGNED: &str = "uk.icr.io/mattarno_image_push/busybox@sha256:513877bbaebc5a0e079d03eeaaf57bc47b29d47eab9b2d500e436f280ba2c783";
+    #[cfg(feature = "extension-rss")]
+    const UK_ICR_IO_IMAGE_SIGNED_BY_TAG: &str =
+        "uk.icr.io/mattarno_image_push/busybox:signed-latest";
 
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
@@ -2647,6 +2789,143 @@ mod test {
             .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_pull_uk_icr_io() {
+        match std::env::var("AUTH_PASSWORD") {
+            Ok(auth_password) => match !auth_password.is_empty() {
+                true => {
+                    let reference = Reference::try_from(UK_ICR_IO_IMAGE_SIGNED)
+                        .expect("failed to parse reference");
+                    let mut c = Client::default();
+                    let (manifest, _manifest_str) = c
+                        .pull_image_manifest(
+                            &reference,
+                            &RegistryAuth::Basic(UK_ICR_IO_USERNAME.to_owned(), auth_password),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        manifest.config.media_type,
+                        manifest::IMAGE_DOCKER_CONFIG_MEDIA_TYPE
+                    );
+                }
+                false => {
+                    println!("Skipping test test_pull_uk_icr_io because password credential for uk.icr.io is not set")
+                }
+            },
+            Err(_) => {
+                println!("Skipping test test_pull_uk_icr_io because password credential for uk.icr.io is not set")
+            }
+        }
+    }
+
+    #[cfg(feature = "extension-rss")]
+    #[tokio::test]
+    async fn test_fetch_signatures_signed_digest() {
+        match std::env::var("AUTH_PASSWORD") {
+            Ok(auth_password) => match !auth_password.is_empty() {
+                true => {
+                    let reference = Reference::try_from(UK_ICR_IO_IMAGE_SIGNED)
+                        .expect("failed to parse reference");
+                    let mut c = Client::default();
+                    let registry_signatures = c
+                        .fetch_signatures(
+                            &reference,
+                            &RegistryAuth::Basic(UK_ICR_IO_USERNAME.to_owned(), auth_password),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(registry_signatures.signatures.len(), 1);
+                    assert_eq!(registry_signatures.signatures[0].schema_version, 2);
+                    assert_eq!(registry_signatures.signatures[0].name, "sha256:023917ec6a886d0e8e15f28fb543515a5fcd8d938edb091e8147db4efed388ee@5fbc99999615600d0d7ed04321d86484");
+                    assert_eq!(
+                        registry_signatures.signatures[0].signature_type,
+                        SIGNATURE_TYPE
+                    );
+                    assert_eq!(registry_signatures.signatures[0].content, "owGbwMvMwMXY5l3h8yxR5Rvj6QOVSQwpH0qSqpWSizJLMpMTc5SsqpUyU1LzSjJLKkHslPzk7NQi3aLUtNSi1LzkVCUrpdJsvczkIr3MfP3cxJKSxKK8/PjM3MT01PiC0uIM/aTS4sqk/Aqr4sz0vNQU3ZzEktTiEqVaHSWwGiQjcxPzMtOAcropmekgJVZKxRmJRqZmVgZGxpaG5qnJZokWFmYpBqkWqYamaUYWaUmmJsamhqaJpmnJKRYplsYWqSlJBpaGqRaGJuYpSSZAF6YYW1ikpoIsK6ksADk1sSQ/NzNZITk/ryQxMy+1SAHkqsSS0iKwovyCksz8PIifk4tSgYqLEHpM9QzN9AyVgEZl5gKdl5hboGRlaGZpbGJhYGBsUlvbybiZhYGRi0FWTJEldp/CvXsqN17dW9ejDwtcViZQwDJwcQrARDiO8DBs0XYuPzzjaa9m4fOw8qnc59OWrXKwet/1NWHZTb4nvF+WxTr1RKU98GeZfXDHPJND6R8fzOvktbGQiF3151LcxwSFjLTzC9nTv5Tu79vw6fCnDz/3lvx++qB3Wzp/EQd7yxWurBlL9u27bXukgnnDTafNxbYF+x4e/rd1u/1UGbml989X/Hx9d4XGtKsiUywOJXvtn7ajsXbbdbuTJVMafSJnPuqR/7qytl4trLH5UOj1tAjN9zFpj11LnpadqJ+2zLvhhQvnqakXu1J+fTzwSF7pt5zSEYuwlYXZU3dusTKuuX/9CWdmJH+4fqn8rF+7NSZ9ZDq45/O3Mhu2F884mOwn/Fiz4+m05w/e7XF/enLGn8fXjAS2d8nEpq5mvDwznctkv5h7v8jUrKZ47SlrV9gaTdoqVLwgqzW17Tfjv2AznYiYlezvizYf5rC/cFot9V8E+75/x8+uDbnA4VLT/fvDi10X3QJtrvY2PAm0PKB/xLNttm34+mVvz1hobz35yKPwyPbwqgu55QvVl/lxF3rLu/Ex5AMA");
+                }
+                false => {
+                    println!("Skipping test test_fetch_signatures_signed_digest because password credential for uk.icr.io is not set")
+                }
+            },
+            Err(_) => {
+                println!("Skipping test test_fetch_signatures_signed_digest because password credential for uk.icr.io is not set")
+            }
+        }
+    }
+
+    #[cfg(feature = "extension-rss")]
+    #[tokio::test]
+    async fn test_fetch_signatures_unsigned_digest() {
+        match std::env::var("AUTH_PASSWORD") {
+            Ok(auth_password) => match !auth_password.is_empty() {
+                true => {
+                    let reference = Reference::try_from(UK_ICR_IO_IMAGE_UNSIGNED)
+                        .expect("failed to parse reference");
+                    let mut c = Client::default();
+                    let registry_signatures = c
+                        .fetch_signatures(
+                            &reference,
+                            &RegistryAuth::Basic(UK_ICR_IO_USERNAME.to_owned(), auth_password),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(registry_signatures.signatures.len(), 0);
+                }
+                false => {
+                    println!("Skipping test test_fetch_signatures_unsigned_digest because password credential for uk.icr.io is not set")
+                }
+            },
+            Err(_) => {
+                println!("Skipping test test_fetch_signatures_unsigned_digest because password credential for uk.icr.io is not set")
+            }
+        }
+    }
+
+    #[cfg(feature = "extension-rss")]
+    #[tokio::test]
+    async fn test_fetch_signatures_registry_does_not_support_xrss() {
+        let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
+        let mut c = Client::default();
+        let registry_signatures = c
+            .fetch_signatures(&reference, &RegistryAuth::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(registry_signatures.signatures.len(), 0);
+    }
+
+    #[cfg(feature = "extension-rss")]
+    #[tokio::test]
+    async fn test_fetch_signatures_reference_does_not_include_digest() {
+        match std::env::var("AUTH_PASSWORD") {
+            Ok(auth_password) => match !auth_password.is_empty() {
+                true => {
+                    let reference = Reference::try_from(UK_ICR_IO_IMAGE_SIGNED_BY_TAG)
+                        .expect("failed to parse reference");
+                    let mut c = Client::default();
+                    let fetch_signatures_err = c
+                        .fetch_signatures(
+                            &reference,
+                            &RegistryAuth::Basic(UK_ICR_IO_USERNAME.to_owned(), auth_password),
+                        )
+                        .await
+                        .err()
+                        .unwrap();
+                    assert_eq!(
+                        fetch_signatures_err.to_string(),
+                        OciDistributionError::FetchSignatureNoDigestError.to_string()
+                    );
+                }
+                false => {
+                    println!("Skipping test test_fetch_signatures_reference_does_not_include_digest because password credential for uk.icr.io is not set")
+                }
+            },
+            Err(_) => {
+                println!("Skipping test test_fetch_signatures_reference_does_not_include_digest because password credential for uk.icr.io is not set")
+            }
+        }
     }
 
     #[tokio::test]
