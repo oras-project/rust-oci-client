@@ -26,6 +26,7 @@ use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
+use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -68,6 +69,15 @@ pub struct PushResponse {
     pub config_url: String,
     /// Pullable url for the manifest
     pub manifest_url: String,
+}
+
+/// The data returned by a successful tags/list Request
+#[derive(Deserialize, Debug)]
+pub struct TagResponse {
+    /// Repository Name
+    pub name: String,
+    /// List of existing Tags
+    pub tags: Vec<String>,
 }
 
 /// The data and media type for an image layer
@@ -270,6 +280,52 @@ impl Client {
     /// Create a new client with the supplied config
     pub fn from_source(config_source: &impl ClientConfigSource) -> Self {
         Self::new(config_source.client_config())
+    }
+
+    /// Fetches the available Tags for the given Reference
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    pub async fn list_tags(
+        &mut self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<TagResponse> {
+        let op = RegistryOperation::Pull;
+        let url = self.to_list_tags_url(image);
+
+        if !self.tokens.contains_key(image, op) {
+            self.auth(image, auth, op).await?;
+        }
+
+        let request = self.client.get(&url);
+        let request = if n.is_some() {
+            request.query(&[("n", n.unwrap())])
+        } else {
+            request
+        };
+        let request = if last.is_some() {
+            request.query(&[("last", last.unwrap())])
+        } else {
+            request
+        };
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: request,
+        };
+        let res = request
+            .apply_auth(image, op)?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let text = res.text().await?;
+
+        validate_registry_response(status, &text, &url)?;
+
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// Pull an image and return the bytes
@@ -1188,6 +1244,17 @@ impl Client {
             "uploads/",
         )
     }
+
+    fn to_list_tags_url(&self, reference: &Reference) -> String {
+        format!(
+            "{}://{}/v2/{}/tags/list",
+            self.config
+                .protocol
+                .scheme_for(reference.resolve_registry()),
+            reference.resolve_registry(),
+            reference.repository(),
+        )
+    }
 }
 
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
@@ -1735,6 +1802,17 @@ mod test {
     }
 
     #[test]
+    fn test_to_list_tags_url() {
+        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let blob_url = Client::default().to_list_tags_url(&image);
+
+        assert_eq!(
+            blob_url,
+            "https://webassembly.azurecr.io/v2/hello-wasm/tags/list"
+        )
+    }
+
+    #[test]
     fn manifest_url_generation_respects_http_protocol() {
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -1969,6 +2047,66 @@ mod test {
                 panic!("Unexpeted Basic Auth Token");
             }
         }
+    }
+
+    #[cfg(feature = "test-registry")]
+    #[tokio::test]
+    async fn test_list_tags() {
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image_edge());
+        let port = test_container.get_host_port_ipv4(5000);
+        let auth =
+            RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
+
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
+
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        client
+            .auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _digest) = client
+            ._pull_image_manifest(&image)
+            .await
+            .expect("failed to pull manifest");
+
+        let image_data = client
+            .pull(&image, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
+            .await
+            .expect("failed to pull image");
+
+        for i in 0..=3 {
+            let push_image: Reference = format!("localhost:{}/hello-wasm:1.0.{}", port, i)
+                .parse()
+                .unwrap();
+            client
+                .auth(&push_image, &auth, RegistryOperation::Push)
+                .await
+                .expect("authenticated");
+            client
+                .push(
+                    &push_image,
+                    &image_data.layers,
+                    image_data.config.clone(),
+                    &auth,
+                    Some(manifest.clone()),
+                )
+                .await
+                .expect("Failed to push Image");
+        }
+
+        let image: Reference = format!("localhost:{}/hello-wasm:1.0.1", port)
+            .parse()
+            .unwrap();
+        let response = client
+            .list_tags(&image, &RegistryAuth::Anonymous, Some(2), Some("1.0.1"))
+            .await
+            .expect("Cannot list Tags");
+        assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
     }
 
     #[tokio::test]
@@ -2215,6 +2353,17 @@ mod test {
                 .await
                 .is_err());
         }
+    }
+
+    // This is the latest build of distribution/distribution from the `main` branch
+    // Until distribution v3 is relased, this is the only way to have this fix
+    // https://github.com/distribution/distribution/pull/3143
+    //
+    // We require this fix only when testing the capability to list tags
+    #[cfg(feature = "test-registry")]
+    fn registry_image_edge() -> GenericImage {
+        images::generic::GenericImage::new("distribution/distribution", "edge")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[cfg(feature = "test-registry")]
