@@ -325,7 +325,7 @@ impl Client {
 
         validate_registry_response(status, &text, &url)?;
 
-        return Ok(serde_json::from_str(&text)?);
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// Pull an image and return the bytes
@@ -2049,6 +2049,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_list_tags() {
         let docker = clients::Cli::default();
