@@ -81,6 +81,8 @@ pub enum Os {
     Plan9,
     /// Solaris
     Solaris,
+    /// WASI Preview 1
+    Wasip1,
     /// Microsoft Windows
     Windows,
     /// With this field empty
