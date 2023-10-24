@@ -301,13 +301,13 @@ impl Client {
         }
 
         let request = self.client.get(&url);
-        let request = if n.is_some() {
-            request.query(&[("n", n.unwrap())])
+        let request = if let Some(num) = n {
+            request.query(&[("n", num)])
         } else {
             request
         };
-        let request = if last.is_some() {
-            request.query(&[("last", last.unwrap())])
+        let request = if let Some(l) = last {
+            request.query(&[("last", l)])
         } else {
             request
         };
