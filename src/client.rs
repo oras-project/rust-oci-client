@@ -301,13 +301,13 @@ impl Client {
         }
 
         let request = self.client.get(&url);
-        let request = if n.is_some() {
-            request.query(&[("n", n.unwrap())])
+        let request = if let Some(num) = n {
+            request.query(&[("n", num)])
         } else {
             request
         };
-        let request = if last.is_some() {
-            request.query(&[("last", last.unwrap())])
+        let request = if let Some(l) = last {
+            request.query(&[("last", l)])
         } else {
             request
         };
@@ -1651,11 +1651,7 @@ mod test {
     use tokio_util::io::StreamReader;
 
     #[cfg(feature = "test-registry")]
-    use testcontainers::{
-        clients,
-        core::WaitFor,
-        images::{self, generic::GenericImage},
-    };
+    use testcontainers::{clients, core::WaitFor, GenericImage};
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
     const HELLO_IMAGE_TAG: &str = "webassembly.azurecr.io/hello-wasm:v1";
@@ -2362,19 +2358,19 @@ mod test {
     // We require this fix only when testing the capability to list tags
     #[cfg(feature = "test-registry")]
     fn registry_image_edge() -> GenericImage {
-        images::generic::GenericImage::new("distribution/distribution", "edge")
+        GenericImage::new("distribution/distribution", "edge")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[cfg(feature = "test-registry")]
     fn registry_image() -> GenericImage {
-        images::generic::GenericImage::new("docker.io/library/registry", "2")
+        GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[cfg(feature = "test-registry")]
     fn registry_image_basic_auth(auth_path: &str) -> GenericImage {
-        images::generic::GenericImage::new("docker.io/library/registry", "2")
+        GenericImage::new("docker.io/library/registry", "2")
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
