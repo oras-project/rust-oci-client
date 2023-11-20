@@ -38,7 +38,7 @@ test-registry = []
 bytes = "1"
 chrono = { version = "0.4.23", features = ["serde"] }
 futures-util = "0.3"
-http = "0.2"
+http = "1.0"
 http-auth = { version = "0.1", default_features = false }
 jwt = "0.16"
 lazy_static = "1.4"
