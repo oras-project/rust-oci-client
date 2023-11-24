@@ -498,7 +498,7 @@ impl Client {
         image: &Reference,
         authentication: &RegistryAuth,
         operation: RegistryOperation,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         debug!("Authorizing for image: {:?}", image);
         // The version request will tell us where to go.
         let url = format!(
@@ -510,7 +510,7 @@ impl Client {
         let res = self.client.get(&url).send().await?;
         let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
             Some(h) => h,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         let challenge = match BearerChallenge::try_from(dist_hdr) {
@@ -524,7 +524,7 @@ impl Client {
                         RegistryTokenType::Basic(username.to_string(), password.to_string()),
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -561,9 +561,10 @@ impl Client {
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
                 debug!("Successfully authorized for image '{:?}'", image);
+                let oauth_token = token.token().to_string();
                 self.tokens
                     .insert(image, operation, RegistryTokenType::Bearer(token));
-                Ok(())
+                Ok(Some(oauth_token))
             }
             _ => {
                 let reason = auth_res.text().await?;
@@ -2019,18 +2020,27 @@ mod test {
         assert!(res.is_err());
     }
 
+    fn check_auth_token(token: &str) {
+        // We test that the token is longer than a minimal hash.
+        assert!(token.len() > 64);
+    }
+
     #[tokio::test]
     async fn test_auth() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             let mut c = Client::default();
-            c.auth(
-                &reference,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Pull,
-            )
-            .await
-            .expect("result from auth request");
+            let token = c
+                .auth(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    RegistryOperation::Pull,
+                )
+                .await
+                .expect("result from auth request");
+
+            assert!(token.is_some());
+            check_auth_token(token.unwrap().as_ref());
 
             let tok = c
                 .tokens
@@ -2038,7 +2048,7 @@ mod test {
                 .expect("token is available");
             // We test that the token is longer than a minimal hash.
             if let RegistryTokenType::Bearer(tok) = tok {
-                assert!(tok.token().len() > 64);
+                check_auth_token(tok.token());
             } else {
                 panic!("Unexpeted Basic Auth Token");
             }
