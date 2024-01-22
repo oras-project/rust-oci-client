@@ -6,7 +6,7 @@
 use crate::config::ConfigFile;
 use crate::errors::*;
 use crate::manifest::{
-    ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest, Versioned,
+    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
     IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
@@ -361,7 +361,7 @@ impl Client {
                 async move {
                     let mut out: Vec<u8> = Vec::new();
                     debug!("Pulling image layer");
-                    this.pull_blob(image, &layer.digest, &mut out).await?;
+                    this.pull_blob(image, layer, &mut out).await?;
                     Ok::<_, OciDistributionError>(ImageLayer::new(
                         out,
                         layer.media_type.clone(),
@@ -840,8 +840,7 @@ impl Client {
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
-        self.pull_blob(image, &manifest.config.digest, &mut out)
-            .await?;
+        self.pull_blob(image, &manifest.config, &mut out).await?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
         Ok((manifest, digest, Config::new(out, media_type, annotations)))
@@ -864,26 +863,50 @@ impl Client {
     /// Pull a single layer from an OCI registry.
     ///
     /// This pulls the layer for a particular image that is identified by
-    /// the given digest. The image reference is used to find the
+    /// the given layer descriptor. The image reference is used to find the
     /// repository and the registry, but it is not used to verify that
     /// the digest is a layer inside of the image. (The manifest is
     /// used for that.)
     pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
-        digest: &str,
+        layer: &OciDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
-        let mut stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+
+        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder()
             .send()
-            .await?
-            .error_for_status()?
-            .bytes_stream();
+            .await?;
+
+        if let Some(urls) = &layer.urls {
+            for url in urls {
+                if response.error_for_status_ref().is_ok() {
+                    break;
+                }
+
+                let url = Url::parse(url)
+                    .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+
+                if url.scheme() == "http" || url.scheme() == "https" {
+                    // NOTE: we must not authenticate on additional URLs as those
+                    // can be abused to leak credentials or tokens.  Please
+                    // refer to CVE-2020-15157 for more information.
+                    response =
+                        RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
+                            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+                            .into_request_builder()
+                            .send()
+                            .await?
+                }
+            }
+        }
+
+        let mut stream = response.error_for_status()?.bytes_stream();
 
         while let Some(bytes) = stream.next().await {
             out.write_all(&bytes?).await?;
@@ -899,16 +922,43 @@ impl Client {
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
-        digest: &str,
+        layer: &OciDescriptor,
     ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
-        let stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+
+        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder()
             .send()
-            .await?
+            .await?;
+
+        if let Some(urls) = &layer.urls {
+            for url in urls {
+                if response.error_for_status_ref().is_ok() {
+                    break;
+                }
+
+                let url = Url::parse(url)
+                    .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+
+                if url.scheme() == "http" || url.scheme() == "https" {
+                    // NOTE: we must not authenticate on additional URLs as those
+                    // can be abused to leak credentials or tokens.  Please
+                    // refer to CVE-2020-15157 for more information.
+                    response =
+                        RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
+                            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+                            .into_request_builder()
+                            .send()
+                            .await?
+                }
+            }
+        }
+
+        let stream = response
+            .error_for_status()?
             .bytes_stream()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
@@ -1491,6 +1541,18 @@ pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
         .find(|entry| {
             entry.platform.as_ref().map_or(false, |platform| {
                 platform.os == "linux" && platform.architecture == "amd64"
+            })
+        })
+        .map(|entry| entry.digest.clone())
+}
+
+/// A platform resolver that chooses the first windows/amd64 variant, if present
+pub fn windows_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().map_or(false, |platform| {
+                platform.os == "windows" && platform.architecture == "amd64"
             })
         })
         .map(|entry| entry.digest.clone())
@@ -2259,7 +2321,7 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, &layer0.digest, &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, &layer0, &mut file).await {
                     println!(
                         "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
@@ -2304,7 +2366,7 @@ mod test {
             let layer0 = &manifest.layers[0];
 
             let layer_stream = c
-                .pull_blob_stream(&reference, &layer0.digest)
+                .pull_blob_stream(&reference, &layer0)
                 .await
                 .expect("failed to pull blob stream");
 
@@ -2615,8 +2677,11 @@ mod test {
             .parse()
             .unwrap();
         let layer_data = vec![1u8, 2, 3, 4];
-        let layer_digest = sha256_digest(&layer_data);
-        c.push_blob(&layer_reference, &[1, 2, 3, 4], &layer_digest)
+        let layer = OciDescriptor {
+            digest: sha256_digest(&layer_data),
+            ..Default::default()
+        };
+        c.push_blob(&layer_reference, &[1, 2, 3, 4], &layer.digest)
             .await
             .expect("Failed to push");
 
@@ -2624,13 +2689,13 @@ mod test {
         let image_reference: Reference = format!("localhost:{}/image-repository", port)
             .parse()
             .unwrap();
-        c.mount_blob(&image_reference, &layer_reference, &layer_digest)
+        c.mount_blob(&image_reference, &layer_reference, &layer.digest)
             .await
             .expect("Failed to mount");
 
         // Pull the layer from `image-repository`
         let mut buf = Vec::new();
-        c.pull_blob(&image_reference, &layer_digest, &mut buf)
+        c.pull_blob(&image_reference, &layer, &mut buf)
             .await
             .expect("Failed to pull");
 
