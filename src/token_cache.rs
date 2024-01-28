@@ -75,7 +75,7 @@ impl TokenCache {
     }
 
     pub(crate) async fn insert(
-        &mut self,
+        &self,
         reference: &Reference,
         op: RegistryOperation,
         token: RegistryTokenType,

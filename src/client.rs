@@ -289,7 +289,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     pub async fn list_tags(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
         n: Option<usize>,
@@ -336,7 +336,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     pub async fn pull(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: Vec<&str>,
@@ -354,7 +354,7 @@ impl Client {
 
         let layers = stream::iter(&manifest.layers)
             .map(|layer| {
-                // This avoids moving `self` which is &mut Self
+                // This avoids moving `self` which is &Self
                 // into the async block. We only want to capture
                 // as &Self
                 let this = &self;
@@ -392,7 +392,7 @@ impl Client {
     ///
     /// Returns pullable URL for the image
     pub async fn push(
-        &mut self,
+        &self,
         image_ref: &Reference,
         layers: &[ImageLayer],
         config: Config,
@@ -413,7 +413,7 @@ impl Client {
         // Upload layers
         stream::iter(layers)
             .map(|layer| {
-                // This avoids moving `self` which is &mut Self
+                // This avoids moving `self` which is &Self
                 // into the async block. We only want to capture
                 // as &Self
                 let this = &self;
@@ -497,7 +497,7 @@ impl Client {
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
     pub async fn auth(
-        &mut self,
+        &self,
         image: &Reference,
         authentication: &RegistryAuth,
         operation: RegistryOperation,
@@ -589,7 +589,7 @@ impl Client {
     /// HEAD request. If this header is not present, will make a second GET
     /// request and return the SHA256 of the response body.
     pub async fn fetch_manifest_digest(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<String> {
@@ -666,7 +666,7 @@ impl Client {
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
     pub async fn pull_image_manifest(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
@@ -686,7 +686,7 @@ impl Client {
     /// A Tuple is returned containing the [Manifest](crate::manifest::OciImageManifest)
     /// and the manifest content digest hash.
     pub async fn pull_manifest(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciManifest, String)> {
@@ -807,7 +807,7 @@ impl Client {
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
     pub async fn pull_manifest_and_config(
-        &mut self,
+        &self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String, String)> {
@@ -833,7 +833,7 @@ impl Client {
     }
 
     async fn _pull_manifest_and_config(
-        &mut self,
+        &self,
         image: &Reference,
     ) -> Result<(OciImageManifest, String, Config)> {
         let (manifest, digest) = self._pull_image_manifest(image).await?;
@@ -851,7 +851,7 @@ impl Client {
     ///
     /// This pushes a manifest list to an OCI registry.
     pub async fn push_manifest_list(
-        &mut self,
+        &self,
         reference: &Reference,
         auth: &RegistryAuth,
         manifest: OciImageIndex,
@@ -1740,7 +1740,7 @@ mod test {
         use hmac::{Hmac, Mac};
         use jwt::SignWithKey;
         use sha2::Sha256;
-        let mut client = Client::default();
+        let client = Client::default();
         let header = jwt::header::Header {
             algorithm: jwt::algorithm::AlgorithmType::Hs256,
             key_id: None,
@@ -2052,7 +2052,7 @@ mod test {
     async fn test_auth() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let mut c = Client::default();
+            let c = Client::default();
             let token = c
                 .auth(
                     &reference,
@@ -2088,7 +2088,7 @@ mod test {
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        let mut client = Client::new(ClientConfig {
+        let client = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
@@ -2150,7 +2150,7 @@ mod test {
                 .expect_err("pull manifest should fail");
 
             // But this should pass
-            let mut c = Client::default();
+            let c = Client::default();
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
@@ -2173,7 +2173,7 @@ mod test {
     async fn test_pull_manifest_public() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let mut c = Client::default();
+            let c = Client::default();
             let (manifest, _) = c
                 .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
                 .await
@@ -2189,7 +2189,7 @@ mod test {
     async fn pull_manifest_and_config_public() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let mut c = Client::default();
+            let c = Client::default();
             let (manifest, _, config) = c
                 .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
                 .await
@@ -2204,7 +2204,7 @@ mod test {
 
     #[tokio::test]
     async fn test_fetch_digest() {
-        let mut c = Client::default();
+        let c = Client::default();
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -2214,7 +2214,7 @@ mod test {
 
             // This should pass
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let mut c = Client::default();
+            let c = Client::default();
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
@@ -2236,7 +2236,7 @@ mod test {
 
     #[tokio::test]
     async fn test_pull_blob() {
-        let mut c = Client::default();
+        let c = Client::default();
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -2283,7 +2283,7 @@ mod test {
 
     #[tokio::test]
     async fn test_pull_blob_stream() {
-        let mut c = Client::default();
+        let c = Client::default();
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -2419,7 +2419,7 @@ mod test {
         let test_container = docker.run(registry_image());
         let port = test_container.get_host_port_ipv4(5000);
 
-        let mut c = Client::new(ClientConfig {
+        let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
@@ -2534,7 +2534,7 @@ mod test {
         let _ = tracing_subscriber::fmt::try_init();
         let port = test_container.get_host_port_ipv4(5000);
 
-        let mut c = Client::new(ClientConfig {
+        let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
@@ -2641,7 +2641,7 @@ mod test {
     async fn test_platform_resolution() {
         // test that we get an error when we pull a manifest list
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
-        let mut c = Client::new(ClientConfig {
+        let c = Client::new(ClientConfig {
             platform_resolver: None,
             ..Default::default()
         });
@@ -2671,7 +2671,7 @@ mod test {
     #[tokio::test]
     async fn test_pull_ghcr_io() {
         let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
-        let mut c = Client::default();
+        let c = Client::default();
         let (manifest, _manifest_str) = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
             .await
@@ -2683,7 +2683,7 @@ mod test {
     #[ignore]
     async fn test_roundtrip_multiple_layers() {
         let _ = tracing_subscriber::fmt::try_init();
-        let mut c = Client::new(ClientConfig {
+        let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
         });
