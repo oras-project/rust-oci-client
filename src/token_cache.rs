@@ -59,7 +59,15 @@ pub enum RegistryOperation {
     Pull,
 }
 
-type CacheType = BTreeMap<(String, String, RegistryOperation), (RegistryTokenType, u64)>;
+// Types to allow better naming
+type Registry = String;
+type Repository = String;
+type TokenCacheKey = (Registry, Repository, RegistryOperation);
+type TokenExpiration = u64;
+type TokenCacheValue = (RegistryTokenType, TokenExpiration);
+
+// (registry, repository, scope) -> (token, expiration)
+type CacheType = BTreeMap<TokenCacheKey, TokenCacheValue>;
 
 #[derive(Default, Clone)]
 pub(crate) struct TokenCache {
@@ -68,12 +76,6 @@ pub(crate) struct TokenCache {
 }
 
 impl TokenCache {
-    pub(crate) fn new() -> Self {
-        TokenCache {
-            tokens: Arc::new(RwLock::new(BTreeMap::new())),
-        }
-    }
-
     pub(crate) async fn insert(
         &self,
         reference: &Reference,
@@ -157,9 +159,5 @@ impl TokenCache {
                 None
             }
         }
-    }
-
-    pub(crate) async fn contains_key(&self, reference: &Reference, op: RegistryOperation) -> bool {
-        self.get(reference, op).await.is_some()
     }
 }
