@@ -2641,7 +2641,7 @@ mod test {
     async fn test_platform_resolution() {
         // test that we get an error when we pull a manifest list
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
-        let c = Client::new(ClientConfig {
+        let mut c = Client::new(ClientConfig {
             platform_resolver: None,
             ..Default::default()
         });
