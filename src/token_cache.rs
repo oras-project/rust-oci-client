@@ -62,9 +62,20 @@ pub enum RegistryOperation {
 // Types to allow better naming
 type Registry = String;
 type Repository = String;
-type TokenCacheKey = (Registry, Repository, RegistryOperation);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TokenCacheKey {
+    registry: Registry,
+    repository: Repository,
+    operation: RegistryOperation,
+}
+
 type TokenExpiration = u64;
-type TokenCacheValue = (RegistryTokenType, TokenExpiration);
+
+struct TokenCacheValue {
+    token: RegistryTokenType,
+    expiration: TokenExpiration,
+}
 
 // (registry, repository, scope) -> (token, expiration)
 type CacheType = BTreeMap<TokenCacheKey, TokenCacheValue>;
@@ -121,10 +132,14 @@ impl TokenCache {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
         debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens
-            .write()
-            .await
-            .insert((registry, repository, op), (token, expiration));
+        self.tokens.write().await.insert(
+            TokenCacheKey {
+                registry,
+                repository,
+                operation: op,
+            },
+            TokenCacheValue { token, expiration },
+        );
     }
 
     pub(crate) async fn get(
@@ -134,28 +149,31 @@ impl TokenCache {
     ) -> Option<RegistryTokenType> {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
-        match self
-            .tokens
-            .read()
-            .await
-            .get(&(registry.clone(), repository.clone(), op))
-        {
-            Some((ref token, expiration)) => {
+        let key = TokenCacheKey {
+            registry,
+            repository,
+            operation: op,
+        };
+        match self.tokens.read().await.get(&key) {
+            Some(TokenCacheValue {
+                ref token,
+                expiration,
+            }) => {
                 let now = SystemTime::now();
                 let epoch = now
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
                     .as_secs();
                 if epoch > *expiration {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=true, "Fetching token");
+                    debug!(?key, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=false, "Fetching token");
+                    debug!(?key, %expiration, miss=false, expired=false, "Fetching token");
                     Some(token.clone())
                 }
             }
             None => {
-                debug!(%registry, %repository, ?op, miss=true, "Fetching token");
+                debug!(?key, miss = true, "Fetching token");
                 None
             }
         }
