@@ -534,6 +534,8 @@ impl Client {
         authentication: &RegistryAuth,
         operation: RegistryOperation,
     ) -> Result<Option<String>> {
+        self.store_auth_if_needed(image.resolve_registry(), authentication)
+            .await;
         // preserve old caching behavior
         match self._auth(image, authentication, operation).await {
             Ok(Some(RegistryTokenType::Bearer(token))) => {
@@ -1801,6 +1803,14 @@ mod test {
             .sign_with_key(&key)?
             .as_str()
             .to_string();
+
+        // we have to have it in the stored auth so we'll get to the token cache check.
+        client
+            .store_auth(
+                &Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
+                RegistryAuth::Anonymous,
+            )
+            .await;
 
         client
             .tokens
