@@ -34,7 +34,7 @@ pub(crate) struct Cli {
 fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     let server = reference
         .resolve_registry()
-        .strip_suffix("/")
+        .strip_suffix('/')
         .unwrap_or_else(|| reference.resolve_registry());
 
     if cli.anonymous {
@@ -85,7 +85,7 @@ pub async fn main() {
     let auth = build_auth(&reference, &cli);
 
     let client_config = build_client_config(&cli);
-    let mut client = Client::new(client_config);
+    let client = Client::new(client_config);
 
     let (manifest, _) = client
         .pull_manifest(&reference, &auth)
