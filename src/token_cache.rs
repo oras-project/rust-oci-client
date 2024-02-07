@@ -59,21 +59,25 @@ pub enum RegistryOperation {
     Pull,
 }
 
-type CacheType = BTreeMap<(String, String, RegistryOperation), (RegistryTokenType, u64)>;
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TokenCacheKey {
+    registry: String,
+    repository: String,
+    operation: RegistryOperation,
+}
+
+struct TokenCacheValue {
+    token: RegistryTokenType,
+    expiration: u64,
+}
 
 #[derive(Default, Clone)]
 pub(crate) struct TokenCache {
     // (registry, repository, scope) -> (token, expiration)
-    tokens: Arc<RwLock<CacheType>>,
+    tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
 }
 
 impl TokenCache {
-    pub(crate) fn new() -> Self {
-        TokenCache {
-            tokens: Arc::new(RwLock::new(BTreeMap::new())),
-        }
-    }
-
     pub(crate) async fn insert(
         &self,
         reference: &Reference,
@@ -119,10 +123,14 @@ impl TokenCache {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
         debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens
-            .write()
-            .await
-            .insert((registry, repository, op), (token, expiration));
+        self.tokens.write().await.insert(
+            TokenCacheKey {
+                registry,
+                repository,
+                operation: op,
+            },
+            TokenCacheValue { token, expiration },
+        );
     }
 
     pub(crate) async fn get(
@@ -132,34 +140,33 @@ impl TokenCache {
     ) -> Option<RegistryTokenType> {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
-        match self
-            .tokens
-            .read()
-            .await
-            .get(&(registry.clone(), repository.clone(), op))
-        {
-            Some((ref token, expiration)) => {
+        let key = TokenCacheKey {
+            registry,
+            repository,
+            operation: op,
+        };
+        match self.tokens.read().await.get(&key) {
+            Some(TokenCacheValue {
+                ref token,
+                expiration,
+            }) => {
                 let now = SystemTime::now();
                 let epoch = now
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
                     .as_secs();
                 if epoch > *expiration {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=true, "Fetching token");
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=false, "Fetching token");
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=false, "Fetching token");
                     Some(token.clone())
                 }
             }
             None => {
-                debug!(%registry, %repository, ?op, miss=true, "Fetching token");
+                debug!(%key.registry, %key.repository, ?key.operation, miss = true, "Fetching token");
                 None
             }
         }
-    }
-
-    pub(crate) async fn contains_key(&self, reference: &Reference, op: RegistryOperation) -> bool {
-        self.get(reference, op).await.is_some()
     }
 }
