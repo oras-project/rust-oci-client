@@ -1939,7 +1939,7 @@ mod test {
     #[test]
     fn can_generate_valid_digest() {
         let bytes = b"hellobytes";
-        let hash = sha256_digest(&bytes.to_vec());
+        let hash = sha256_digest(bytes);
 
         let combination = vec![b"hello".to_vec(), b"bytes".to_vec()];
         let combination_hash =

@@ -309,7 +309,7 @@ pub struct History {
 #[cfg(test)]
 mod tests {
     use assert_json_diff::assert_json_eq;
-    use chrono::{TimeZone, Utc};
+    use chrono::DateTime;
     use rstest::*;
     use serde_json::Value;
     use std::collections::{HashMap, HashSet};
@@ -411,14 +411,14 @@ mod tests {
         };
 
         let history = Some(vec![History {
-            created: Some(Utc.datetime_from_str("2015-10-31T22:22:54.690851953Z", "%+").expect("parse time failed")),
+            created: Some(DateTime::parse_from_rfc3339("2015-10-31T22:22:54.690851953Z").expect("parse time failed").into()),
             author: None,
             created_by: Some("/bin/sh -c #(nop) ADD file:a3bc1e842b69636f9df5256c49c5374fb4eef1e281fe3f282c65fb853ee171c5 in /".into()),
             comment: None,
             empty_layer: None,
         },
         History {
-            created: Some(Utc.datetime_from_str("2015-10-31T22:22:55.613815829Z", "%+").expect("parse time failed")),
+            created: Some(DateTime::parse_from_rfc3339("2015-10-31T22:22:55.613815829Z").expect("parse time failed").into()),
             author: None,
             created_by: Some("/bin/sh -c #(nop) CMD [\"sh\"]".into()),
             comment: None,
@@ -426,8 +426,9 @@ mod tests {
         }]);
         ConfigFile {
             created: Some(
-                Utc.datetime_from_str("2015-10-31T22:22:56.015925234Z", "%+")
-                    .expect("parse time failed"),
+                DateTime::parse_from_rfc3339("2015-10-31T22:22:56.015925234Z")
+                    .expect("parse time failed")
+                    .into(),
             ),
             author: Some("Alyssa P. Hacker <alyspdev@example.com>".into()),
             architecture: Architecture::Amd64,
@@ -503,8 +504,9 @@ mod tests {
         });
         let history = Some(vec![History {
             created: Some(
-                Utc.datetime_from_str("2023-04-21T11:53:28.176613804Z", "%+")
-                    .expect("parse time failed"),
+                DateTime::parse_from_rfc3339("2023-04-21T11:53:28.176613804Z")
+                    .expect("parse time failed")
+                    .into(),
             ),
             author: None,
             created_by: Some("COPY ./src/main.rs / # buildkit".into()),
@@ -526,8 +528,9 @@ mod tests {
             rootfs,
             history,
             created: Some(
-                Utc.datetime_from_str("2023-04-21T11:53:28.176613804Z", "%+")
-                    .expect("parse time failed"),
+                DateTime::parse_from_rfc3339("2023-04-21T11:53:28.176613804Z")
+                    .expect("parse time failed")
+                    .into(),
             ),
             author: None,
         }

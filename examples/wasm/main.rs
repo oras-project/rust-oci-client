@@ -19,7 +19,7 @@ use push::push_wasm;
 fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     let server = reference
         .resolve_registry()
-        .strip_suffix("/")
+        .strip_suffix('/')
         .unwrap_or_else(|| reference.resolve_registry());
 
     if cli.anonymous {
@@ -73,7 +73,7 @@ pub async fn main() {
         crate::cli::Commands::Pull { output, image } => {
             let reference: Reference = image.parse().expect("Not a valid image reference");
             let auth = build_auth(&reference, &cli);
-            pull_wasm(&mut client, &auth, &reference, &output).await;
+            pull_wasm(&mut client, &auth, &reference, output).await;
         }
         crate::cli::Commands::Push {
             module,
@@ -98,17 +98,14 @@ pub async fn main() {
                         values.insert(String::from(tmp[0]), String::from(tmp[1]));
                     }
                 }
-                if !values.contains_key(&annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string()) {
-                    values.insert(
-                        annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
-                        module.clone(),
-                    );
-                }
+                values
+                    .entry(annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string())
+                    .or_insert_with(|| module.clone());
 
                 Some(values)
             };
 
-            push_wasm(&mut client, &auth, &reference, &module, annotations).await;
+            push_wasm(&mut client, &auth, &reference, module, annotations).await;
         }
     }
 }

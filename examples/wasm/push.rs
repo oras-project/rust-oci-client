@@ -35,7 +35,7 @@ pub(crate) async fn push_wasm(
     let image_manifest = manifest::OciImageManifest::build(&layers, &config, annotations);
 
     let response = client
-        .push(&reference, &layers, config, &auth, Some(image_manifest))
+        .push(reference, &layers, config, auth, Some(image_manifest))
         .await
         .map(|push_response| push_response.manifest_url)
         .expect("Cannot push Wasm module");
