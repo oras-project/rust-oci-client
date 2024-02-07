@@ -59,31 +59,22 @@ pub enum RegistryOperation {
     Pull,
 }
 
-// Types to allow better naming
-type Registry = String;
-type Repository = String;
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TokenCacheKey {
-    registry: Registry,
-    repository: Repository,
+    registry: String,
+    repository: String,
     operation: RegistryOperation,
 }
 
-type TokenExpiration = u64;
-
 struct TokenCacheValue {
     token: RegistryTokenType,
-    expiration: TokenExpiration,
+    expiration: u64,
 }
-
-// (registry, repository, scope) -> (token, expiration)
-type CacheType = BTreeMap<TokenCacheKey, TokenCacheValue>;
 
 #[derive(Default, Clone)]
 pub(crate) struct TokenCache {
     // (registry, repository, scope) -> (token, expiration)
-    tokens: Arc<RwLock<CacheType>>,
+    tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
 }
 
 impl TokenCache {
@@ -165,15 +156,15 @@ impl TokenCache {
                     .expect("Time went backwards")
                     .as_secs();
                 if epoch > *expiration {
-                    debug!(?key, %expiration, miss=false, expired=true, "Fetching token");
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
-                    debug!(?key, %expiration, miss=false, expired=false, "Fetching token");
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=false, "Fetching token");
                     Some(token.clone())
                 }
             }
             None => {
-                debug!(?key, miss = true, "Fetching token");
+                debug!(%key.registry, %key.repository, ?key.operation, miss = true, "Fetching token");
                 None
             }
         }
