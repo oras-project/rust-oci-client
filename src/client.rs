@@ -731,6 +731,25 @@ impl Client {
         self._pull_image_manifest(image).await
     }
 
+    /// Pull a manifest from the remote OCI Distribution service without parsing it.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// A Tuple is returned containing the plain text representation of the manifest
+    /// and the manifest content digest hash.
+    pub async fn pull_manifest_raw(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        accepted_media_types: &[&str],
+    ) -> Result<(String, String)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_manifest_raw(image, accepted_media_types).await
+    }
+
     /// Pull a manifest from the remote OCI Distribution service.
     ///
     /// The client will check if it's already been authenticated and if
@@ -796,16 +815,20 @@ impl Client {
         }
     }
 
-    /// Pull a manifest from the remote OCI Distribution service.
+    /// Pull a manifest from the remote OCI Distribution service without parsing it.
     ///
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
-    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
+    async fn _pull_manifest_raw(
+        &self,
+        image: &Reference,
+        accepted_media_types: &[&str],
+    ) -> Result<(String, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_accept(accepted_media_types)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder()
@@ -819,9 +842,21 @@ impl Client {
 
         let digest = digest_header_value(headers, Some(&text))?;
 
+        Ok((text, digest))
+    }
+
+    /// Pull a manifest from the remote OCI Distribution service.
+    ///
+    /// If the connection has already gone through authentication, this will
+    /// use the bearer token. Otherwise, this will attempt an anonymous pull.
+    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
+        let (text, digest) = self
+            ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
+            .await?;
+
         self.validate_image_manifest(&text).await?;
 
-        debug!("Parsing response as Manifest: {}", text);
+        debug!("Parsing response as Manifest: {}", &text);
         let manifest = serde_json::from_str(&text)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
         Ok((manifest, digest))
@@ -2715,6 +2750,43 @@ mod test {
         assert_eq!(manifest.media_type, pulled_manifest.media_type);
         assert_eq!(manifest.schema_version, pulled_manifest.schema_version);
         assert_eq!(manifest.config.digest, pulled_manifest.config.digest);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_raw_manifest_digest() {
+        let docker = clients::Cli::default();
+        let test_container = docker.run(registry_image());
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let port = test_container.get_host_port_ipv4(5000);
+
+        let c = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
+
+        // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _) = c
+            .pull_manifest_raw(
+                &image,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull manifest");
+
+        // Compute the digest of the returned manifest text.
+        let digest = sha2::Sha256::digest(manifest.as_bytes());
+        let hex = format!("sha256:{:x}", digest);
+
+        // Validate that the computed digest and the digest in the pulled reference match.
+        assert_eq!(image.digest().unwrap(), hex);
     }
 
     #[tokio::test]
