@@ -2762,7 +2762,7 @@ mod test {
     #[tokio::test]
     async fn test_raw_manifest_digest() {
         let _ = tracing_subscriber::fmt::try_init();
-        
+
         let c = Client::default();
 
         // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
