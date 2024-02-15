@@ -736,8 +736,8 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the plain text representation of the manifest
-    /// and the manifest content digest hash.
+    /// A Tuple is returned containing raw byte representation of the manifest
+    /// and the manifest content digest.
     pub async fn pull_manifest_raw(
         &self,
         image: &Reference,
