@@ -364,7 +364,7 @@ impl Client {
 
         validate_registry_response(status, &body, &url)?;
 
-        Ok(serde_json::from_str(&std::str::from_utf8(&body)?)?)
+        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
 
     /// Pull an image and return the bytes
@@ -856,10 +856,10 @@ impl Client {
 
         let text = std::str::from_utf8(&body)?;
 
-        self.validate_image_manifest(&text).await?;
+        self.validate_image_manifest(text).await?;
 
         debug!("Parsing response as Manifest: {}", &text);
-        let manifest = serde_json::from_str(&text)
+        let manifest = serde_json::from_str(text)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
         Ok((manifest, digest))
     }
