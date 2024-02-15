@@ -29,6 +29,9 @@ pub enum OciDistributionError {
     #[error(transparent)]
     /// Transparent wrapper around `serde_json::error::Error`
     JsonError(#[from] serde_json::error::Error),
+    /// Manifest is not valid UTF-8
+    #[error("Manifest is not valid UTF-8")]
+    ManifestEncodingError(#[from] std::str::Utf8Error),
     /// Manifest: JSON unmarshalling error
     #[error("Failed to parse manifest as Versioned object: {0}")]
     ManifestParsingError(String),
