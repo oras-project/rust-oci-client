@@ -679,7 +679,7 @@ impl Client {
             let text = res.text().await?;
             validate_registry_response(status, &text, &url)?;
 
-            digest_header_value(headers, Some(&text))
+            digest_header_value(headers, Some(&text.as_bytes()))
         } else {
             let status = res.status();
             let headers = res.headers().clone();
@@ -840,7 +840,7 @@ impl Client {
 
         validate_registry_response(status, &text, &url)?;
 
-        let digest = digest_header_value(headers, Some(&text))?;
+        let digest = digest_header_value(headers, Some(&text.as_bytes()))?;
 
         Ok((text, digest))
     }
@@ -1783,13 +1783,13 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 /// Can optionally supply a response body (i.e. the manifest itself) to
 /// fallback to manually hashing this content. This should only be done if the
 /// response body contains the image manifest.
-fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> Result<String> {
+fn digest_header_value(headers: HeaderMap, body: Option<&[u8]>) -> Result<String> {
     let digest_header = headers.get("Docker-Content-Digest");
     match digest_header {
         None => {
             if let Some(body) = body {
                 // Fallback to hashing payload (tested with ECR)
-                let digest = sha2::Sha256::digest(body.as_bytes());
+                let digest = sha2::Sha256::digest(body);
                 let hex = format!("sha256:{:x}", digest);
                 debug!(%hex, "Computed digest of manifest payload.");
                 Ok(hex)
