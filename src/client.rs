@@ -360,11 +360,11 @@ impl Client {
             .send()
             .await?;
         let status = res.status();
-        let text = res.text().await?;
+        let body = res.bytes().await?;
 
-        validate_registry_response(status, &text, &url)?;
+        validate_registry_response(status, &body, &url)?;
 
-        Ok(serde_json::from_str(&text)?)
+        Ok(serde_json::from_str(&std::str::from_utf8(&body)?)?)
     }
 
     /// Pull an image and return the bytes
@@ -676,15 +676,15 @@ impl Client {
             let status = res.status();
             let headers = res.headers().clone();
             trace!(headers=?res.headers(), "Got Headers");
-            let text = res.text().await?;
-            validate_registry_response(status, &text, &url)?;
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
 
-            digest_header_value(headers, Some(&text.as_bytes()))
+            digest_header_value(headers, Some(&body))
         } else {
             let status = res.status();
             let headers = res.headers().clone();
-            let text = res.text().await?;
-            validate_registry_response(status, &text, &url)?;
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
 
             digest_header_value(headers, None)
         }
@@ -743,7 +743,7 @@ impl Client {
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: &[&str],
-    ) -> Result<(String, String)> {
+    ) -> Result<(Vec<u8>, String)> {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
@@ -823,7 +823,7 @@ impl Client {
         &self,
         image: &Reference,
         accepted_media_types: &[&str],
-    ) -> Result<(String, String)> {
+    ) -> Result<(Vec<u8>, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
@@ -836,13 +836,13 @@ impl Client {
             .await?;
         let headers = res.headers().clone();
         let status = res.status();
-        let text = res.text().await?;
+        let body = res.bytes().await?;
 
-        validate_registry_response(status, &text, &url)?;
+        validate_registry_response(status, &body, &url)?;
 
-        let digest = digest_header_value(headers, Some(&text.as_bytes()))?;
+        let digest = digest_header_value(headers, Some(&body))?;
 
-        Ok((text, digest))
+        Ok((body.to_vec(), digest))
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -850,9 +850,11 @@ impl Client {
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
     async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
-        let (text, digest) = self
+        let (body, digest) = self
             ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
             .await?;
+
+        let text = std::str::from_utf8(&body)?;
 
         self.validate_image_manifest(&text).await?;
 
@@ -1414,7 +1416,7 @@ impl Client {
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str) -> Result<()> {
+fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
         reqwest::StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
@@ -1426,6 +1428,7 @@ fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str
             status,
         ))),
         s if s.is_client_error() => {
+            let text = std::str::from_utf8(body)?;
             // According to the OCI spec, we should see an error in the message body.
             let envelope = serde_json::from_str::<OciEnvelope>(text)?;
             Err(OciDistributionError::RegistryError {
@@ -1433,11 +1436,15 @@ fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str
                 url: url.to_string(),
             })
         }
-        s => Err(OciDistributionError::ServerError {
-            code: s.as_u16(),
-            url: url.to_string(),
-            message: text.to_string(),
-        }),
+        s => {
+            let text = std::str::from_utf8(body)?;
+
+            Err(OciDistributionError::ServerError {
+                code: s.as_u16(),
+                url: url.to_string(),
+                message: text.to_string(),
+            })
+        }
     }
 }
 
@@ -2753,18 +2760,10 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
     async fn test_raw_manifest_digest() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-
         let _ = tracing_subscriber::fmt::try_init();
-        let port = test_container.get_host_port_ipv4(5000);
-
-        let c = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
-            ..Default::default()
-        });
+        
+        let c = Client::default();
 
         // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
@@ -2782,7 +2781,7 @@ mod test {
             .expect("failed to pull manifest");
 
         // Compute the digest of the returned manifest text.
-        let digest = sha2::Sha256::digest(manifest.as_bytes());
+        let digest = sha2::Sha256::digest(manifest);
         let hex = format!("sha256:{:x}", digest);
 
         // Validate that the computed digest and the digest in the pulled reference match.
