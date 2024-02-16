@@ -360,11 +360,11 @@ impl Client {
             .send()
             .await?;
         let status = res.status();
-        let text = res.text().await?;
+        let body = res.bytes().await?;
 
-        validate_registry_response(status, &text, &url)?;
+        validate_registry_response(status, &body, &url)?;
 
-        Ok(serde_json::from_str(&text)?)
+        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
 
     /// Pull an image and return the bytes
@@ -676,15 +676,15 @@ impl Client {
             let status = res.status();
             let headers = res.headers().clone();
             trace!(headers=?res.headers(), "Got Headers");
-            let text = res.text().await?;
-            validate_registry_response(status, &text, &url)?;
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
 
-            digest_header_value(headers, Some(&text))
+            digest_header_value(headers, Some(&body))
         } else {
             let status = res.status();
             let headers = res.headers().clone();
-            let text = res.text().await?;
-            validate_registry_response(status, &text, &url)?;
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
 
             digest_header_value(headers, None)
         }
@@ -729,6 +729,25 @@ impl Client {
             .await;
 
         self._pull_image_manifest(image).await
+    }
+
+    /// Pull a manifest from the remote OCI Distribution service without parsing it.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// A Tuple is returned containing raw byte representation of the manifest
+    /// and the manifest content digest.
+    pub async fn pull_manifest_raw(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        accepted_media_types: &[&str],
+    ) -> Result<(Vec<u8>, String)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_manifest_raw(image, accepted_media_types).await
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -796,16 +815,20 @@ impl Client {
         }
     }
 
-    /// Pull a manifest from the remote OCI Distribution service.
+    /// Pull a manifest from the remote OCI Distribution service without parsing it.
     ///
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
-    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
+    async fn _pull_manifest_raw(
+        &self,
+        image: &Reference,
+        accepted_media_types: &[&str],
+    ) -> Result<(Vec<u8>, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_accept(accepted_media_types)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder()
@@ -813,16 +836,30 @@ impl Client {
             .await?;
         let headers = res.headers().clone();
         let status = res.status();
-        let text = res.text().await?;
+        let body = res.bytes().await?;
 
-        validate_registry_response(status, &text, &url)?;
+        validate_registry_response(status, &body, &url)?;
 
-        let digest = digest_header_value(headers, Some(&text))?;
+        let digest = digest_header_value(headers, Some(&body))?;
 
-        self.validate_image_manifest(&text).await?;
+        Ok((body.to_vec(), digest))
+    }
 
-        debug!("Parsing response as Manifest: {}", text);
-        let manifest = serde_json::from_str(&text)
+    /// Pull a manifest from the remote OCI Distribution service.
+    ///
+    /// If the connection has already gone through authentication, this will
+    /// use the bearer token. Otherwise, this will attempt an anonymous pull.
+    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
+        let (body, digest) = self
+            ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
+            .await?;
+
+        let text = std::str::from_utf8(&body)?;
+
+        self.validate_image_manifest(text).await?;
+
+        debug!("Parsing response as Manifest: {}", &text);
+        let manifest = serde_json::from_str(text)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
         Ok((manifest, digest))
     }
@@ -1379,7 +1416,7 @@ impl Client {
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str) -> Result<()> {
+fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
         reqwest::StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
@@ -1391,6 +1428,7 @@ fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str
             status,
         ))),
         s if s.is_client_error() => {
+            let text = std::str::from_utf8(body)?;
             // According to the OCI spec, we should see an error in the message body.
             let envelope = serde_json::from_str::<OciEnvelope>(text)?;
             Err(OciDistributionError::RegistryError {
@@ -1398,11 +1436,15 @@ fn validate_registry_response(status: reqwest::StatusCode, text: &str, url: &str
                 url: url.to_string(),
             })
         }
-        s => Err(OciDistributionError::ServerError {
-            code: s.as_u16(),
-            url: url.to_string(),
-            message: text.to_string(),
-        }),
+        s => {
+            let text = std::str::from_utf8(body)?;
+
+            Err(OciDistributionError::ServerError {
+                code: s.as_u16(),
+                url: url.to_string(),
+                message: text.to_string(),
+            })
+        }
     }
 }
 
@@ -1748,13 +1790,13 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 /// Can optionally supply a response body (i.e. the manifest itself) to
 /// fallback to manually hashing this content. This should only be done if the
 /// response body contains the image manifest.
-fn digest_header_value(headers: HeaderMap, body: Option<&str>) -> Result<String> {
+fn digest_header_value(headers: HeaderMap, body: Option<&[u8]>) -> Result<String> {
     let digest_header = headers.get("Docker-Content-Digest");
     match digest_header {
         None => {
             if let Some(body) = body {
                 // Fallback to hashing payload (tested with ECR)
-                let digest = sha2::Sha256::digest(body.as_bytes());
+                let digest = sha2::Sha256::digest(body);
                 let hex = format!("sha256:{:x}", digest);
                 debug!(%hex, "Computed digest of manifest payload.");
                 Ok(hex)
@@ -2715,6 +2757,35 @@ mod test {
         assert_eq!(manifest.media_type, pulled_manifest.media_type);
         assert_eq!(manifest.schema_version, pulled_manifest.schema_version);
         assert_eq!(manifest.config.digest, pulled_manifest.config.digest);
+    }
+
+    #[tokio::test]
+    async fn test_raw_manifest_digest() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let c = Client::default();
+
+        // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _) = c
+            .pull_manifest_raw(
+                &image,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull manifest");
+
+        // Compute the digest of the returned manifest text.
+        let digest = sha2::Sha256::digest(manifest);
+        let hex = format!("sha256:{:x}", digest);
+
+        // Validate that the computed digest and the digest in the pulled reference match.
+        assert_eq!(image.digest().unwrap(), hex);
     }
 
     #[tokio::test]
