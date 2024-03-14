@@ -23,6 +23,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use futures_util::Stream;
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
+use itertools::Itertools;
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
@@ -31,6 +32,7 @@ use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -86,7 +88,7 @@ pub struct TagResponse {
 }
 
 /// The data and media type for an image layer
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageLayer {
     /// The data of this layer
     pub data: Vec<u8>,
@@ -125,6 +127,22 @@ impl ImageLayer {
     /// Helper function to compute the sha256 digest of an image layer
     pub fn sha256_digest(&self) -> String {
         sha256_digest(&self.data)
+    }
+}
+
+/// Implementing Hash to enable determining uniqueness
+/// eg via https://docs.rs/itertools/latest/itertools/structs/struct.Unique.html
+impl Hash for ImageLayer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.data.hash(state);
+        self.media_type.hash(state);
+        if let Some(annotations) = self.annotations.clone() {
+            let sorted = annotations.iter().sorted();
+            for (k, v) in sorted {
+                k.hash(state);
+                v.hash(state);
+            }
+        }
     }
 }
 
@@ -2928,5 +2946,88 @@ mod test {
         c.pull_image_manifest(&dest_image, &RegistryAuth::Anonymous)
             .await
             .expect("Failed to pull manifest");
+    }
+
+    #[tokio::test]
+    async fn test_hashable_image_layer() {
+        // First two should be identical; others differ
+        let image_layers = Vec::from([
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(HashMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(HashMap::from([
+                    ("2".to_owned(), "3".to_owned()),
+                    ("0".to_owned(), "1".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "different_media_type".to_owned(),
+                annotations: Some(HashMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(HashMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(HashMap::from([
+                    ("1".to_owned(), "0".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+        ]);
+
+        assert_eq!(
+            &image_layers[0], &image_layers[1],
+            "image_layers[0] should equal image_layers[1]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[2],
+            "image_layers[0] should not equal image_layers[2]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[3],
+            "image_layers[0] should not equal image_layers[3]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[4],
+            "image_layers[0] should not equal image_layers[4]"
+        );
+        assert_ne!(
+            &image_layers[2], &image_layers[3],
+            "image_layers[2] should not equal image_layers[3]"
+        );
+        assert_ne!(
+            &image_layers[2], &image_layers[4],
+            "image_layers[2] should not equal image_layers[4]"
+        );
+        assert_ne!(
+            &image_layers[3], &image_layers[4],
+            "image_layers[3] should not equal image_layers[4]"
+        );
+
+        let deduped: Vec<ImageLayer> = image_layers.clone().into_iter().unique().collect();
+        assert_eq!(
+            image_layers.len() - 1,
+            deduped.len(),
+            "after deduplication, there should be one less image layer"
+        );
     }
 }
