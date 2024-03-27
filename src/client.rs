@@ -51,6 +51,9 @@ pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
 /// Default value for `ClientConfig::max_concurrent_download`
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 
+/// Default value for `ClientConfig:default_token_expiration_secs`
+pub const DEFAULT_TOKEN_EXPIRATION_SECS: usize = 60;
+
 /// The data for an image or module.
 #[derive(Clone)]
 pub struct ImageData {
@@ -259,8 +262,11 @@ impl TryFrom<ClientConfig> for Client {
             client_builder = client_builder.add_root_certificate(cert);
         }
 
+        let mut tokens = TokenCache::default();
+        tokens.default_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
             config: Arc::new(config),
+            tokens,
             client: client_builder.build()?,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             ..Default::default()
@@ -271,10 +277,13 @@ impl TryFrom<ClientConfig> for Client {
 impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
+        let mut tokens = TokenCache::default();
+        tokens.default_expiration_secs = config.default_token_expiration_secs;
         Client::try_from(config).unwrap_or_else(|err| {
             warn!("Cannot create OCI client from config: {:?}", err);
             warn!("Creating client with default configuration");
             Self {
+                tokens,
                 push_chunk_size: PUSH_CHUNK_MAX_SIZE,
                 ..Default::default()
             }
@@ -1604,6 +1613,12 @@ pub struct ClientConfig {
     ///
     /// This defaults to [`DEFAULT_MAX_CONCURRENT_DOWNLOAD`].
     pub max_concurrent_download: usize,
+
+    /// Default token expiration in seconds, to use when the token claim
+    /// doesn't provide a value.
+    ///
+    /// This defaults to [`DEFAULT_TOKEN_EXPIRATION_SECS`].
+    pub default_token_expiration_secs: usize,
 }
 
 impl Default for ClientConfig {
@@ -1617,6 +1632,7 @@ impl Default for ClientConfig {
             platform_resolver: Some(Box::new(current_platform_resolver)),
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
+            default_token_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
         }
     }
 }
