@@ -1,4 +1,3 @@
-use crate::client::DEFAULT_TOKEN_EXPIRATION_SECS;
 use crate::reference::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -80,16 +79,14 @@ pub(crate) struct TokenCache {
     pub default_expiration_secs: usize,
 }
 
-impl Default for TokenCache {
-    fn default() -> Self {
-        Self {
-            tokens: Arc::default(),
-            default_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
+impl TokenCache {
+    pub(crate) fn new(default_expiration_secs: usize) -> Self {
+        TokenCache {
+            tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            default_expiration_secs,
         }
     }
-}
 
-impl TokenCache {
     pub(crate) async fn insert(
         &self,
         reference: &Reference,

@@ -221,7 +221,7 @@ impl Default for Client {
         Self {
             config: Arc::default(),
             auth_store: Arc::default(),
-            tokens: TokenCache::default(),
+            tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
             client: reqwest::Client::default(),
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         }
@@ -262,11 +262,10 @@ impl TryFrom<ClientConfig> for Client {
             client_builder = client_builder.add_root_certificate(cert);
         }
 
-        let mut tokens = TokenCache::default();
-        tokens.default_expiration_secs = config.default_token_expiration_secs;
+        let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
             config: Arc::new(config),
-            tokens,
+            tokens: TokenCache::new(default_token_expiration_secs),
             client: client_builder.build()?,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             ..Default::default()
@@ -277,13 +276,12 @@ impl TryFrom<ClientConfig> for Client {
 impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
-        let mut tokens = TokenCache::default();
-        tokens.default_expiration_secs = config.default_token_expiration_secs;
+        let default_token_expiration_secs = config.default_token_expiration_secs;
         Client::try_from(config).unwrap_or_else(|err| {
             warn!("Cannot create OCI client from config: {:?}", err);
             warn!("Creating client with default configuration");
             Self {
-                tokens,
+                tokens: TokenCache::new(default_token_expiration_secs),
                 push_chunk_size: PUSH_CHUNK_MAX_SIZE,
                 ..Default::default()
             }
