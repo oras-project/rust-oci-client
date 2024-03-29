@@ -23,16 +23,15 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use futures_util::Stream;
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
-use itertools::Itertools;
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Url};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -88,7 +87,7 @@ pub struct TagResponse {
 }
 
 /// The data and media type for an image layer
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
     /// The data of this layer
     pub data: Vec<u8>,
@@ -96,7 +95,7 @@ pub struct ImageLayer {
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl ImageLayer {
@@ -104,7 +103,7 @@ impl ImageLayer {
     pub fn new(
         data: Vec<u8>,
         media_type: String,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         ImageLayer {
             data,
@@ -115,34 +114,18 @@ impl ImageLayer {
 
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
     }
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
     }
 
     /// Helper function to compute the sha256 digest of an image layer
     pub fn sha256_digest(&self) -> String {
         sha256_digest(&self.data)
-    }
-}
-
-/// Implementing Hash to enable determining uniqueness
-/// eg via https://docs.rs/itertools/latest/itertools/structs/struct.Unique.html
-impl Hash for ImageLayer {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data.hash(state);
-        self.media_type.hash(state);
-        if let Some(annotations) = self.annotations.clone() {
-            let sorted = annotations.iter().sorted();
-            for (k, v) in sorted {
-                k.hash(state);
-                v.hash(state);
-            }
-        }
     }
 }
 
@@ -155,7 +138,7 @@ pub struct Config {
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl Config {
@@ -163,7 +146,7 @@ impl Config {
     pub fn new(
         data: Vec<u8>,
         media_type: String,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         Config {
             data,
@@ -174,7 +157,7 @@ impl Config {
 
     /// Constructs a new Config struct with provided data and
     /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -182,7 +165,7 @@ impl Config {
     /// media type `application/vnd.oci.image.config.v1+json`
     pub fn oci_v1_from_config_file(
         config_file: ConfigFile,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
         let data = serde_json::to_vec(&config_file)?;
         Ok(Self::new(
@@ -2950,12 +2933,14 @@ mod test {
 
     #[tokio::test]
     async fn test_hashable_image_layer() {
+        use itertools::Itertools;
+
         // First two should be identical; others differ
         let image_layers = Vec::from([
             ImageLayer {
                 data: Vec::from([0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
-                annotations: Some(HashMap::from([
+                annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
                     ("2".to_owned(), "3".to_owned()),
                 ])),
@@ -2963,7 +2948,7 @@ mod test {
             ImageLayer {
                 data: Vec::from([0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
-                annotations: Some(HashMap::from([
+                annotations: Some(BTreeMap::from([
                     ("2".to_owned(), "3".to_owned()),
                     ("0".to_owned(), "1".to_owned()),
                 ])),
@@ -2971,7 +2956,7 @@ mod test {
             ImageLayer {
                 data: Vec::from([0, 1, 2, 3]),
                 media_type: "different_media_type".to_owned(),
-                annotations: Some(HashMap::from([
+                annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
                     ("2".to_owned(), "3".to_owned()),
                 ])),
@@ -2979,7 +2964,7 @@ mod test {
             ImageLayer {
                 data: Vec::from([0, 1, 2]),
                 media_type: "media_type".to_owned(),
-                annotations: Some(HashMap::from([
+                annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
                     ("2".to_owned(), "3".to_owned()),
                 ])),
@@ -2987,7 +2972,7 @@ mod test {
             ImageLayer {
                 data: Vec::from([0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
-                annotations: Some(HashMap::from([
+                annotations: Some(BTreeMap::from([
                     ("1".to_owned(), "0".to_owned()),
                     ("2".to_owned(), "3".to_owned()),
                 ])),

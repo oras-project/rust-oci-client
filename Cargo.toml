@@ -37,7 +37,6 @@ chrono = { version = "0.4.23", features = ["serde"] }
 futures-util = "0.3"
 http = "1.1"
 http-auth = { version = "0.1", default_features = false }
-itertools = "0.12.1"
 jwt = "0.16"
 lazy_static = "1.4"
 olpc-cjson = "0.1"
@@ -62,6 +61,7 @@ clap = { version = "4.0", features = ["derive"] }
 rstest = "0.18.1"
 docker_credential = "1.0"
 hmac = "0.12"
+itertools = "0.12.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
 testcontainers = "0.15"

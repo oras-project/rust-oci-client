@@ -1,5 +1,5 @@
 //! OCI Manifest
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::{
     client::{Config, ImageLayer},
@@ -113,7 +113,7 @@ pub struct OciImageManifest {
     /// MUST either be absent or be an empty map."
     /// TO accomodate either, this is optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl Default for OciImageManifest {
@@ -137,7 +137,7 @@ impl OciImageManifest {
     pub fn build(
         layers: &[ImageLayer],
         config: &Config,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         let mut manifest = OciImageManifest::default();
 
@@ -276,7 +276,7 @@ pub struct OciDescriptor {
     /// This OPTIONAL property MUST use the annotation rules.
     /// <https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules>
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl std::fmt::Display for OciDescriptor {
@@ -334,7 +334,7 @@ pub struct OciImageIndex {
     /// MUST either be absent or be an empty map."
     /// TO accomodate either, this is optional.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// The manifest entry of an `ImageIndex`.
@@ -375,7 +375,7 @@ pub struct ImageIndexEntry {
     /// This OPTIONAL property contains arbitrary metadata for the image index.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl std::fmt::Display for ImageIndexEntry {
