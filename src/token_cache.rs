@@ -71,13 +71,22 @@ struct TokenCacheValue {
     expiration: u64,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct TokenCache {
     // (registry, repository, scope) -> (token, expiration)
     tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
+    /// Default token expiration in seconds, to use when claim doesn't specify a value
+    pub default_expiration_secs: usize,
 }
 
 impl TokenCache {
+    pub(crate) fn new(default_expiration_secs: usize) -> Self {
+        TokenCache {
+            tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            default_expiration_secs,
+        }
+    }
+
     pub(crate) async fn insert(
         &self,
         reference: &Reference,
@@ -109,8 +118,8 @@ impl TokenCache {
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Time went backwards")
                                 .as_secs();
-                            let expiration = epoch + 60;
-                            debug!(?token, "Cannot extract expiration from token's claims, assuming a 60 seconds validity");
+                            let expiration = epoch + self.default_expiration_secs as u64;
+                            debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", self.default_expiration_secs);
                             expiration
                         },
                         Err(error) => {
