@@ -1,7 +1,7 @@
 use oci_distribution::{annotations, secrets::RegistryAuth, Client, Reference};
 
 use docker_credential::{CredentialRetrievalError, DockerCredential};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tracing::{debug, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -84,14 +84,14 @@ pub async fn main() {
             let auth = build_auth(&reference, &cli);
 
             let annotations = if annotations.is_empty() {
-                let mut values: HashMap<String, String> = HashMap::new();
+                let mut values: BTreeMap<String, String> = BTreeMap::new();
                 values.insert(
                     annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
                     module.clone(),
                 );
                 Some(values)
             } else {
-                let mut values: HashMap<String, String> = HashMap::new();
+                let mut values: BTreeMap<String, String> = BTreeMap::new();
                 for annotation in annotations {
                     let tmp: Vec<_> = annotation.splitn(2, '=').collect();
                     if tmp.len() == 2 {

@@ -29,8 +29,9 @@ use reqwest::{RequestBuilder, Url};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
+use std::hash::Hash;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -86,7 +87,7 @@ pub struct TagResponse {
 }
 
 /// The data and media type for an image layer
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
     /// The data of this layer
     pub data: Vec<u8>,
@@ -94,7 +95,7 @@ pub struct ImageLayer {
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl ImageLayer {
@@ -102,7 +103,7 @@ impl ImageLayer {
     pub fn new(
         data: Vec<u8>,
         media_type: String,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         ImageLayer {
             data,
@@ -113,12 +114,12 @@ impl ImageLayer {
 
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
     }
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -137,7 +138,7 @@ pub struct Config {
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 impl Config {
@@ -145,7 +146,7 @@ impl Config {
     pub fn new(
         data: Vec<u8>,
         media_type: String,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         Config {
             data,
@@ -156,7 +157,7 @@ impl Config {
 
     /// Constructs a new Config struct with provided data and
     /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<HashMap<String, String>>) -> Self {
+    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
         Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -164,7 +165,7 @@ impl Config {
     /// media type `application/vnd.oci.image.config.v1+json`
     pub fn oci_v1_from_config_file(
         config_file: ConfigFile,
-        annotations: Option<HashMap<String, String>>,
+        annotations: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
         let data = serde_json::to_vec(&config_file)?;
         Ok(Self::new(
@@ -2928,5 +2929,90 @@ mod test {
         c.pull_image_manifest(&dest_image, &RegistryAuth::Anonymous)
             .await
             .expect("Failed to pull manifest");
+    }
+
+    #[tokio::test]
+    async fn test_hashable_image_layer() {
+        use itertools::Itertools;
+
+        // First two should be identical; others differ
+        let image_layers = Vec::from([
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(BTreeMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(BTreeMap::from([
+                    ("2".to_owned(), "3".to_owned()),
+                    ("0".to_owned(), "1".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "different_media_type".to_owned(),
+                annotations: Some(BTreeMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(BTreeMap::from([
+                    ("0".to_owned(), "1".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+            ImageLayer {
+                data: Vec::from([0, 1, 2, 3]),
+                media_type: "media_type".to_owned(),
+                annotations: Some(BTreeMap::from([
+                    ("1".to_owned(), "0".to_owned()),
+                    ("2".to_owned(), "3".to_owned()),
+                ])),
+            },
+        ]);
+
+        assert_eq!(
+            &image_layers[0], &image_layers[1],
+            "image_layers[0] should equal image_layers[1]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[2],
+            "image_layers[0] should not equal image_layers[2]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[3],
+            "image_layers[0] should not equal image_layers[3]"
+        );
+        assert_ne!(
+            &image_layers[0], &image_layers[4],
+            "image_layers[0] should not equal image_layers[4]"
+        );
+        assert_ne!(
+            &image_layers[2], &image_layers[3],
+            "image_layers[2] should not equal image_layers[3]"
+        );
+        assert_ne!(
+            &image_layers[2], &image_layers[4],
+            "image_layers[2] should not equal image_layers[4]"
+        );
+        assert_ne!(
+            &image_layers[3], &image_layers[4],
+            "image_layers[3] should not equal image_layers[4]"
+        );
+
+        let deduped: Vec<ImageLayer> = image_layers.clone().into_iter().unique().collect();
+        assert_eq!(
+            image_layers.len() - 1,
+            deduped.len(),
+            "after deduplication, there should be one less image layer"
+        );
     }
 }
