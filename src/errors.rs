@@ -108,7 +108,7 @@ pub type Result<T> = std::result::Result<T, OciDistributionError>;
 ///
 /// This struct represents that error format, which is formally described here:
 /// <https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2>
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct OciError {
     /// The error code
     pub code: OciErrorCode,
@@ -132,7 +132,7 @@ impl std::fmt::Display for OciError {
 }
 
 /// A struct that holds a series of OCI errors
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct OciEnvelope {
     /// List of OCI registry errors
     pub errors: Vec<OciError>,
@@ -148,7 +148,7 @@ impl std::fmt::Display for OciEnvelope {
 /// OCI error codes
 ///
 /// Outlined [here](https://github.com/opencontainers/distribution-spec/blob/master/spec.md#errors-2)
-#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OciErrorCode {
     /// Blob unknown to registry
