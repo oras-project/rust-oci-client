@@ -86,6 +86,32 @@ pub struct TagResponse {
     pub tags: Vec<String>,
 }
 
+/// Layer descriptor required to pull a layer
+pub struct LayerDescriptor<'a> {
+    /// The digest of the layer
+    pub digest: &'a str,
+    /// Optional list of additional URIs to pull the layer from
+    pub urls: &'a Option<Vec<String>>,
+}
+
+impl<'a> From<&'a str> for LayerDescriptor<'a> {
+    fn from(digest: &'a str) -> Self {
+        LayerDescriptor {
+            digest,
+            urls: &None,
+        }
+    }
+}
+
+impl<'a> From<&'a OciDescriptor> for LayerDescriptor<'a> {
+    fn from(descriptor: &'a OciDescriptor) -> Self {
+        LayerDescriptor {
+            digest: &descriptor.digest,
+            urls: &descriptor.urls,
+        }
+    }
+}
+
 /// The data and media type for an image layer
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
@@ -403,7 +429,7 @@ impl Client {
                 async move {
                     let mut out: Vec<u8> = Vec::new();
                     debug!("Pulling image layer");
-                    this.pull_blob(image, layer, &mut out).await?;
+                    this.pull_blob(image, &layer.into(), &mut out).await?;
                     Ok::<_, OciDistributionError>(ImageLayer::new(
                         out,
                         layer.media_type.clone(),
@@ -934,7 +960,8 @@ impl Client {
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
-        self.pull_blob(image, &manifest.config, &mut out).await?;
+        self.pull_blob(image, &(&manifest.config).into(), &mut out)
+            .await?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
         Ok((manifest, digest, Config::new(out, media_type, annotations)))
@@ -965,10 +992,10 @@ impl Client {
     pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
+        layer: &LayerDescriptor<'_>,
         mut out: T,
     ) -> Result<()> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1017,9 +1044,9 @@ impl Client {
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
+        layer: &LayerDescriptor<'_>,
     ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -2436,7 +2463,7 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, &layer0, &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, &layer0.into(), &mut file).await {
                     println!(
                         "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
@@ -2481,7 +2508,7 @@ mod test {
             let layer0 = &manifest.layers[0];
 
             let layer_stream = c
-                .pull_blob_stream(&reference, &layer0)
+                .pull_blob_stream(&reference, &layer0.into())
                 .await
                 .expect("failed to pull blob stream");
 
@@ -2839,7 +2866,7 @@ mod test {
 
         // Pull the layer from `image-repository`
         let mut buf = Vec::new();
-        c.pull_blob(&image_reference, &layer, &mut buf)
+        c.pull_blob(&image_reference, &(&layer).into(), &mut buf)
             .await
             .expect("Failed to pull");
 
