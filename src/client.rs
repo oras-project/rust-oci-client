@@ -94,6 +94,15 @@ pub struct LayerDescriptor<'a> {
     pub urls: &'a Option<Vec<String>>,
 }
 
+impl<'a> From<&'a LayerDescriptor<'a>> for LayerDescriptor<'a> {
+    fn from(descriptor: &'a LayerDescriptor<'a>) -> Self {
+        LayerDescriptor {
+            digest: descriptor.digest,
+            urls: descriptor.urls,
+        }
+    }
+}
+
 impl<'a> From<&'a str> for LayerDescriptor<'a> {
     fn from(digest: &'a str) -> Self {
         LayerDescriptor {
@@ -109,6 +118,45 @@ impl<'a> From<&'a OciDescriptor> for LayerDescriptor<'a> {
             digest: &descriptor.digest,
             urls: &descriptor.urls,
         }
+    }
+}
+
+/// A trait for converting any type into a [`LayerDescriptor`]
+pub trait AsLayerDescriptor {
+    /// Convert the type to a LayerDescriptor reference
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
+}
+
+impl AsLayerDescriptor for &str {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self,
+            urls: &None,
+        }
+    }
+}
+
+impl AsLayerDescriptor for OciDescriptor {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: &self.digest,
+            urls: &self.urls,
+        }
+    }
+}
+
+impl<'a> AsLayerDescriptor for &'a OciDescriptor {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'a> {
+        LayerDescriptor {
+            digest: &self.digest,
+            urls: &self.urls,
+        }
+    }
+}
+
+impl AsLayerDescriptor for LayerDescriptor<'_> {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        self.into()
     }
 }
 
@@ -429,7 +477,7 @@ impl Client {
                 async move {
                     let mut out: Vec<u8> = Vec::new();
                     debug!("Pulling image layer");
-                    this.pull_blob(image, &layer.into(), &mut out).await?;
+                    this.pull_blob(image, layer, &mut out).await?;
                     Ok::<_, OciDistributionError>(ImageLayer::new(
                         out,
                         layer.media_type.clone(),
@@ -960,8 +1008,7 @@ impl Client {
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
-        self.pull_blob(image, &(&manifest.config).into(), &mut out)
-            .await?;
+        self.pull_blob(image, &manifest.config, &mut out).await?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
         Ok((manifest, digest, Config::new(out, media_type, annotations)))
@@ -984,17 +1031,18 @@ impl Client {
 
     /// Pull a single layer from an OCI registry.
     ///
-    /// This pulls the layer for a particular image that is identified by
-    /// the given layer descriptor. The image reference is used to find the
-    /// repository and the registry, but it is not used to verify that
-    /// the digest is a layer inside of the image. (The manifest is
-    /// used for that.)
+    /// This pulls the layer for a particular image that is identified by the given layer
+    /// descriptor. The layer descriptor can be anything that can be referenced as a layer
+    /// descriptor. The image reference is used to find the repository and the registry, but it is
+    /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
+    /// that.)
     pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
-        layer: &LayerDescriptor<'_>,
+        layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
+        let layer = layer.as_layer_descriptor();
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -1953,7 +2001,7 @@ mod test {
         // we have to have it in the stored auth so we'll get to the token cache check.
         client
             .store_auth(
-                &Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
+                Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
                 RegistryAuth::Anonymous,
             )
             .await;
@@ -2463,7 +2511,7 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, &layer0.into(), &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
                     println!(
                         "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
@@ -2866,7 +2914,7 @@ mod test {
 
         // Pull the layer from `image-repository`
         let mut buf = Vec::new();
-        c.pull_blob(&image_reference, &(&layer).into(), &mut buf)
+        c.pull_blob(&image_reference, &layer, &mut buf)
             .await
             .expect("Failed to pull");
 
