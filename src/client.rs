@@ -94,33 +94,6 @@ pub struct LayerDescriptor<'a> {
     pub urls: &'a Option<Vec<String>>,
 }
 
-impl<'a> From<&'a LayerDescriptor<'a>> for LayerDescriptor<'a> {
-    fn from(descriptor: &'a LayerDescriptor<'a>) -> Self {
-        LayerDescriptor {
-            digest: descriptor.digest,
-            urls: descriptor.urls,
-        }
-    }
-}
-
-impl<'a> From<&'a str> for LayerDescriptor<'a> {
-    fn from(digest: &'a str) -> Self {
-        LayerDescriptor {
-            digest,
-            urls: &None,
-        }
-    }
-}
-
-impl<'a> From<&'a OciDescriptor> for LayerDescriptor<'a> {
-    fn from(descriptor: &'a OciDescriptor) -> Self {
-        LayerDescriptor {
-            digest: &descriptor.digest,
-            urls: &descriptor.urls,
-        }
-    }
-}
-
 /// A trait for converting any type into a [`LayerDescriptor`]
 pub trait AsLayerDescriptor {
     /// Convert the type to a LayerDescriptor reference
@@ -136,27 +109,12 @@ impl AsLayerDescriptor for &str {
     }
 }
 
-impl AsLayerDescriptor for OciDescriptor {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: &self.digest,
-            urls: &self.urls,
-        }
-    }
-}
-
 impl AsLayerDescriptor for &OciDescriptor {
     fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
         LayerDescriptor {
             digest: &self.digest,
             urls: &self.urls,
         }
-    }
-}
-
-impl AsLayerDescriptor for LayerDescriptor<'_> {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        self.into()
     }
 }
 
