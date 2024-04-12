@@ -1092,8 +1092,9 @@ impl Client {
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
-        layer: &LayerDescriptor<'_>,
+        layer: impl AsLayerDescriptor,
     ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
+        let layer = layer.as_layer_descriptor();
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -2556,7 +2557,7 @@ mod test {
             let layer0 = &manifest.layers[0];
 
             let layer_stream = c
-                .pull_blob_stream(&reference, &layer0.into())
+                .pull_blob_stream(&reference, layer0)
                 .await
                 .expect("failed to pull blob stream");
 
