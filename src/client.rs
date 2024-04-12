@@ -145,8 +145,8 @@ impl AsLayerDescriptor for OciDescriptor {
     }
 }
 
-impl<'a> AsLayerDescriptor for &'a OciDescriptor {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'a> {
+impl AsLayerDescriptor for &OciDescriptor {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
         LayerDescriptor {
             digest: &self.digest,
             urls: &self.urls,
@@ -157,6 +157,15 @@ impl<'a> AsLayerDescriptor for &'a OciDescriptor {
 impl AsLayerDescriptor for LayerDescriptor<'_> {
     fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
         self.into()
+    }
+}
+
+impl AsLayerDescriptor for &LayerDescriptor<'_> {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self.digest,
+            urls: self.urls,
+        }
     }
 }
 
