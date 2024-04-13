@@ -86,6 +86,47 @@ pub struct TagResponse {
     pub tags: Vec<String>,
 }
 
+/// Layer descriptor required to pull a layer
+pub struct LayerDescriptor<'a> {
+    /// The digest of the layer
+    pub digest: &'a str,
+    /// Optional list of additional URIs to pull the layer from
+    pub urls: &'a Option<Vec<String>>,
+}
+
+/// A trait for converting any type into a [`LayerDescriptor`]
+pub trait AsLayerDescriptor {
+    /// Convert the type to a LayerDescriptor reference
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
+}
+
+impl AsLayerDescriptor for &str {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self,
+            urls: &None,
+        }
+    }
+}
+
+impl AsLayerDescriptor for &OciDescriptor {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: &self.digest,
+            urls: &self.urls,
+        }
+    }
+}
+
+impl AsLayerDescriptor for &LayerDescriptor<'_> {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self.digest,
+            urls: self.urls,
+        }
+    }
+}
+
 /// The data and media type for an image layer
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
@@ -957,18 +998,19 @@ impl Client {
 
     /// Pull a single layer from an OCI registry.
     ///
-    /// This pulls the layer for a particular image that is identified by
-    /// the given layer descriptor. The image reference is used to find the
-    /// repository and the registry, but it is not used to verify that
-    /// the digest is a layer inside of the image. (The manifest is
-    /// used for that.)
+    /// This pulls the layer for a particular image that is identified by the given layer
+    /// descriptor. The layer descriptor can be anything that can be referenced as a layer
+    /// descriptor. The image reference is used to find the repository and the registry, but it is
+    /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
+    /// that.)
     pub async fn pull_blob<T: AsyncWrite + Unpin>(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
+        layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        let layer = layer.as_layer_descriptor();
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1017,9 +1059,10 @@ impl Client {
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
+        layer: impl AsLayerDescriptor,
     ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        let layer = layer.as_layer_descriptor();
+        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
         let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1926,7 +1969,7 @@ mod test {
         // we have to have it in the stored auth so we'll get to the token cache check.
         client
             .store_auth(
-                &Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
+                Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
                 RegistryAuth::Anonymous,
             )
             .await;
@@ -2436,7 +2479,7 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, &layer0, &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
                     println!(
                         "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
@@ -2481,7 +2524,7 @@ mod test {
             let layer0 = &manifest.layers[0];
 
             let layer_stream = c
-                .pull_blob_stream(&reference, &layer0)
+                .pull_blob_stream(&reference, layer0)
                 .await
                 .expect("failed to pull blob stream");
 
