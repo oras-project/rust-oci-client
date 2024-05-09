@@ -1882,7 +1882,11 @@ mod test {
     use tokio_util::io::StreamReader;
 
     #[cfg(feature = "test-registry")]
-    use testcontainers::{clients, core::WaitFor, GenericImage};
+    use testcontainers::{
+        core::{Mount, WaitFor},
+        runners::AsyncRunner,
+        GenericImage,
+    };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
     const HELLO_IMAGE_TAG: &str = "webassembly.azurecr.io/hello-wasm:v1";
@@ -2302,9 +2306,8 @@ mod test {
     #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_list_tags() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image_edge());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image_edge().start().await;
+        let port = test_container.get_host_port_ipv4(5000).await;
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
@@ -2628,16 +2631,15 @@ mod test {
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
-            .with_volume(auth_path, "/auth")
+            .with_mount(Mount::bind_mount(auth_path, "/auth"))
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_chunk() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image().start().await;
+        let port = test_container.get_host_port_ipv4(5000).await;
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2680,9 +2682,8 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_multiple_chunks() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image().start().await;
+        let port = test_container.get_host_port_ipv4(5000).await;
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2718,8 +2719,7 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_anon_auth() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
+        let test_container = registry_image().start().await;
 
         test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
     }
@@ -2731,14 +2731,13 @@ mod test {
         let htpasswd_path = path::Path::join(auth_dir.path(), "htpasswd");
         fs::write(htpasswd_path, HTPASSWD).expect("cannot write htpasswd file");
 
-        let docker = clients::Cli::default();
         let image = registry_image_basic_auth(
             auth_dir
                 .path()
                 .to_str()
                 .expect("cannot convert htpasswd_path to string"),
         );
-        let test_container = docker.run(image);
+        let test_container = image.start().await;
 
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
@@ -2749,10 +2748,10 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
-        test_container: &testcontainers::Container<'_, GenericImage>,
+        test_container: &testcontainers::ContainerAsync<GenericImage>,
     ) {
         let _ = tracing_subscriber::fmt::try_init();
-        let port = test_container.get_host_port_ipv4(5000);
+        let port = test_container.get_host_port_ipv4(5000).await;
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
@@ -2850,9 +2849,8 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_mount() {
         // initialize the registry
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image().start().await;
+        let port = test_container.get_host_port_ipv4(5000).await;
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
