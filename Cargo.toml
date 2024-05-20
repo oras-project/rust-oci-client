@@ -61,7 +61,7 @@ clap = { version = "4.0", features = ["derive"] }
 rstest = "0.19.0"
 docker_credential = "1.0"
 hmac = "0.12"
-itertools = "0.12.1"
+itertools = "0.13.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
 testcontainers = "0.16"
