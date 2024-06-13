@@ -16,10 +16,10 @@ default = "deny"
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
 allow = [
     "LicenseRef-ring",
-    "LicenseRef-webpki",
     "LicenseRef-rustls-webpki",
     "MPL-2.0",
     "Unicode-DFS-2016",
+    "Unicode-3.0"
 ]
 
 deny = [
@@ -32,13 +32,6 @@ name = "ring"
 expression = "LicenseRef-ring"
 license-files = [
     { path = "LICENSE", hash = 0xbd0eed23 },
-]
-
-[[licenses.clarify]]
-name = "webpki"
-expression = "LicenseRef-webpki"
-license-files = [
-    { path = "LICENSE", hash = 0x001c7e6c },
 ]
 
 [[licenses.clarify]]
