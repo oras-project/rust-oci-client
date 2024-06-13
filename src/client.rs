@@ -2306,8 +2306,14 @@ mod test {
     #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_list_tags() {
-        let test_container = registry_image_edge().start().await;
-        let port = test_container.get_host_port_ipv4(5000).await;
+        let test_container = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
@@ -2638,8 +2644,14 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_chunk() {
-        let test_container = registry_image().start().await;
-        let port = test_container.get_host_port_ipv4(5000).await;
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2682,8 +2694,14 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_multiple_chunks() {
-        let test_container = registry_image().start().await;
-        let port = test_container.get_host_port_ipv4(5000).await;
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2719,7 +2737,10 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_anon_auth() {
-        let test_container = registry_image().start().await;
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
 
         test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
     }
@@ -2737,7 +2758,7 @@ mod test {
                 .to_str()
                 .expect("cannot convert htpasswd_path to string"),
         );
-        let test_container = image.start().await;
+        let test_container = image.start().await.expect("cannot registry container");
 
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
@@ -2751,7 +2772,10 @@ mod test {
         test_container: &testcontainers::ContainerAsync<GenericImage>,
     ) {
         let _ = tracing_subscriber::fmt::try_init();
-        let port = test_container.get_host_port_ipv4(5000).await;
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
@@ -2849,8 +2873,14 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_mount() {
         // initialize the registry
-        let test_container = registry_image().start().await;
-        let port = test_container.get_host_port_ipv4(5000).await;
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
