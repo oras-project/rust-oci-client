@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -302,6 +303,13 @@ impl TryFrom<ClientConfig> for Client {
                 CertificateEncoding::Pem => reqwest::Certificate::from_pem(c.data.as_slice())?,
             };
             client_builder = client_builder.add_root_certificate(cert);
+        }
+
+        if let Some(timeout) = config.read_timeout {
+            client_builder = client_builder.read_timeout(timeout);
+        }
+        if let Some(timeout) = config.connect_timeout {
+            client_builder = client_builder.connect_timeout(timeout);
         }
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
@@ -1661,6 +1669,16 @@ pub struct ClientConfig {
     ///
     /// This defaults to [`DEFAULT_TOKEN_EXPIRATION_SECS`].
     pub default_token_expiration_secs: usize,
+
+    /// Enables a read timeout for the client.
+    ///
+    /// See [`reqwest::ClientBuilder::read_timeout`] for more information.
+    pub read_timeout: Option<Duration>,
+
+    /// Set a timeout for the connect phase for the client.
+    ///
+    /// See [`reqwest::ClientBuilder::connect_timeout`] for more information.
+    pub connect_timeout: Option<Duration>,
 }
 
 impl Default for ClientConfig {
@@ -1675,6 +1693,8 @@ impl Default for ClientConfig {
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
             default_token_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
+            read_timeout: None,
+            connect_timeout: None,
         }
     }
 }
