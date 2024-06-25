@@ -7,6 +7,7 @@ target/
 _dist/
 node_modules/
 .DS_Store
+.vscode/
 
 # oneclick trace files
 krustlet-wasi-e2e.stdout.txt
