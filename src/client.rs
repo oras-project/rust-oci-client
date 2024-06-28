@@ -56,6 +56,8 @@ pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 /// Default value for `ClientConfig:default_token_expiration_secs`
 pub const DEFAULT_TOKEN_EXPIRATION_SECS: usize = 60;
 
+static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// The data for an image or module.
 #[derive(Clone)]
 pub struct ImageData {
@@ -311,6 +313,8 @@ impl TryFrom<ClientConfig> for Client {
         if let Some(timeout) = config.connect_timeout {
             client_builder = client_builder.connect_timeout(timeout);
         }
+
+        client_builder = client_builder.user_agent(config.user_agent);
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
@@ -1679,6 +1683,11 @@ pub struct ClientConfig {
     ///
     /// See [`reqwest::ClientBuilder::connect_timeout`] for more information.
     pub connect_timeout: Option<Duration>,
+
+    /// Set the `User-Agent` used by the client.
+    ///
+    /// This defaults to [`DEFAULT_USER_AGENT`].
+    pub user_agent: &'static str,
 }
 
 impl Default for ClientConfig {
@@ -1695,6 +1704,7 @@ impl Default for ClientConfig {
             default_token_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
             read_timeout: None,
             connect_timeout: None,
+            user_agent: DEFAULT_USER_AGENT,
         }
     }
 }
