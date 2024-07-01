@@ -19,8 +19,7 @@ use crate::Reference;
 use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
-use futures_util::Stream;
+use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
@@ -171,6 +170,14 @@ impl ImageLayer {
     pub fn sha256_digest(&self) -> String {
         sha256_digest(&self.data)
     }
+}
+
+/// Stream response of a blob with optional content length if available
+pub struct SizedStream {
+    /// The length of the stream if the upstream registry sent a `Content-Length` header
+    pub content_length: Option<u64>,
+    /// The stream of bytes
+    pub stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>>,
 }
 
 /// The data and media type for a configuration object
@@ -1040,15 +1047,19 @@ impl Client {
         &self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
-    ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
+    ) -> Result<SizedStream> {
         let response = self.pull_blob_response(image, layer).await?;
 
+        let content_length = response.content_length();
         let stream = response
             .error_for_status()?
             .bytes_stream()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-        Ok(stream)
+        Ok(SizedStream {
+            content_length,
+            stream: Box::pin(stream),
+        })
     }
 
     /// Pull a single layer from an OCI registry.
@@ -2546,7 +2557,8 @@ mod test {
                 .await
                 .expect("failed to pull blob stream");
 
-            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream), &mut file)
+            assert_eq!(layer_stream.content_length, Some(layer0.size as u64));
+            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream.stream), &mut file)
                 .await
                 .unwrap();
 
