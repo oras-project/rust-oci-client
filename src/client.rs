@@ -25,7 +25,7 @@ use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
-use reqwest::{RequestBuilder, Url};
+use reqwest::{RequestBuilder, Response, Url};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -1021,39 +1021,7 @@ impl Client {
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let layer = layer.as_layer_descriptor();
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
-
-        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
-
-        if let Some(urls) = &layer.urls {
-            for url in urls {
-                if response.error_for_status_ref().is_ok() {
-                    break;
-                }
-
-                let url = Url::parse(url)
-                    .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
-
-                if url.scheme() == "http" || url.scheme() == "https" {
-                    // NOTE: we must not authenticate on additional URLs as those
-                    // can be abused to leak credentials or tokens.  Please
-                    // refer to CVE-2020-15157 for more information.
-                    response =
-                        RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
-                            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                            .into_request_builder()
-                            .send()
-                            .await?
-                }
-            }
-        }
+        let response = self.pull_blob_response(image, layer).await?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
 
@@ -1073,6 +1041,22 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
     ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
+        let response = self.pull_blob_response(image, layer).await?;
+
+        let stream = response
+            .error_for_status()?
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+        Ok(stream)
+    }
+
+    /// Pull a single layer from an OCI registry.
+    async fn pull_blob_response(
+        &self,
+        image: &Reference,
+        layer: impl AsLayerDescriptor,
+    ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
@@ -1107,12 +1091,7 @@ impl Client {
             }
         }
 
-        let stream = response
-            .error_for_status()?
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-        Ok(stream)
+        Ok(response)
     }
 
     /// Begins a session to push an image to registry in a monolithical way
