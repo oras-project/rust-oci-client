@@ -20,7 +20,8 @@ use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
-use http::HeaderValue;
+use http::header::RANGE;
+use http::{HeaderValue, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
@@ -178,6 +179,14 @@ pub struct SizedStream {
     pub content_length: Option<u64>,
     /// The stream of bytes
     pub stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>>,
+}
+
+/// The response of a partial blob request
+pub enum BlobResponse {
+    /// The response is a full blob (for example when partial requests aren't supported)
+    Full(SizedStream),
+    /// The response is a partial blob as requested
+    Partial(SizedStream),
 }
 
 /// The data and media type for a configuration object
@@ -1028,7 +1037,7 @@ impl Client {
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let response = self.pull_blob_response(image, layer).await?;
+        let response = self.pull_blob_response(image, layer, None).await?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
 
@@ -1048,18 +1057,33 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
     ) -> Result<SizedStream> {
-        let response = self.pull_blob_response(image, layer).await?;
+        stream_from_response(self.pull_blob_response(image, layer, None).await?)
+    }
 
-        let content_length = response.content_length();
-        let stream = response
-            .error_for_status()?
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    /// Stream a single layer from an OCI registry starting with a byte offset.
+    /// This can be used to continue downloading a layer after a network error.
+    ///
+    /// Returns [`Stream`](futures_util::Stream).
+    pub async fn pull_blob_stream_partial(
+        &self,
+        image: &Reference,
+        layer: impl AsLayerDescriptor,
+        offset: u64,
+    ) -> Result<BlobResponse> {
+        let response = self.pull_blob_response(image, layer, Some(offset)).await?;
 
-        Ok(SizedStream {
-            content_length,
-            stream: Box::pin(stream),
-        })
+        let status = response.status();
+        match status {
+            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(response)?)),
+            StatusCode::PARTIAL_CONTENT => {
+                Ok(BlobResponse::Partial(stream_from_response(response)?))
+            }
+            _ => Err(OciDistributionError::ServerError {
+                code: status.as_u16(),
+                url: response.url().to_string(),
+                message: response.text().await?,
+            }),
+        }
     }
 
     /// Pull a single layer from an OCI registry.
@@ -1067,17 +1091,23 @@ impl Client {
         &self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
+        offset: Option<u64>,
     ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
 
-        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+        let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder()
-            .send()
-            .await?;
+            .into_request_builder();
+        if let Some(offset) = offset {
+            request = request.header(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
+            );
+        }
+        let mut response = request.send().await?;
 
         if let Some(urls) = &layer.urls {
             for url in urls {
@@ -1092,12 +1122,17 @@ impl Client {
                     // NOTE: we must not authenticate on additional URLs as those
                     // can be abused to leak credentials or tokens.  Please
                     // refer to CVE-2020-15157 for more information.
-                    response =
+                    request =
                         RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
                             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                            .into_request_builder()
-                            .send()
-                            .await?
+                            .into_request_builder();
+                    if let Some(offset) = offset {
+                        request = request.header(
+                            RANGE,
+                            HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
+                        );
+                    }
+                    response = request.send().await?
                 }
             }
         }
@@ -1499,6 +1534,19 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             })
         }
     }
+}
+
+/// Converts a response into a stream
+fn stream_from_response(response: Response) -> Result<SizedStream> {
+    let content_length = response.content_length();
+    let stream = response
+        .error_for_status()?
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    Ok(SizedStream {
+        content_length,
+        stream: Box::pin(stream),
+    })
 }
 
 /// The request builder wrapper allows to be instantiated from a
