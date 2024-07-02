@@ -1915,7 +1915,7 @@ mod test {
     use testcontainers::{
         core::{Mount, WaitFor},
         runners::AsyncRunner,
-        GenericImage,
+        ContainerRequest, GenericImage, ImageExt,
     };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
@@ -2662,13 +2662,13 @@ mod test {
     }
 
     #[cfg(feature = "test-registry")]
-    fn registry_image_basic_auth(auth_path: &str) -> GenericImage {
+    fn registry_image_basic_auth(auth_path: &str) -> ContainerRequest<GenericImage> {
         GenericImage::new("docker.io/library/registry", "2")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
             .with_mount(Mount::bind_mount(auth_path, "/auth"))
-            .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
     #[tokio::test]
