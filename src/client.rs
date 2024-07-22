@@ -867,11 +867,7 @@ impl Client {
                 match digest {
                     Some(digest) => {
                         debug!("Selected manifest entry with digest: {}", digest);
-                        let manifest_entry_reference = Reference::with_digest(
-                            image.registry().to_string(),
-                            image.repository().to_string(),
-                            digest.clone(),
-                        );
+                        let manifest_entry_reference = image.clone_with_digest(digest.clone());
                         self._pull_manifest(&manifest_entry_reference)
                             .await
                             .and_then(|(manifest, _digest)| match manifest {
