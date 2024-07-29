@@ -1,4 +1,4 @@
-use oci_distribution::{secrets::RegistryAuth, Client, Reference};
+use oci_client::{secrets::RegistryAuth, Client, Reference};
 
 use clap::Parser;
 use docker_credential::{CredentialRetrievalError, DockerCredential};
@@ -56,14 +56,14 @@ fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     }
 }
 
-fn build_client_config(cli: &Cli) -> oci_distribution::client::ClientConfig {
+fn build_client_config(cli: &Cli) -> oci_client::client::ClientConfig {
     let protocol = if cli.insecure {
-        oci_distribution::client::ClientProtocol::Http
+        oci_client::client::ClientProtocol::Http
     } else {
-        oci_distribution::client::ClientProtocol::Https
+        oci_client::client::ClientProtocol::Https
     };
 
-    oci_distribution::client::ClientConfig {
+    oci_client::client::ClientConfig {
         protocol,
         ..Default::default()
     }
