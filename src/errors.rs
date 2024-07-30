@@ -1,5 +1,7 @@
 //! Errors related to interacting with an OCI compliant remote store
 
+use std::fmt::Display;
+
 use thiserror::Error;
 
 /// Errors that can be raised while interacting with an OCI registry
@@ -99,10 +101,34 @@ pub enum OciDistributionError {
     #[error("Failed to convert Config into ConfigFile: {0}")]
     /// Transparent wrapper around `std::string::FromUtf8Error`
     ConfigConversionError(String),
+    /// Verification of the content digest failed
+    #[error("Failed to verify content digest. {0}")]
+    ContentDigestVerificationError(ContentDigestVerificationError),
 }
 
 /// Helper type to declare `Result` objects that might return a `OciDistributionError`
 pub type Result<T> = std::result::Result<T, OciDistributionError>;
+
+/// An error type for digest verification errors.
+#[derive(Debug)]
+pub struct ContentDigestVerificationError {
+    /// Expected digest
+    pub expected: String,
+    /// Actual digest
+    pub actual: String,
+}
+
+impl Display for ContentDigestVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Expected digest: {}, actual digest: {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ContentDigestVerificationError {}
 
 /// The OCI specification defines a specific error format.
 ///
