@@ -1,7 +1,10 @@
 //! OCI distribution client for fetching oci images from an OCI compliant remote store
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::errors::{OciDistributionError, Result};
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use http::header::RANGE;
@@ -12,18 +15,13 @@ use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Response, Url};
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
-use std::hash::Hash;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 pub use crate::blob::*;
 use crate::config::ConfigFile;
+use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
 use crate::errors::*;
 use crate::manifest::{
     ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
@@ -34,6 +32,7 @@ use crate::manifest::{
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
+use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -44,7 +43,6 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 ];
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
-const DOCKER_DIGEST_HEADER: &str = "Docker-Content-Digest";
 
 /// Default value for `ClientConfig::max_concurrent_upload`
 pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
@@ -737,7 +735,29 @@ impl Client {
             .send()
             .await?;
 
-        if !res.headers().contains_key(DOCKER_DIGEST_HEADER) {
+        if let Some(digest) = digest_header_value(res.headers().clone())? {
+            let status = res.status();
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
+
+            // If the reference has a digest and the digest header has a matching algorithm, compare
+            // them and return an error if they don't match.
+            if let Some(img_digest) = image.digest() {
+                let header_digest = Digest::new(&digest)?;
+                let image_digest = Digest::new(img_digest)?;
+                if header_digest.algorithm == image_digest.algorithm
+                    && header_digest != image_digest
+                {
+                    return Err(DigestError::VerificationError {
+                        expected: img_digest.to_string(),
+                        actual: digest,
+                    }
+                    .into());
+                }
+            }
+
+            Ok(digest)
+        } else {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -753,29 +773,7 @@ impl Client {
             validate_registry_response(status, &body, &url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
-        } else {
-            let status = res.status();
-            let headers = res.headers().clone();
-            trace!(headers = ?res.headers(), "Got Headers");
-            let body = res.bytes().await?;
-            validate_registry_response(status, &body, &url)?;
-
-            // SAFETY: We just checked that the header exists, so this is safe to unwrap
-            let header_digest = digest_header_value(headers)?.unwrap();
-            // If the reference has a digest, we want to make sure that the digest from the header
-            // matches the digest of the reference
-            if let Some(digest) = image.digest() {
-                if header_digest != digest {
-                    return Err(OciDistributionError::ContentDigestVerificationError(
-                        ContentDigestVerificationError {
-                            expected: digest.to_string(),
-                            actual: header_digest,
-                        },
-                    ));
-                }
-            }
-
-            Ok(header_digest)
+                .map_err(OciDistributionError::from)
         }
     }
 
@@ -1046,35 +1044,44 @@ impl Client {
     ) -> Result<()> {
         let response = self.pull_blob_response(image, &layer, None).await?;
 
+        let mut maybe_header_digester = digest_header_value(response.headers().clone())?
+            .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
+            .transpose()?;
+
         // With a blob pull, we need to use the digest from the layer and not the image
-        let mut maybe_digester = compare_and_validate_digests(
-            digest_header_value(response.headers().clone())?,
-            Some(layer.as_layer_descriptor().digest),
-        )?
-        .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
-        .transpose()?;
+        let layer_digest = layer.as_layer_descriptor().digest.to_string();
+        let mut layer_digester = Digester::new(&layer_digest)?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
 
         while let Some(bytes) = stream.next().await {
             let bytes = bytes?;
-            if let Some((ref mut digester, _)) = maybe_digester.as_mut() {
+            if let Some((ref mut digester, _)) = maybe_header_digester.as_mut() {
                 digester.update(&bytes);
             }
+            layer_digester.update(&bytes);
             out.write_all(&bytes).await?;
         }
 
-        if let Some((mut digester, expected)) = maybe_digester.take() {
+        if let Some((mut digester, expected)) = maybe_header_digester.take() {
             let digest = digester.finalize();
 
             if digest != expected {
-                return Err(OciDistributionError::ContentDigestVerificationError(
-                    ContentDigestVerificationError {
-                        expected,
-                        actual: digest,
-                    },
-                ));
+                return Err(DigestError::VerificationError {
+                    expected,
+                    actual: digest,
+                }
+                .into());
             }
+        }
+
+        let digest = layer_digester.finalize();
+        if digest != layer_digest {
+            return Err(DigestError::VerificationError {
+                expected: layer_digest,
+                actual: digest,
+            }
+            .into());
         }
 
         Ok(())
@@ -1571,18 +1578,30 @@ fn stream_from_response(response: Response, layer: impl AsLayerDescriptor) -> Re
         .bytes_stream()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-    let stream = if let Some(digest) = compare_and_validate_digests(
-        digest_header_value(headers)?,
-        Some(layer.as_layer_descriptor().digest),
-    )? {
-        Box::pin(VerifyingStream::new(
-            Box::pin(stream),
-            Digester::new(&digest)?,
-            digest,
-        )) as BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>>
-    } else {
-        Box::pin(stream) as BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>>
-    };
+    let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
+    let layer_digester = Digester::new(&expected_layer_digest)?;
+    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> =
+        match digest_header_value(headers)? {
+            // If the digests match, we don't need to do both digesters
+            Some(digest) if digest == expected_layer_digest => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                None,
+            )),
+            Some(digest) => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                Some((Digester::new(&digest)?, digest)),
+            )),
+            None => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                None,
+            )),
+        };
     Ok(SizedStream {
         content_length,
         stream,
@@ -1952,119 +1971,21 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
     }
 }
 
-/// Helper for extracting `Docker-Content-Digest` header from manifest GET or HEAD request.
-fn digest_header_value(headers: HeaderMap) -> Result<Option<String>> {
-    headers
-        .get(DOCKER_DIGEST_HEADER)
-        .map(|hv| hv.to_str().map(|s| s.to_string()))
-        .transpose()
-        .map_err(|e| {
-            OciDistributionError::GenericError(Some(format!(
-                "Cannot convert Docker-Content-Digest header value to string: {}",
-                e
-            )))
-        })
-}
-
-/// Given the optional digest header value and digest of the reference, returns the digest of the
-/// content, validating that the digest of the content matches the proper digest
-fn validate_digest(
-    body: &[u8],
-    digest_header: Option<String>,
-    reference_digest: Option<&str>,
-) -> Result<String> {
-    match compare_and_validate_digests(digest_header, reference_digest)? {
-        Some(digest) => calculate_and_validate(body, &digest),
-        // If we have neither, just digest the body
-        None => Ok(sha256_digest(body)),
-    }
-}
-
-/// This function compares the possible digest header value with a digest of a reference and returns
-/// the proper digest if it is valid. If both digests are provided, but they use different
-/// algorithms, then the header digest is returned as according to the spec it should be used for
-/// validation
-fn compare_and_validate_digests(
-    digest_header: Option<String>,
-    reference_digest: Option<&str>,
-) -> Result<Option<String>> {
-    match (digest_header, reference_digest) {
-        (None, None) => Ok(None),
-        (Some(digest), None) => Ok(Some(digest)),
-        (None, Some(digest)) => Ok(Some(digest.to_string())),
-        (Some(digest), Some(ref_digest)) => {
-            // According to the spec, it is just fine if the requested digest differs from the
-            // canonical digest from the headers if the algorithms are different. If they are the
-            // same, then the digests should match.
-            let (algo, _) = digest.split_once(':').ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "Incorrect digest format on header value. Should have algorithm".to_string(),
-                ))
-            })?;
-            let (ref_algo, _) = ref_digest.split_once(':').ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "Incorrect digest format on image reference. Should have algorithm".to_string(),
-                ))
-            })?;
-            if algo != ref_algo {
-                return Ok(Some(digest));
-            }
-            if digest != ref_digest {
-                return Err(OciDistributionError::ContentDigestVerificationError(
-                    ContentDigestVerificationError {
-                        expected: ref_digest.to_string(),
-                        actual: digest,
-                    },
-                ));
-            }
-            Ok(Some(digest))
-        }
-    }
-}
-
-/// Helper for calculating and validating the digest of the given content
-fn calculate_and_validate(content: &[u8], digest: &str) -> Result<String> {
-    let (algo, _) = digest.split_once(':').ok_or_else(|| {
-        OciDistributionError::GenericError(Some(
-            "Incorrect digest format. Should have algorithm".to_string(),
-        ))
-    })?;
-    let digest_calculated = match algo {
-        "sha256" => format!("{:x}", sha2::Sha256::digest(content)),
-        "sha384" => format!("{:x}", sha2::Sha384::digest(content)),
-        "sha512" => format!("{:x}", sha2::Sha512::digest(content)),
-        other => {
-            return Err(OciDistributionError::GenericError(Some(format!(
-                "Unsupported digest algorithm: {}",
-                other
-            ))))
-        }
-    };
-    let hex = format!("{algo}:{digest_calculated}");
-    debug!(%hex, "Computed digest of payload.");
-    if hex != digest {
-        return Err(OciDistributionError::ContentDigestVerificationError(
-            ContentDigestVerificationError {
-                expected: digest.to_owned(),
-                actual: hex,
-            },
-        ));
-    }
-    Ok(hex)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
-    use rstest::rstest;
     use std::convert::TryFrom;
     use std::fs;
     use std::path;
     use std::result::Result;
+
+    use rstest::rstest;
+    use sha2::Digest as _;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
+
+    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
 
     #[cfg(feature = "test-registry")]
     use testcontainers::{

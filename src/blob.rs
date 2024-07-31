@@ -2,9 +2,9 @@
 use std::task::Poll;
 
 use futures_util::stream::{BoxStream, Stream};
-use sha2::Digest;
 
-use crate::errors::{ContentDigestVerificationError, OciDistributionError};
+use crate::digest::Digester;
+use crate::errors::DigestError;
 
 /// Stream response of a blob with optional content length if available
 pub struct SizedStream {
@@ -24,20 +24,23 @@ pub enum BlobResponse {
 
 pub(crate) struct VerifyingStream {
     stream: BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
-    digester: Digester,
-    expected_digest: String,
+    layer_digester: Digester,
+    expected_layer_digest: String,
+    header_digester: Option<(Digester, String)>,
 }
 
 impl VerifyingStream {
     pub fn new(
         stream: BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
-        digester: Digester,
-        expected_digest: String,
+        layer_digester: Digester,
+        expected_layer_digest: String,
+        header_digester_and_digest: Option<(Digester, String)>,
     ) -> Self {
         Self {
             stream,
-            digester,
-            expected_digest,
+            layer_digester,
+            expected_layer_digest,
+            header_digester: header_digester_and_digest,
         }
     }
 }
@@ -52,71 +55,158 @@ impl Stream for VerifyingStream {
         let this = self.get_mut();
         match futures_util::ready!(this.stream.as_mut().poll_next(cx)) {
             Some(Ok(bytes)) => {
-                this.digester.update(&bytes);
+                this.layer_digester.update(&bytes);
+                if let Some((digester, _)) = this.header_digester.as_mut() {
+                    digester.update(&bytes);
+                }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Some(Err(e)) => Poll::Ready(Some(Err(e))),
             None => {
-                // Now that we've reached the end of the stream, verify the digest
-                let digest = this.digester.finalize();
-                if digest == this.expected_digest {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        ContentDigestVerificationError {
-                            expected: this.expected_digest.clone(),
-                            actual: digest,
-                        },
-                    ))))
+                // Now that we've reached the end of the stream, verify the digest(s)
+                match this.header_digester.as_mut() {
+                    Some((digester, expected)) => {
+                        // Check the header digester and then the layer digester before returning
+                        let digest = digester.finalize();
+                        if digest != *expected {
+                            return Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                DigestError::VerificationError {
+                                    expected: expected.clone(),
+                                    actual: digest,
+                                },
+                            ))));
+                        }
+                        let digest = this.layer_digester.finalize();
+                        if digest == this.expected_layer_digest {
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                DigestError::VerificationError {
+                                    expected: expected.clone(),
+                                    actual: digest,
+                                },
+                            ))))
+                        }
+                    }
+                    None => {
+                        let digest = this.layer_digester.finalize();
+                        if digest == this.expected_layer_digest {
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                DigestError::VerificationError {
+                                    expected: this.expected_layer_digest.clone(),
+                                    actual: digest,
+                                },
+                            ))))
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Helper wrapper around various digest algorithms to make it easier to use them with our blob
-/// utils. This has to be an enum because the digest algorithms aren't object safe so we can't box
-/// dynner them
-pub(crate) enum Digester {
-    Sha256(sha2::Sha256),
-    Sha384(sha2::Sha384),
-    Sha512(sha2::Sha512),
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Digester {
-    pub fn new(digest: &str) -> crate::errors::Result<Self> {
-        let (algo, _) = digest.split_once(':').ok_or_else(|| {
-            OciDistributionError::GenericError(Some(format!(
-                "Digest header value is not in the expected format: {}",
-                digest
-            )))
-        })?;
+    use bytes::Bytes;
+    use futures_util::TryStreamExt;
+    use sha2::Digest as _;
 
-        match algo {
-            "sha256" => Ok(Digester::Sha256(sha2::Sha256::new())),
-            "sha384" => Ok(Digester::Sha384(sha2::Sha384::new())),
-            "sha512" => Ok(Digester::Sha512(sha2::Sha512::new())),
-            _ => Err(OciDistributionError::GenericError(Some(format!(
-                "Unsupported digest algorithm: {}",
-                algo
-            )))),
-        }
-    }
+    #[tokio::test]
+    async fn test_verifying_stream() {
+        // Test with correct SHA
+        let data = b"Hello, world!";
+        let correct_sha = format!("sha256:{:x}", sha2::Sha256::digest(data));
+        let stream = VerifyingStream::new(
+            Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                data,
+            ))])),
+            Digester::new(&correct_sha).unwrap(),
+            correct_sha.clone(),
+            None,
+        );
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Should not error with valid data");
 
-    pub fn update(&mut self, data: impl AsRef<[u8]>) {
-        match self {
-            Self::Sha256(d) => d.update(data),
-            Self::Sha384(d) => d.update(data),
-            Self::Sha512(d) => d.update(data),
-        }
-    }
+        // Test with incorrect SHA
+        let incorrect_sha = "sha256:incorrect_hash";
+        let stream = VerifyingStream::new(
+            Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                data,
+            ))])),
+            Digester::new(incorrect_sha).unwrap(),
+            incorrect_sha.to_string(),
+            None,
+        );
 
-    pub fn finalize(&mut self) -> String {
-        match self {
-            Self::Sha256(d) => format!("sha256:{:x}", d.finalize_reset()),
-            Self::Sha384(d) => format!("sha384:{:x}", d.finalize_reset()),
-            Self::Sha512(d) => format!("sha512:{:x}", d.finalize_reset()),
-        }
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("Should error with invalid sha");
+
+        let err = err
+            .into_inner()
+            .expect("Should have inner error")
+            .downcast::<DigestError>()
+            .expect("Should be a DigestError");
+        assert!(
+            matches!(*err, DigestError::VerificationError { .. }),
+            "Error should be a verification error"
+        );
+
+        // Test with correct SHA and header
+        let correct_header_sha = format!("sha512:{:x}", sha2::Sha512::digest(data));
+        let stream = VerifyingStream::new(
+            Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                data,
+            ))])),
+            Digester::new(&correct_sha).unwrap(),
+            correct_sha.clone(),
+            Some((
+                Digester::new(&correct_header_sha).unwrap(),
+                correct_header_sha.clone(),
+            )),
+        );
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Should not error with valid data");
+
+        // Test with correct layer sha and wrong header sha
+        let incorrect_header_sha = "sha512:incorrect_hash";
+        let stream = VerifyingStream::new(
+            Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                data,
+            ))])),
+            Digester::new(&correct_sha).unwrap(),
+            correct_sha.clone(),
+            Some((
+                Digester::new(incorrect_header_sha).unwrap(),
+                incorrect_header_sha.to_string(),
+            )),
+        );
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("Should error with invalid sha");
+
+        let err = err
+            .into_inner()
+            .expect("Should have inner error")
+            .downcast::<DigestError>()
+            .expect("Should be a DigestError");
+        assert!(
+            matches!(*err, DigestError::VerificationError { .. }),
+            "Error should be a verification error"
+        );
     }
 }
