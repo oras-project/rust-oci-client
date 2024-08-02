@@ -374,7 +374,15 @@ impl Client {
         self.auth_store.read().await.contains_key(registry)
     }
 
-    async fn store_auth_if_needed(&self, registry: &str, auth: &RegistryAuth) {
+    /// Store the authentication information for this registry if it's not already stored in the client.
+    ///
+    /// Most of the time, you don't need to call this method directly. It's called by other
+    /// methods (where you have to provide the authentication information as parameter).
+    ///
+    /// But if you want to pull/push a blob without calling any of the other methods first, which would
+    /// store the authentication information, you can call this method to store the authentication
+    /// information manually.
+    pub async fn store_auth_if_needed(&self, registry: &str, auth: &RegistryAuth) {
         if !self.is_stored_auth(registry).await {
             self.store_auth(registry, auth.clone()).await;
         }
