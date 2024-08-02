@@ -867,11 +867,7 @@ impl Client {
                 match digest {
                     Some(digest) => {
                         debug!("Selected manifest entry with digest: {}", digest);
-                        let manifest_entry_reference = Reference::with_digest(
-                            image.registry().to_string(),
-                            image.repository().to_string(),
-                            digest.clone(),
-                        );
+                        let manifest_entry_reference = image.clone_with_digest(digest.clone());
                         self._pull_manifest(&manifest_entry_reference)
                             .await
                             .and_then(|(manifest, _digest)| match manifest {
@@ -1094,7 +1090,7 @@ impl Client {
         offset: Option<u64>,
     ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), layer.digest);
+        let url = self.to_v2_blob_url(image, layer.digest);
 
         let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1433,11 +1429,10 @@ impl Client {
     ) -> Result<String> {
         let lh = location_header.to_str()?;
         if lh.starts_with("/v2/") {
+            let registry = image.resolve_registry();
             Ok(format!(
-                "{}://{}{}",
-                self.config.protocol.scheme_for(image.resolve_registry()),
-                image.resolve_registry(),
-                lh
+                "{scheme}://{registry}{lh}",
+                scheme = self.config.protocol.scheme_for(registry)
             ))
         } else {
             Ok(lh.to_string())
@@ -1446,57 +1441,52 @@ impl Client {
 
     /// Convert a Reference to a v2 manifest URL.
     fn to_v2_manifest_url(&self, reference: &Reference) -> String {
-        if let Some(digest) = reference.digest() {
-            format!(
-                "{}://{}/v2/{}/manifests/{}",
-                self.config
-                    .protocol
-                    .scheme_for(reference.resolve_registry()),
-                reference.resolve_registry(),
-                reference.repository(),
-                digest,
-            )
-        } else {
-            format!(
-                "{}://{}/v2/{}/manifests/{}",
-                self.config
-                    .protocol
-                    .scheme_for(reference.resolve_registry()),
-                reference.resolve_registry(),
-                reference.repository(),
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/{repository}/manifests/{reference}{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            reference = if let Some(digest) = reference.digest() {
+                digest
+            } else {
                 reference.tag().unwrap_or("latest")
-            )
-        }
+            },
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
     }
 
     /// Convert a Reference to a v2 blob (layer) URL.
-    fn to_v2_blob_url(&self, registry: &str, repository: &str, digest: &str) -> String {
+    fn to_v2_blob_url(&self, reference: &Reference, digest: &str) -> String {
+        let registry = reference.resolve_registry();
         format!(
-            "{}://{}/v2/{}/blobs/{}",
-            self.config.protocol.scheme_for(registry),
-            registry,
-            repository,
-            digest,
+            "{scheme}://{registry}/v2/{repository}/blobs/{digest}{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
         )
     }
 
     /// Convert a Reference to a v2 blob upload URL.
     fn to_v2_blob_upload_url(&self, reference: &Reference) -> String {
-        self.to_v2_blob_url(
-            reference.resolve_registry(),
-            reference.repository(),
-            "uploads/",
-        )
+        self.to_v2_blob_url(reference, "uploads/")
     }
 
     fn to_list_tags_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
         format!(
-            "{}://{}/v2/{}/tags/list",
-            self.config
-                .protocol
-                .scheme_for(reference.resolve_registry()),
-            reference.resolve_registry(),
-            reference.repository(),
+            "{scheme}://{registry}/v2/{repository}/tags/list{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
         )
     }
 }
@@ -1941,6 +1931,7 @@ fn digest_header_value(headers: HeaderMap, body: Option<&[u8]>) -> Result<String
 mod test {
     use super::*;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
+    use rstest::rstest;
     use std::convert::TryFrom;
     use std::fs;
     use std::path;
@@ -2075,31 +2066,34 @@ mod test {
 
     #[test]
     fn test_to_v2_blob_url() {
-        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_v2_blob_url(
-            image.registry(),
-            image.repository(),
-            "sha256:deadbeef",
-        );
-        assert_eq!(
-            blob_url,
-            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"
-        )
-    }
-
-    #[test]
-    fn test_to_v2_manifest() {
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
         let c = Client::default();
 
-        for &(image, expected_uri) in [
-            (HELLO_IMAGE_NO_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/latest"), // TODO: confirm this is the right translation when no tag
-            (HELLO_IMAGE_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/v1"),
-            (HELLO_IMAGE_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"),
-            (HELLO_IMAGE_TAG_AND_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"),
-            ].iter() {
-                let reference = Reference::try_from(image).expect("failed to parse reference");
-                assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
-            }
+        assert_eq!(
+            c.to_v2_blob_url(&image, "sha256:deadbeef"),
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_v2_blob_url(&image, "sha256:deadbeef"),
+            "https://docker.mirror.io/v2/hello-wasm/blobs/sha256:deadbeef?ns=webassembly.azurecr.io"
+        );
+    }
+
+    #[rstest(image, expected_uri, expected_mirror_uri,
+        case(HELLO_IMAGE_NO_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/latest", "https://docker.mirror.io/v2/hello-wasm/manifests/latest?ns=webassembly.azurecr.io"), // TODO: confirm this is the right translation when no tag
+        case(HELLO_IMAGE_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/v1", "https://docker.mirror.io/v2/hello-wasm/manifests/v1?ns=webassembly.azurecr.io"),
+        case(HELLO_IMAGE_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7", "https://docker.mirror.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?ns=webassembly.azurecr.io"),
+        case(HELLO_IMAGE_TAG_AND_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7", "https://docker.mirror.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?ns=webassembly.azurecr.io"),
+    )]
+    fn test_to_v2_manifest(image: &str, expected_uri: &str, expected_mirror_uri: &str) {
+        let mut reference = Reference::try_from(image).expect("failed to parse reference");
+        let c = Client::default();
+        assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
+
+        reference.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(c.to_v2_manifest_url(&reference), expected_mirror_uri);
     }
 
     #[test]
@@ -2115,13 +2109,19 @@ mod test {
 
     #[test]
     fn test_to_list_tags_url() {
-        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_list_tags_url(&image);
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let c = Client::default();
 
         assert_eq!(
-            blob_url,
+            c.to_list_tags_url(&image),
             "https://webassembly.azurecr.io/v2/hello-wasm/tags/list"
-        )
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_list_tags_url(&image),
+            "https://docker.mirror.io/v2/hello-wasm/tags/list?ns=webassembly.azurecr.io"
+        );
     }
 
     #[test]
@@ -2148,11 +2148,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "http://webassembly.azurecr.io/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
@@ -2200,11 +2196,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "https://webassembly.azurecr.io/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
@@ -2220,11 +2212,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "http://oci.registry.local/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
