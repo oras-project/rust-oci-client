@@ -1,4 +1,4 @@
-use oci_distribution::{manifest, secrets::RegistryAuth, Client, Reference};
+use oci_client::{manifest, secrets::RegistryAuth, Client, Reference};
 use tracing::info;
 
 pub(crate) async fn pull_wasm(

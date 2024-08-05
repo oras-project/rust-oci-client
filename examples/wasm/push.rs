@@ -1,4 +1,4 @@
-use oci_distribution::{
+use oci_client::{
     client::{Config, ImageLayer},
     manifest,
     secrets::RegistryAuth,
