@@ -2,30 +2,38 @@
 
 use thiserror::Error;
 
+pub use crate::digest::DigestError;
+
 /// Errors that can be raised while interacting with an OCI registry
 #[derive(Error, Debug)]
 pub enum OciDistributionError {
     /// Authentication error
     #[error("Authentication failure: {0}")]
     AuthenticationFailure(String),
+    #[error("Failed to convert Config into ConfigFile: {0}")]
+    /// Transparent wrapper around `std::string::FromUtf8Error`
+    ConfigConversionError(String),
+    /// An error occurred with a digest operation
+    #[error("Digest error: {0}")]
+    DigestError(#[from] DigestError),
     /// Generic error, might provide an explanation message
     #[error("Generic error: {0:?}")]
     GenericError(Option<String>),
     /// Transparent wrapper around `reqwest::header::ToStrError`
     #[error(transparent)]
     HeaderValueError(#[from] reqwest::header::ToStrError),
-    /// IO Error
-    #[error(transparent)]
-    IoError(#[from] std::io::Error),
-    /// Platform resolver not specified
-    #[error("Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver")]
-    ImageIndexParsingNoPlatformResolverError,
     /// Image manifest not found
     #[error("Image manifest not found: {0}")]
     ImageManifestNotFoundError(String),
+    /// Platform resolver not specified
+    #[error("Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver")]
+    ImageIndexParsingNoPlatformResolverError,
     /// Registry returned a layer with an incompatible type
     #[error("Incompatible layer media type: {0}")]
     IncompatibleLayerMediaTypeError(String),
+    /// IO Error
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
     #[error(transparent)]
     /// Transparent wrapper around `serde_json::error::Error`
     JsonError(#[from] serde_json::error::Error),
@@ -64,9 +72,6 @@ pub enum OciDistributionError {
     /// Transparent wrapper around `reqwest::Error`
     #[error(transparent)]
     RequestError(#[from] reqwest::Error),
-    /// Cannot parse URL
-    #[error("Error parsing Url {0}")]
-    UrlParseError(String),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {
@@ -87,6 +92,9 @@ pub enum OciDistributionError {
         /// request URL
         url: String,
     },
+    /// Cannot parse URL
+    #[error("Error parsing Url {0}")]
+    UrlParseError(String),
     /// Media type not supported
     #[error("Unsupported media type: {0}")]
     UnsupportedMediaTypeError(String),
@@ -96,9 +104,6 @@ pub enum OciDistributionError {
     /// Versioned object: JSON deserialization error
     #[error("Failed to parse manifest: {0}")]
     VersionedParsingError(String),
-    #[error("Failed to convert Config into ConfigFile: {0}")]
-    /// Transparent wrapper around `std::string::FromUtf8Error`
-    ConfigConversionError(String),
 }
 
 /// Helper type to declare `Result` objects that might return a `OciDistributionError`

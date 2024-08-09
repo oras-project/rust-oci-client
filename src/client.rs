@@ -1,23 +1,10 @@
-//! OCI distribution client
-//!
-//! *Note*: This client is very feature poor. We hope to expand this to be a complete
-//! OCI distribution client in the future.
+//! OCI distribution client for fetching oci images from an OCI compliant remote store
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::config::ConfigFile;
-use crate::errors::*;
-use crate::manifest::{
-    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
-    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-    IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
-    OCI_IMAGE_MEDIA_TYPE,
-};
-use crate::secrets::RegistryAuth;
-use crate::secrets::*;
-use crate::sha256_digest;
-use crate::Reference;
-
-use crate::errors::{OciDistributionError, Result};
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use http::header::RANGE;
@@ -28,15 +15,25 @@ use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Response, Url};
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
-use std::hash::Hash;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
+
+pub use crate::blob::*;
+use crate::config::ConfigFile;
+use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
+use crate::errors::*;
+use crate::manifest::{
+    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
+    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+};
+use crate::secrets::RegistryAuth;
+use crate::secrets::*;
+use crate::sha256_digest;
+use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     IMAGE_MANIFEST_MEDIA_TYPE,
@@ -101,6 +98,12 @@ pub struct LayerDescriptor<'a> {
 pub trait AsLayerDescriptor {
     /// Convert the type to a LayerDescriptor reference
     fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
+}
+
+impl<T: AsLayerDescriptor> AsLayerDescriptor for &T {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        (*self).as_layer_descriptor()
+    }
 }
 
 impl AsLayerDescriptor for &str {
@@ -171,22 +174,6 @@ impl ImageLayer {
     pub fn sha256_digest(&self) -> String {
         sha256_digest(&self.data)
     }
-}
-
-/// Stream response of a blob with optional content length if available
-pub struct SizedStream {
-    /// The length of the stream if the upstream registry sent a `Content-Length` header
-    pub content_length: Option<u64>,
-    /// The stream of bytes
-    pub stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>>,
-}
-
-/// The response of a partial blob request
-pub enum BlobResponse {
-    /// The response is a full blob (for example when partial requests aren't supported)
-    Full(SizedStream),
-    /// The response is a partial blob as requested
-    Partial(SizedStream),
 }
 
 /// The data and media type for a configuration object
@@ -260,7 +247,7 @@ impl TryFrom<Config> for ConfigFile {
 /// provides a native Rust implementation for pulling OCI images.
 ///
 /// Some OCI registries support completely anonymous access. But most require
-/// at least an Oauth2 handshake. Typlically, you will want to create a new
+/// at least an Oauth2 handshake. Typically, you will want to create a new
 /// client, and then run the `auth()` method, which will attempt to get
 /// a read-only bearer token. From there, pulling images can be done with
 /// the `pull_*` functions.
@@ -748,8 +735,29 @@ impl Client {
             .send()
             .await?;
 
-        trace!(headers=?res.headers(), "Got Headers");
-        if res.headers().get("Docker-Content-Digest").is_none() {
+        if let Some(digest) = digest_header_value(res.headers().clone())? {
+            let status = res.status();
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
+
+            // If the reference has a digest and the digest header has a matching algorithm, compare
+            // them and return an error if they don't match.
+            if let Some(img_digest) = image.digest() {
+                let header_digest = Digest::new(&digest)?;
+                let image_digest = Digest::new(img_digest)?;
+                if header_digest.algorithm == image_digest.algorithm
+                    && header_digest != image_digest
+                {
+                    return Err(DigestError::VerificationError {
+                        expected: img_digest.to_string(),
+                        actual: digest,
+                    }
+                    .into());
+                }
+            }
+
+            Ok(digest)
+        } else {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -759,19 +767,13 @@ impl Client {
                 .send()
                 .await?;
             let status = res.status();
-            let headers = res.headers().clone();
-            trace!(headers=?res.headers(), "Got Headers");
-            let body = res.bytes().await?;
-            validate_registry_response(status, &body, &url)?;
-
-            digest_header_value(headers, Some(&body))
-        } else {
-            let status = res.status();
+            trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
             let body = res.bytes().await?;
             validate_registry_response(status, &body, &url)?;
 
-            digest_header_value(headers, None)
+            validate_digest(&body, digest_header_value(headers)?, image.digest())
+                .map_err(OciDistributionError::from)
         }
     }
 
@@ -915,13 +917,14 @@ impl Client {
             .into_request_builder()
             .send()
             .await?;
-        let headers = res.headers().clone();
         let status = res.status();
+        let headers = res.headers().clone();
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
 
-        let digest = digest_header_value(headers, Some(&body))?;
+        let digest_header = digest_header_value(headers)?;
+        let digest = validate_digest(&body, digest_header, image.digest())?;
 
         Ok((body.to_vec(), digest))
     }
@@ -935,20 +938,18 @@ impl Client {
             ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
             .await?;
 
-        let text = std::str::from_utf8(&body)?;
+        self.validate_image_manifest(&body).await?;
 
-        self.validate_image_manifest(text).await?;
-
-        debug!("Parsing response as Manifest: {}", &text);
-        let manifest = serde_json::from_str(text)
+        debug!("Parsing response as Manifest");
+        let manifest = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
         Ok((manifest, digest))
     }
 
-    async fn validate_image_manifest(&self, text: &str) -> Result<()> {
-        debug!("validating manifest: {}", text);
-        let versioned: Versioned = serde_json::from_str(text)
+    async fn validate_image_manifest(&self, body: &[u8]) -> Result<()> {
+        let versioned: Versioned = serde_json::from_slice(body)
             .map_err(|e| OciDistributionError::VersionedParsingError(e.to_string()))?;
+        debug!(?versioned, "validating manifest");
         if versioned.schema_version != 2 {
             return Err(OciDistributionError::UnsupportedSchemaVersionError(
                 versioned.schema_version,
@@ -1041,12 +1042,46 @@ impl Client {
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let response = self.pull_blob_response(image, layer, None).await?;
+        let response = self.pull_blob_response(image, &layer, None).await?;
+
+        let mut maybe_header_digester = digest_header_value(response.headers().clone())?
+            .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
+            .transpose()?;
+
+        // With a blob pull, we need to use the digest from the layer and not the image
+        let layer_digest = layer.as_layer_descriptor().digest.to_string();
+        let mut layer_digester = Digester::new(&layer_digest)?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
 
         while let Some(bytes) = stream.next().await {
-            out.write_all(&bytes?).await?;
+            let bytes = bytes?;
+            if let Some((ref mut digester, _)) = maybe_header_digester.as_mut() {
+                digester.update(&bytes);
+            }
+            layer_digester.update(&bytes);
+            out.write_all(&bytes).await?;
+        }
+
+        if let Some((mut digester, expected)) = maybe_header_digester.take() {
+            let digest = digester.finalize();
+
+            if digest != expected {
+                return Err(DigestError::VerificationError {
+                    expected,
+                    actual: digest,
+                }
+                .into());
+            }
+        }
+
+        let digest = layer_digester.finalize();
+        if digest != layer_digest {
+            return Err(DigestError::VerificationError {
+                expected: layer_digest,
+                actual: digest,
+            }
+            .into());
         }
 
         Ok(())
@@ -1061,7 +1096,7 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
     ) -> Result<SizedStream> {
-        stream_from_response(self.pull_blob_response(image, layer, None).await?)
+        stream_from_response(self.pull_blob_response(image, &layer, None).await?, layer)
     }
 
     /// Stream a single layer from an OCI registry starting with a byte offset.
@@ -1074,14 +1109,14 @@ impl Client {
         layer: impl AsLayerDescriptor,
         offset: u64,
     ) -> Result<BlobResponse> {
-        let response = self.pull_blob_response(image, layer, Some(offset)).await?;
+        let response = self.pull_blob_response(image, &layer, Some(offset)).await?;
 
         let status = response.status();
         match status {
-            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(response)?)),
-            StatusCode::PARTIAL_CONTENT => {
-                Ok(BlobResponse::Partial(stream_from_response(response)?))
-            }
+            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(response, &layer)?)),
+            StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(stream_from_response(
+                response, &layer,
+            )?)),
             _ => Err(OciDistributionError::ServerError {
                 code: status.as_u16(),
                 url: response.url().to_string(),
@@ -1535,15 +1570,41 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
 }
 
 /// Converts a response into a stream
-fn stream_from_response(response: Response) -> Result<SizedStream> {
+fn stream_from_response(response: Response, layer: impl AsLayerDescriptor) -> Result<SizedStream> {
     let content_length = response.content_length();
+    let headers = response.headers().clone();
     let stream = response
         .error_for_status()?
         .bytes_stream()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+    let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
+    let layer_digester = Digester::new(&expected_layer_digest)?;
+    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> =
+        match digest_header_value(headers)? {
+            // If the digests match, we don't need to do both digesters
+            Some(digest) if digest == expected_layer_digest => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                None,
+            )),
+            Some(digest) => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                Some((Digester::new(&digest)?, digest)),
+            )),
+            None => Box::pin(VerifyingStream::new(
+                Box::pin(stream),
+                layer_digester,
+                expected_layer_digest,
+                None,
+            )),
+        };
     Ok(SizedStream {
         content_length,
-        stream: Box::pin(stream),
+        stream,
     })
 }
 
@@ -1910,43 +1971,21 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
     }
 }
 
-/// Extract `Docker-Content-Digest` header from manifest GET or HEAD request.
-/// Can optionally supply a response body (i.e. the manifest itself) to
-/// fallback to manually hashing this content. This should only be done if the
-/// response body contains the image manifest.
-fn digest_header_value(headers: HeaderMap, body: Option<&[u8]>) -> Result<String> {
-    let digest_header = headers.get("Docker-Content-Digest");
-    match digest_header {
-        None => {
-            if let Some(body) = body {
-                // Fallback to hashing payload (tested with ECR)
-                let digest = sha2::Sha256::digest(body);
-                let hex = format!("sha256:{:x}", digest);
-                debug!(%hex, "Computed digest of manifest payload.");
-                Ok(hex)
-            } else {
-                Err(OciDistributionError::RegistryNoDigestError)
-            }
-        }
-        Some(hv) => hv
-            .to_str()
-            .map(|s| s.to_string())
-            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string()))),
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
-    use rstest::rstest;
     use std::convert::TryFrom;
     use std::fs;
     use std::path;
     use std::result::Result;
+
+    use rstest::rstest;
+    use sha2::Digest as _;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
+
+    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
 
     #[cfg(feature = "test-registry")]
     use testcontainers::{

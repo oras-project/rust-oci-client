@@ -4,8 +4,10 @@
 use sha2::Digest;
 
 pub mod annotations;
+mod blob;
 pub mod client;
 pub mod config;
+pub(crate) mod digest;
 pub mod errors;
 pub mod manifest;
 mod reference;

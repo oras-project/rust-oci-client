@@ -36,7 +36,7 @@ bytes = "1"
 chrono = { version = "0.4.23", features = ["serde"] }
 futures-util = "0.3"
 http = "1.1"
-http-auth = { version = "0.1", default_features = false }
+http-auth = { version = "0.1", default-features = false }
 jwt = "0.16"
 lazy_static = "1.4"
 olpc-cjson = "0.1"
@@ -57,6 +57,7 @@ unicase = "2.6"
 assert-json-diff = "2.0.2"
 async-std = "1.12"
 anyhow = "1.0"
+axum = "0.7"
 clap = { version = "4.0", features = ["derive"] }
 rstest = "0.22.0"
 docker_credential = "1.0"
