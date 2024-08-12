@@ -1089,8 +1089,33 @@ impl Client {
 
     /// Stream a single layer from an OCI registry.
     ///
-    /// This is a streaming version of [`Client::pull_blob`].
-    /// Returns [`Stream`](futures_util::Stream).
+    /// This is a streaming version of [`Client::pull_blob`]. Returns [`SizedStream`], which
+    /// implements [`Stream`](futures_util::Stream) or can be used directly to get the content
+    /// length of the response
+    ///
+    /// # Example
+    /// ```rust
+    /// use std::future::Future;
+    /// use std::io::Error;
+    ///
+    /// use futures_util::TryStreamExt;
+    /// use oci_client::{Client, Reference};
+    /// use oci_client::client::ClientConfig;
+    /// use oci_client::manifest::OciDescriptor;
+    ///
+    /// async {
+    ///   let client = Client::new(Default::default());
+    ///   let imgRef: Reference = "busybox:latest".parse().unwrap();
+    ///   let desc = OciDescriptor { digest: "sha256:deadbeef".to_owned(), ..Default::default() };
+    ///   let mut stream = client.pull_blob_stream(&imgRef, &desc).await.unwrap();
+    ///   // Check the optional content length
+    ///   let content_length = stream.content_length.unwrap_or_default();
+    ///   // Use as a stream
+    ///   stream.try_next().await.unwrap().unwrap();
+    ///   // Use the underlying stream
+    ///   let mut stream = stream.stream;
+    /// };
+    /// ```
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
