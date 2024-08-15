@@ -2,6 +2,7 @@
 use std::task::Poll;
 
 use futures_util::stream::{BoxStream, Stream};
+use futures_util::TryStreamExt;
 
 use crate::digest::Digester;
 use crate::errors::DigestError;
@@ -12,6 +13,17 @@ pub struct SizedStream {
     pub content_length: Option<u64>,
     /// The stream of bytes
     pub stream: BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+}
+
+impl Stream for SizedStream {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.stream.try_poll_next_unpin(cx)
+    }
 }
 
 /// The response of a partial blob request
