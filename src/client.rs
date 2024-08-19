@@ -12,7 +12,7 @@ use http::{HeaderValue, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
-use reqwest::{RequestBuilder, Response, Url};
+use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -318,6 +318,15 @@ impl TryFrom<ClientConfig> for Client {
         }
 
         client_builder = client_builder.user_agent(config.user_agent);
+
+        if let Some(proxy_addr) = &config.https_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| NoProxy::from_string(&no_proxy));
+            let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
@@ -1810,6 +1819,16 @@ pub struct ClientConfig {
     ///
     /// This defaults to [`DEFAULT_USER_AGENT`].
     pub user_agent: &'static str,
+
+    /// Set the `HTTPS PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub https_proxy: Option<String>,
+
+    /// Set the `NO PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub no_proxy: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -1827,6 +1846,8 @@ impl Default for ClientConfig {
             read_timeout: None,
             connect_timeout: None,
             user_agent: DEFAULT_USER_AGENT,
+            https_proxy: None,
+            no_proxy: None,
         }
     }
 }
