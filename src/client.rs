@@ -1051,7 +1051,7 @@ impl Client {
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let response = self.pull_blob_response(image, &layer, None).await?;
+        let response = self.pull_blob_response(image, &layer, None, None).await?;
 
         let mut maybe_header_digester = digest_header_value(response.headers().clone())?
             .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
@@ -1130,7 +1130,11 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
     ) -> Result<SizedStream> {
-        stream_from_response(self.pull_blob_response(image, &layer, None).await?, layer)
+        stream_from_response(
+            self.pull_blob_response(image, &layer, None, None).await?,
+            layer,
+            true,
+        )
     }
 
     /// Stream a single layer from an OCI registry starting with a byte offset.
@@ -1142,14 +1146,19 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
         offset: u64,
+        length: Option<u64>,
     ) -> Result<BlobResponse> {
-        let response = self.pull_blob_response(image, &layer, Some(offset)).await?;
+        let response = self
+            .pull_blob_response(image, &layer, Some(offset), length)
+            .await?;
 
         let status = response.status();
         match status {
-            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(response, &layer)?)),
+            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(
+                response, &layer, true,
+            )?)),
             StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(stream_from_response(
-                response, &layer,
+                response, &layer, false,
             )?)),
             _ => Err(OciDistributionError::ServerError {
                 code: status.as_u16(),
@@ -1165,6 +1174,7 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
         offset: Option<u64>,
+        length: Option<u64>,
     ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
         let url = self.to_v2_blob_url(image, layer.digest);
@@ -1174,7 +1184,13 @@ impl Client {
             .apply_auth(image, RegistryOperation::Pull)
             .await?
             .into_request_builder();
-        if let Some(offset) = offset {
+        if let (Some(off), Some(len)) = (offset, length) {
+            let end = (off + len).saturating_sub(1);
+            request = request.header(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes={off}-{end}")).unwrap(),
+            );
+        } else if let Some(offset) = offset {
             request = request.header(
                 RANGE,
                 HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
@@ -1604,7 +1620,11 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
 }
 
 /// Converts a response into a stream
-fn stream_from_response(response: Response, layer: impl AsLayerDescriptor) -> Result<SizedStream> {
+fn stream_from_response(
+    response: Response,
+    layer: impl AsLayerDescriptor,
+    verify: bool,
+) -> Result<SizedStream> {
     let content_length = response.content_length();
     let headers = response.headers().clone();
     let stream = response
@@ -1614,28 +1634,22 @@ fn stream_from_response(response: Response, layer: impl AsLayerDescriptor) -> Re
 
     let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
     let layer_digester = Digester::new(&expected_layer_digest)?;
-    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> =
-        match digest_header_value(headers)? {
-            // If the digests match, we don't need to do both digesters
-            Some(digest) if digest == expected_layer_digest => Box::pin(VerifyingStream::new(
-                Box::pin(stream),
-                layer_digester,
-                expected_layer_digest,
-                None,
-            )),
-            Some(digest) => Box::pin(VerifyingStream::new(
-                Box::pin(stream),
-                layer_digester,
-                expected_layer_digest,
-                Some((Digester::new(&digest)?, digest)),
-            )),
-            None => Box::pin(VerifyingStream::new(
-                Box::pin(stream),
-                layer_digester,
-                expected_layer_digest,
-                None,
-            )),
-        };
+    let header_digester_and_digest = match digest_header_value(headers)? {
+        // If the digests match, we don't need to do both digesters
+        Some(digest) if digest == expected_layer_digest => None,
+        Some(digest) => Some((Digester::new(&digest)?, digest)),
+        None => None,
+    };
+    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> = if verify {
+        Box::pin(VerifyingStream::new(
+            Box::pin(stream),
+            layer_digester,
+            expected_layer_digest,
+            header_digester_and_digest,
+        ))
+    } else {
+        Box::pin(stream)
+    };
     Ok(SizedStream {
         content_length,
         stream,
@@ -2693,6 +2707,74 @@ mod test {
 
             // The manifest says how many bytes we should expect.
             assert_eq!(file.len(), layer0.size as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pull_blob_stream_partial() {
+        let c = Client::default();
+
+        for &image in TEST_IMAGES {
+            let reference = Reference::try_from(image).expect("failed to parse reference");
+            c.auth(
+                &reference,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("authenticated");
+            let (manifest, _) = c
+                ._pull_image_manifest(&reference)
+                .await
+                .expect("failed to pull manifest");
+
+            // Pull part of one specific layer
+            let mut partial_file: Vec<u8> = Vec::new();
+            let layer0 = &manifest.layers[0];
+            let (offset, length) = (10, 6);
+
+            let partial_response = c
+                .pull_blob_stream_partial(&reference, layer0, offset, Some(length))
+                .await
+                .expect("failed to pull blob stream");
+            let full_response = c
+                .pull_blob_stream_partial(&reference, layer0, 0, Some(layer0.size as u64))
+                .await
+                .expect("failed to pull blob stream");
+
+            let layer_stream_partial = match partial_response {
+                BlobResponse::Full(_stream) => panic!("expected partial response"),
+                BlobResponse::Partial(stream) => stream,
+            };
+            assert_eq!(layer_stream_partial.content_length, Some(length));
+            AsyncReadExt::read_to_end(
+                &mut StreamReader::new(layer_stream_partial.stream),
+                &mut partial_file,
+            )
+            .await
+            .unwrap();
+
+            // Also pull the full layer into a separate file to compare with the partial.
+            let mut full_file: Vec<u8> = Vec::new();
+            let layer_stream_full = match full_response {
+                BlobResponse::Full(_stream) => panic!("expected partial response"),
+                BlobResponse::Partial(stream) => stream,
+            };
+            assert_eq!(layer_stream_full.content_length, Some(layer0.size as u64));
+            AsyncReadExt::read_to_end(
+                &mut StreamReader::new(layer_stream_full.stream),
+                &mut full_file,
+            )
+            .await
+            .unwrap();
+
+            // The partial read length says how many bytes we should expect.
+            assert_eq!(partial_file.len(), length as usize);
+            // The manifest says how many bytes we should expect on a full read.
+            assert_eq!(full_file.len(), layer0.size as usize);
+            // Check that the partial read retrieved the correct bytes.
+            let end: usize = (offset + length) as usize;
+            assert_eq!(partial_file, full_file[offset as usize..end]);
         }
     }
 
