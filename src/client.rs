@@ -323,7 +323,7 @@ impl TryFrom<ClientConfig> for Client {
             let no_proxy = config
                 .no_proxy
                 .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(&no_proxy));
+                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
             let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
             client_builder = client_builder.proxy(proxy);
         }
