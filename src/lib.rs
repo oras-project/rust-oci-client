@@ -10,15 +10,13 @@ pub mod config;
 pub(crate) mod digest;
 pub mod errors;
 pub mod manifest;
-mod reference;
-mod regexp;
 pub mod secrets;
 mod token_cache;
 
 #[doc(inline)]
 pub use client::Client;
 #[doc(inline)]
-pub use reference::{ParseError, Reference};
+pub use oci_spec::distribution::{ParseError, Reference};
 #[doc(inline)]
 pub use token_cache::RegistryOperation;
 
