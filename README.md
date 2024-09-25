@@ -2,7 +2,7 @@
 
 Formerly known as `oci-distribution`
 
-[![oci-distribution documentation](https://docs.rs/oci-distribution/badge.svg)](https://docs.rs/oci-distribution)
+[![oci-client documentation](https://docs.rs/oci-client/badge.svg)](https://docs.rs/oci-client)
 
 This Rust library implements the
 [OCI Distribution specification](https://github.com/opencontainers/distribution-spec/blob/master/spec.md),
