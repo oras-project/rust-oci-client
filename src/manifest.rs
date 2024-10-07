@@ -421,6 +421,7 @@ pub struct Platform {
     /// This OPTIONAL property specifies an array of strings, each specifying a mandatory OS feature.
     /// When `os` is `windows`, image indexes SHOULD use, and implementations SHOULD understand the following values:
     /// - `win32k`: image requires `win32k.sys` on the host (Note: `win32k.sys` is missing on Nano Server)
+    ///
     /// When `os` is not `windows`, values are implementation-defined and SHOULD be submitted to this specification for standardization.
     #[serde(rename = "os.features")]
     #[serde(skip_serializing_if = "Option::is_none")]

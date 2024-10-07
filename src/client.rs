@@ -323,7 +323,7 @@ impl TryFrom<ClientConfig> for Client {
             let no_proxy = config
                 .no_proxy
                 .as_ref()
-                .and_then(|no_proxy| NoProxy::from_string(&no_proxy));
+                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
             let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
             client_builder = client_builder.proxy(proxy);
         }
@@ -1137,10 +1137,15 @@ impl Client {
         )
     }
 
-    /// Stream a single layer from an OCI registry starting with a byte offset.
-    /// This can be used to continue downloading a layer after a network error.
+    /// Stream a single layer from an OCI registry starting with a byte offset. This can be used to
+    /// continue downloading a layer after a network error. Please note that when doing a partial
+    /// download (meaning it returns the [`BlobResponse::Partial`] variant), the layer digest is not
+    /// verified as all the bytes are not available. The returned blob response will contain the
+    /// header from the request digest, if it was set, that can be used (in addition to the digest
+    /// from the layer) to verify the blob once all the bytes have been downloaded. Failure to do
+    /// this means your content will not be verified.
     ///
-    /// Returns [`Stream`](futures_util::Stream).
+    /// Returns [`BlobResponse`] which indicates if the response was a full or partial response.
     pub async fn pull_blob_stream_partial(
         &self,
         image: &Reference,
@@ -1640,6 +1645,9 @@ fn stream_from_response(
         Some(digest) => Some((Digester::new(&digest)?, digest)),
         None => None,
     };
+    let header_digest = header_digester_and_digest
+        .as_ref()
+        .map(|(_, digest)| digest.to_owned());
     let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> = if verify {
         Box::pin(VerifyingStream::new(
             Box::pin(stream),
@@ -1652,6 +1660,7 @@ fn stream_from_response(
     };
     Ok(SizedStream {
         content_length,
+        digest_header_value: header_digest,
         stream,
     })
 }

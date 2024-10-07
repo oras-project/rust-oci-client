@@ -11,6 +11,10 @@ use crate::errors::DigestError;
 pub struct SizedStream {
     /// The length of the stream if the upstream registry sent a `Content-Length` header
     pub content_length: Option<u64>,
+    /// The digest header value if the upstream registry sent a `Digest` header. This should be used
+    /// (in addition to the layer digest) for validation when using partial requests as the library
+    /// can't validate against the full response.
+    pub digest_header_value: Option<String>,
     /// The stream of bytes
     pub stream: BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
 }
