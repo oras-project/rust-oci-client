@@ -39,6 +39,7 @@ http = "1.1"
 http-auth = { version = "0.1", default-features = false }
 jwt = "0.16"
 lazy_static = "1.4"
+oci-spec = "0.7.0"
 olpc-cjson = "0.1"
 regex = "1.6"
 reqwest = { version = "0.12.4", default-features = false, features = [

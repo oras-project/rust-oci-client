@@ -10,20 +10,15 @@ pub mod config;
 pub(crate) mod digest;
 pub mod errors;
 pub mod manifest;
-mod reference;
-mod regexp;
 pub mod secrets;
 mod token_cache;
 
 #[doc(inline)]
 pub use client::Client;
 #[doc(inline)]
-pub use reference::{ParseError, Reference};
+pub use oci_spec::distribution::{ParseError, Reference};
 #[doc(inline)]
 pub use token_cache::RegistryOperation;
-
-#[macro_use]
-extern crate lazy_static;
 
 /// Computes the SHA256 digest of a byte vector
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
