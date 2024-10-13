@@ -1244,6 +1244,7 @@ impl Client {
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
+            .header("Content-Length", 0)
             .send()
             .await?;
 
