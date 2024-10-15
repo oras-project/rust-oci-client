@@ -1486,6 +1486,32 @@ impl Client {
         ret
     }
 
+    /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
+    pub async fn pull_referrers(
+        &self,
+        image: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<OciImageIndex> {
+        let url = self.to_v2_referrers_url(image, artifact_type)?;
+        debug!("Pulling referrers from {}", url);
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        validate_registry_response(status, &body, &url)?;
+        let manifest = serde_json::from_slice(&body)
+            .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
+
+        Ok(manifest)
+    }
+
     async fn extract_location_header(
         &self,
         image: &Reference,
@@ -1586,6 +1612,30 @@ impl Client {
                 .map(|ns| format!("?ns={ns}"))
                 .unwrap_or_default(),
         )
+    }
+
+    /// Convert a Reference to a v2 manifest URL.
+    fn to_v2_referrers_url(
+        &self,
+        reference: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<String> {
+        let registry = reference.resolve_registry();
+        Ok(format!(
+            "{scheme}://{registry}/v2/{repository}/referrers/{reference}{at}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            reference = if let Some(digest) = reference.digest() {
+                digest
+            } else {
+                return Err(OciDistributionError::GenericError(Some(
+                    "Getting referrers for a tag is not supported".into(),
+                )));
+            },
+            at = artifact_type
+                .map(|at| format!("?artifactType={at}"))
+                .unwrap_or_default(),
+        ))
     }
 }
 
