@@ -1526,7 +1526,7 @@ impl Client {
         location_header: &reqwest::header::HeaderValue,
     ) -> Result<String> {
         let lh = location_header.to_str()?;
-        if lh.starts_with("/v2/") {
+        if lh.starts_with("/") {
             let registry = image.resolve_registry();
             Ok(format!(
                 "{scheme}://{registry}{lh}",
