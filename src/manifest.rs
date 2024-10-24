@@ -95,6 +95,15 @@ pub struct OciImageManifest {
     /// required, assuming an empty vector can be used if necessary.
     pub layers: Vec<OciDescriptor>,
 
+    /// This is an optional subject linking this manifest to another manifest 
+    /// forming an association between the image manifest and the other manifest.
+    /// 
+    /// NOTE: The responsibility of implementing the fall back mechanism when encountering
+    /// a registry with an [unavailable referrers API](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema)
+    /// falls on the consumer of the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<OciDescriptor>,
+
     /// The OCI artifact type
     ///
     /// This OPTIONAL property contains the type of an artifact when the manifest is used for an
@@ -123,6 +132,7 @@ impl Default for OciImageManifest {
             media_type: None,
             config: OciDescriptor::default(),
             layers: vec![],
+            subject: None,
             artifact_type: None,
             annotations: None,
         }

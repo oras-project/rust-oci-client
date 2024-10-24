@@ -191,6 +191,8 @@ pub enum OciErrorCode {
     NameInvalid,
     /// Repository name is not known
     NameUnknown,
+    /// Manifest is not found
+    NotFound,
     /// Provided length did not match content length
     SizeInvalid,
     /// Manifest tag did not match URI
