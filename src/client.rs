@@ -559,6 +559,10 @@ impl Client {
         data: &[u8],
         digest: &str,
     ) -> Result<String> {
+        if self.config.use_monolithic_push {
+            return self.push_blob_monolithically(image_ref, data, digest).await;
+        }
+
         match self.push_blob_chunked(image_ref, data, digest).await {
             Ok(url) => Ok(url),
             Err(OciDistributionError::SpecViolationError(violation)) => {
@@ -1852,6 +1856,9 @@ pub struct ClientConfig {
     /// Accept invalid certificates. Defaults to false
     pub accept_invalid_certificates: bool,
 
+    /// Use monolithic push for pushing blobs. Defaults to false
+    pub use_monolithic_push: bool,
+
     /// A list of extra root certificate to trust. This can be used to connect
     /// to servers using self-signed certificates
     pub extra_root_certificates: Vec<Certificate>,
@@ -1916,6 +1923,7 @@ impl Default for ClientConfig {
             #[cfg(feature = "native-tls")]
             accept_invalid_hostnames: false,
             accept_invalid_certificates: false,
+            use_monolithic_push: false,
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
