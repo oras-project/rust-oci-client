@@ -1244,6 +1244,11 @@ impl Client {
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
+            // We set "Content-Length" to 0 here even though the OCI Distribution
+            // spec does not strictly require that. In practice we have seen that
+            // certain registries require "Content-Length" to be present for all
+            // types of push sessions.
+            .header("Content-Length", 0)
             .send()
             .await?;
 
