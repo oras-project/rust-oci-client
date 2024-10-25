@@ -328,6 +328,10 @@ pub struct OciImageIndex {
     /// The spec says this field must be present but the value may be an empty array.
     pub manifests: Vec<ImageIndexEntry>,
 
+    /// This property contains the type of an artifact when the manifest is used for an artifact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+
     /// The annotations for this manifest
     ///
     /// The specification says "If there are no annotations then this property
