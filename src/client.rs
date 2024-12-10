@@ -1740,7 +1740,7 @@ impl<'a> RequestBuilderWrapper<'a> {
     fn from_client(
         client: &'a Client,
         f: impl Fn(&reqwest::Client) -> RequestBuilder,
-    ) -> RequestBuilderWrapper {
+    ) -> RequestBuilderWrapper<'a> {
         let request_builder = f(&client.client);
         RequestBuilderWrapper {
             client,
