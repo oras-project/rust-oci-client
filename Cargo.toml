@@ -65,7 +65,7 @@ clap = { version = "4.0", features = ["derive"] }
 rstest = "0.23.0"
 docker_credential = "1.0"
 hmac = "0.12"
-itertools = "0.13.0"
+itertools = "0.14.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
