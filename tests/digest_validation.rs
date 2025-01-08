@@ -119,8 +119,8 @@ impl Drop for BadServer {
 impl BadServer {
     pub async fn new(config: ServerConfig) -> Self {
         let app = Router::new()
-            .route("/v2/busybox/manifests/:digest", get(manifest_handler))
-            .route("/v2/busybox/blobs/:digest", get(blob_handler))
+            .route("/v2/busybox/manifests/{digest}", get(manifest_handler))
+            .route("/v2/busybox/blobs/{digest}", get(blob_handler))
             .with_state(config);
 
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
