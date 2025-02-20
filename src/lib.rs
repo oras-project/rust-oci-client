@@ -38,6 +38,8 @@ use sha2::Digest;
 
 pub mod annotations;
 mod blob;
+#[cfg(feature = "blocking")]
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub(crate) mod digest;
@@ -46,6 +48,7 @@ pub mod manifest;
 pub mod secrets;
 pub mod token_cache;
 pub mod transport;
+mod types;
 
 #[doc(inline)]
 pub use client::Client;
