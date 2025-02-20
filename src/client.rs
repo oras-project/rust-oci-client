@@ -1,7 +1,6 @@
 //! OCI distribution client for fetching oci images from an OCI compliant remote store
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::hash::Hash;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,19 +14,19 @@ use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Serialize;
 use sha2::Digest as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 pub use crate::blob::*;
-use crate::config::ConfigFile;
+pub use crate::types::*;
+
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
 use crate::errors::*;
 use crate::manifest::{
-    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
-    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+    ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest, Versioned,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
 };
@@ -37,14 +36,14 @@ use crate::sha256_digest;
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use crate::Reference;
 
-const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
+pub(crate) const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     IMAGE_MANIFEST_MEDIA_TYPE,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 ];
 
-const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+pub(crate) const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
 
 /// Default value for `ClientConfig::max_concurrent_upload`
 pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
@@ -56,229 +55,6 @@ pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 pub const DEFAULT_TOKEN_EXPIRATION_SECS: usize = 60;
 
 static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-/// The data for an image or module.
-#[derive(Clone)]
-pub struct ImageData {
-    /// The layers of the image or module.
-    pub layers: Vec<ImageLayer>,
-    /// The digest of the image or module.
-    pub digest: Option<String>,
-    /// The Configuration object of the image or module.
-    pub config: Config,
-    /// The manifest of the image or module.
-    pub manifest: Option<OciImageManifest>,
-}
-
-/// The data returned by an OCI registry after a successful push
-/// operation is completed
-pub struct PushResponse {
-    /// Pullable url for the config
-    pub config_url: String,
-    /// Pullable url for the manifest
-    pub manifest_url: String,
-}
-
-/// The data returned by [`Client::push_blob_stream_chunked`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushBlobStreamChunkedResponse {
-    /// Pullable url for the uploaded blob.
-    pub blob_url: String,
-    /// Computed digest of the uploaded blob.
-    pub blob_digest: String,
-    /// Total uploaded blob size in bytes.
-    pub size: u64,
-}
-
-/// The data returned by a successful tags/list Request
-#[derive(Deserialize, Debug)]
-pub struct TagResponse {
-    /// Repository Name
-    pub name: String,
-    /// List of existing Tags
-    #[serde(deserialize_with = "null_as_default")]
-    pub tags: Vec<String>,
-}
-
-/// Helper to deserialize an empty value from a JSON `null`.
-fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    let res = <Option<T>>::deserialize(d)?.unwrap_or_default();
-    Ok(res)
-}
-
-/// The data returned by a successful catalog request.
-#[derive(Deserialize, Debug)]
-pub struct CatalogResponse {
-    /// List of available repositories in the registry.
-    pub repositories: Vec<String>,
-}
-
-/// Layer descriptor required to pull a layer
-pub struct LayerDescriptor<'a> {
-    /// The digest of the layer
-    pub digest: &'a str,
-    /// Optional list of additional URIs to pull the layer from
-    pub urls: &'a Option<Vec<String>>,
-}
-
-/// A trait for converting any type into a [`LayerDescriptor`]
-pub trait AsLayerDescriptor {
-    /// Convert the type to a LayerDescriptor reference
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
-}
-
-impl<T: AsLayerDescriptor> AsLayerDescriptor for &T {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        (*self).as_layer_descriptor()
-    }
-}
-
-impl AsLayerDescriptor for &str {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: self,
-            urls: &None,
-        }
-    }
-}
-
-impl AsLayerDescriptor for &OciDescriptor {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: &self.digest,
-            urls: &self.urls,
-        }
-    }
-}
-
-impl AsLayerDescriptor for &LayerDescriptor<'_> {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: self.digest,
-            urls: self.urls,
-        }
-    }
-}
-
-/// The data and media type for an image layer
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ImageLayer {
-    /// The data of this layer
-    pub data: bytes::Bytes,
-    /// The media type of this layer
-    pub media_type: String,
-    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
-    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<BTreeMap<String, String>>,
-}
-
-impl ImageLayer {
-    /// Constructs a new ImageLayer struct with provided data and media type
-    pub fn new(
-        data: impl Into<bytes::Bytes>,
-        media_type: String,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        ImageLayer {
-            data: data.into(),
-            media_type,
-            annotations,
-        }
-    }
-
-    /// Constructs a new ImageLayer struct with provided data and
-    /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
-    }
-    /// Constructs a new ImageLayer struct with provided data and
-    /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
-    }
-
-    /// Helper function to compute the sha256 digest of an image layer
-    pub fn sha256_digest(&self) -> String {
-        sha256_digest(&self.data)
-    }
-}
-
-/// The data and media type for a configuration object
-#[derive(Clone)]
-pub struct Config {
-    /// The data of this config object
-    pub data: bytes::Bytes,
-    /// The media type of this object
-    pub media_type: String,
-    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
-    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<BTreeMap<String, String>>,
-}
-
-impl Config {
-    /// Constructs a new Config struct with provided data and media type
-    pub fn new(
-        data: impl Into<bytes::Bytes>,
-        media_type: String,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Config {
-            data: data.into(),
-            media_type,
-            annotations,
-        }
-    }
-
-    /// Constructs a new Config struct with provided data and
-    /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
-    }
-
-    /// Construct a new Config struct with provided [`ConfigFile`] and
-    /// media type `application/vnd.oci.image.config.v1+json`
-    pub fn oci_v1_from_config_file(
-        config_file: ConfigFile,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Result<Self> {
-        let data = serde_json::to_vec(&config_file)?;
-        Ok(Self::new(
-            data,
-            IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            annotations,
-        ))
-    }
-
-    /// Helper function to compute the sha256 digest of this config object
-    pub fn sha256_digest(&self) -> String {
-        sha256_digest(&self.data)
-    }
-}
-
-impl TryFrom<Config> for ConfigFile {
-    type Error = crate::errors::OciDistributionError;
-
-    fn try_from(config: Config) -> Result<Self> {
-        let config = String::from_utf8(config.data.into())
-            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
-        let config_file: ConfigFile = serde_json::from_str(&config)
-            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
-        Ok(config_file)
-    }
-}
 
 /// The OCI client connects to an OCI registry and fetches OCI images.
 ///
@@ -2211,7 +1987,11 @@ impl Client {
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
+pub(crate) fn validate_registry_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    url: &str,
+) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
         reqwest::StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
@@ -2480,7 +2260,7 @@ impl TryFrom<&Certificate> for reqwest::Certificate {
     }
 }
 
-fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
+pub(crate) fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
     certs.iter().map(reqwest::Certificate::try_from).collect()
 }
 
@@ -2646,7 +2426,7 @@ pub enum ClientProtocol {
 }
 
 impl ClientProtocol {
-    fn scheme_for(&self, registry: &str) -> &str {
+    pub(crate) fn scheme_for(&self, registry: &str) -> &str {
         match self {
             ClientProtocol::Https => "https",
             ClientProtocol::Http => "http",
@@ -2662,7 +2442,7 @@ impl ClientProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct BearerChallenge {
+pub(crate) struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
 }
@@ -2724,6 +2504,7 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::BTreeMap;
     use std::convert::TryFrom;
     use std::result::Result;
 
@@ -2733,6 +2514,8 @@ mod test {
     use tokio_util::io::StreamReader;
 
     use crate::errors::OciErrorCode;
+    #[cfg(feature = "test-registry")]
+    use crate::manifest::OciDescriptor;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
 
     #[test]

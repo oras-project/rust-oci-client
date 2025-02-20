@@ -24,6 +24,11 @@ version = "0.18.0"
 [badges]
 maintenance = { status = "actively-developed" }
 
+[[example]]
+name = "blocking-get-manifest"
+path = "examples/blocking-get-manifest/main.rs"
+required-features = ["blocking"]
+
 [features]
 default = ["rustls-tls", "test-registry"]
 native-tls = ["reqwest/native-tls"]
@@ -33,6 +38,8 @@ rustls-tls = ["reqwest/rustls"]
 # with `rustls::crypto::ring::default_provider().install_default()`.
 rustls-tls-no-provider = ["reqwest/rustls-no-provider"]
 hickory-dns = ["reqwest/hickory-dns"]
+# Enables a synchronous client (`oci_client::blocking`) built on `reqwest::blocking`
+blocking = ["reqwest/blocking"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
 
@@ -72,6 +79,6 @@ itertools = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
 # using the ring feature. Otherwise this fails to compile on Windows
-testcontainers = "0.28"
+testcontainers = { version = "0.28", features = ["blocking"] }
 tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["compat"] }

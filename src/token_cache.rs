@@ -87,6 +87,7 @@ struct TokenCacheKey {
     operation: RegistryOperation,
 }
 
+#[derive(Debug, Clone)]
 struct TokenCacheValue {
     token: RegistryTokenType,
     expiration: u64,
@@ -151,6 +152,94 @@ impl TokenCache {
             operation: op,
         };
         match self.tokens.read().await.get(&key) {
+            Some(TokenCacheValue {
+                ref token,
+                expiration,
+            }) => {
+                let now = SystemTime::now();
+                let epoch = now
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_secs();
+                if epoch > *expiration {
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
+                    None
+                } else {
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=false, "Fetching token");
+                    Some(token.clone())
+                }
+            }
+            None => {
+                debug!(%key.registry, %key.repository, ?key.operation, miss = true, "Fetching token");
+                None
+            }
+        }
+    }
+}
+
+/// A cache to hold authentication tokens, for use by the blocking client.
+///
+/// Unlike [`TokenCache`], this cache is not shared and requires `&mut self`
+/// to insert tokens, so it needs no locking.
+#[cfg(feature = "blocking")]
+#[derive(Clone)]
+pub(crate) struct SyncTokenCache {
+    // (registry, repository, scope) -> (token, expiration)
+    tokens: BTreeMap<TokenCacheKey, TokenCacheValue>,
+    /// Default token expiration in seconds, to use when claim doesn't specify a value
+    pub default_expiration_secs: usize,
+}
+
+#[cfg(feature = "blocking")]
+impl SyncTokenCache {
+    pub(crate) fn new(default_expiration_secs: usize) -> Self {
+        SyncTokenCache {
+            tokens: BTreeMap::new(),
+            default_expiration_secs,
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        reference: &Reference,
+        op: RegistryOperation,
+        token: RegistryTokenType,
+    ) {
+        let expiration = match token {
+            RegistryTokenType::Basic(_, _) => u64::MAX,
+            RegistryTokenType::Bearer(ref t) => {
+                match bearer_token_cache_expiration(t.token(), self.default_expiration_secs) {
+                    Some(value) => value,
+                    None => return,
+                }
+            }
+        };
+        let registry = reference.resolve_registry().to_string();
+        let repository = reference.repository().to_string();
+        debug!(%registry, %repository, ?op, %expiration, "Inserting token");
+        self.tokens.insert(
+            TokenCacheKey {
+                registry,
+                repository,
+                operation: op,
+            },
+            TokenCacheValue { token, expiration },
+        );
+    }
+
+    pub(crate) fn get(
+        &self,
+        reference: &Reference,
+        op: RegistryOperation,
+    ) -> Option<RegistryTokenType> {
+        let registry = reference.resolve_registry().to_string();
+        let repository = reference.repository().to_string();
+        let key = TokenCacheKey {
+            registry,
+            repository,
+            operation: op,
+        };
+        match self.tokens.get(&key) {
             Some(TokenCacheValue {
                 ref token,
                 expiration,
