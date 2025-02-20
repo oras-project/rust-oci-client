@@ -21,3 +21,12 @@ impl Authenticable for reqwest::RequestBuilder {
         }
     }
 }
+#[cfg(feature = "blocking")]
+impl Authenticable for reqwest::blocking::RequestBuilder {
+    fn apply_authentication(self, auth: &RegistryAuth) -> Self {
+        match auth {
+            RegistryAuth::Anonymous => self,
+            RegistryAuth::Basic(username, password) => self.basic_auth(username, Some(password)),
+        }
+    }
+}

@@ -5,6 +5,8 @@ use sha2::Digest;
 
 pub mod annotations;
 mod blob;
+#[cfg(feature = "blocking")]
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub(crate) mod digest;
@@ -12,9 +14,11 @@ pub mod errors;
 pub mod manifest;
 pub mod secrets;
 mod token_cache;
+mod types;
 
 #[doc(inline)]
 pub use client::Client;
+
 #[doc(inline)]
 pub use oci_spec::distribution::{ParseError, Reference};
 #[doc(inline)]

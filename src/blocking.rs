@@ -1,23 +1,19 @@
 //! OCI distribution client for fetching oci images from an OCI compliant remote store
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::sync::Arc;
+use std::io::Write;
 use std::time::Duration;
 
-use futures_util::future;
-use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use http::header::RANGE;
-use http::{HeaderValue, StatusCode};
+use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
+use reqwest::blocking::{RequestBuilder, Response};
 use reqwest::header::HeaderMap;
-use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
+use reqwest::{NoProxy, Proxy, Url};
 use serde::Serialize;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
-pub use crate::blob::*;
 pub use crate::types::*;
 
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
@@ -30,7 +26,7 @@ use crate::manifest::{
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, SyncTokenCache};
 use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -67,23 +63,22 @@ static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CAR
 ///
 /// For true anonymous access, you can skip `auth()`. This is not recommended
 /// unless you are sure that the remote registry does not require Oauth2.
-#[derive(Clone)]
 pub struct Client {
-    config: Arc<ClientConfig>,
+    config: ClientConfig,
     // Registry -> RegistryAuth
-    auth_store: Arc<RwLock<HashMap<String, RegistryAuth>>>,
-    tokens: TokenCache,
-    client: reqwest::Client,
+    auth_store: HashMap<String, RegistryAuth>,
+    tokens: SyncTokenCache,
+    client: reqwest::blocking::Client,
     push_chunk_size: usize,
 }
 
 impl Default for Client {
     fn default() -> Self {
         Self {
-            config: Arc::default(),
-            auth_store: Arc::default(),
-            tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
-            client: reqwest::Client::default(),
+            config: ClientConfig::default(),
+            auth_store: HashMap::new(),
+            tokens: SyncTokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
+            client: reqwest::blocking::Client::default(),
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         }
     }
@@ -102,7 +97,7 @@ impl TryFrom<ClientConfig> for Client {
 
     fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
         #[allow(unused_mut)]
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder = reqwest::blocking::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
         let mut client_builder =
             client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
@@ -124,7 +119,7 @@ impl TryFrom<ClientConfig> for Client {
         }
 
         if let Some(timeout) = config.read_timeout {
-            client_builder = client_builder.read_timeout(timeout);
+            client_builder = client_builder.timeout(timeout);
         }
         if let Some(timeout) = config.connect_timeout {
             client_builder = client_builder.connect_timeout(timeout);
@@ -143,8 +138,8 @@ impl TryFrom<ClientConfig> for Client {
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
-            config: Arc::new(config),
-            tokens: TokenCache::new(default_token_expiration_secs),
+            config: config,
+            tokens: SyncTokenCache::new(default_token_expiration_secs),
             client: client_builder.build()?,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             ..Default::default()
@@ -160,7 +155,7 @@ impl Client {
             warn!("Cannot create OCI client from config: {:?}", err);
             warn!("Creating client with default configuration");
             Self {
-                tokens: TokenCache::new(default_token_expiration_secs),
+                tokens: SyncTokenCache::new(default_token_expiration_secs),
                 push_chunk_size: PUSH_CHUNK_MAX_SIZE,
                 ..Default::default()
             }
@@ -172,15 +167,12 @@ impl Client {
         Self::new(config_source.client_config())
     }
 
-    async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
-        self.auth_store
-            .write()
-            .await
-            .insert(registry.to_string(), auth);
+    fn store_auth(&mut self, registry: &str, auth: RegistryAuth) {
+        self.auth_store.insert(registry.to_string(), auth);
     }
 
-    async fn is_stored_auth(&self, registry: &str) -> bool {
-        self.auth_store.read().await.contains_key(registry)
+    fn is_stored_auth(&self, registry: &str) -> bool {
+        self.auth_store.contains_key(registry)
     }
 
     /// Store the authentication information for this registry if it's not already stored in the client.
@@ -191,25 +183,25 @@ impl Client {
     /// But if you want to pull/push a blob without calling any of the other methods first, which would
     /// store the authentication information, you can call this method to store the authentication
     /// information manually.
-    pub async fn store_auth_if_needed(&self, registry: &str, auth: &RegistryAuth) {
-        if !self.is_stored_auth(registry).await {
-            self.store_auth(registry, auth.clone()).await;
+    pub fn store_auth_if_needed(&mut self, registry: &str, auth: &RegistryAuth) {
+        if !self.is_stored_auth(registry) {
+            self.store_auth(registry, auth.clone());
         }
     }
 
     /// Checks if we got a token, if we don't - create it and store it in cache.
-    async fn get_auth_token(
-        &self,
+    fn get_auth_token(
+        &mut self,
         reference: &Reference,
         op: RegistryOperation,
     ) -> Option<RegistryTokenType> {
         let registry = reference.resolve_registry();
-        let auth = self.auth_store.read().await.get(registry)?.clone();
-        match self.tokens.get(reference, op).await {
+        let auth = self.auth_store.get(registry)?.clone();
+        match self.tokens.get(reference, op) {
             Some(token) => Some(token),
             None => {
-                let token = self._auth(reference, &auth, op).await.ok()??;
-                self.tokens.insert(reference, op, token.clone()).await;
+                let token = self._auth(reference, &auth, op).ok()??;
+                self.tokens.insert(reference, op, token.clone());
                 Some(token)
             }
         }
@@ -219,8 +211,8 @@ impl Client {
     ///
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
-    pub async fn list_tags(
-        &self,
+    pub fn list_tags(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
         n: Option<usize>,
@@ -229,8 +221,7 @@ impl Client {
         let op = RegistryOperation::Pull;
         let url = self.to_list_tags_url(image);
 
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
         let request = self.client.get(&url);
         let request = if let Some(num) = n {
@@ -243,18 +234,16 @@ impl Client {
         } else {
             request
         };
-        let request = RequestBuilderWrapper {
+        let mut request = RequestBuilderWrapper {
             client: self,
             request_builder: request,
         };
         let res = request
-            .apply_auth(image, op)
-            .await?
+            .apply_auth(image, op)?
             .into_request_builder()
-            .send()
-            .await?;
+            .send()?;
         let status = res.status();
-        let body = res.bytes().await?;
+        let body = res.bytes()?;
 
         validate_registry_response(status, &body, &url)?;
 
@@ -265,42 +254,37 @@ impl Client {
     ///
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
-    pub async fn pull(
-        &self,
+    pub fn pull(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: Vec<&str>,
     ) -> Result<ImageData> {
         debug!("Pulling image: {:?}", image);
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
-        let (manifest, digest, config) = self._pull_manifest_and_config(image).await?;
+        let (manifest, digest, config) = self._pull_manifest_and_config(image)?;
 
-        self.validate_layers(&manifest, accepted_media_types)
-            .await?;
+        self.validate_layers(&manifest, accepted_media_types)?;
 
-        let layers = stream::iter(&manifest.layers)
-            .map(|layer| {
-                // This avoids moving `self` which is &Self
-                // into the async block. We only want to capture
-                // as &Self
-                let this = &self;
-                async move {
-                    let mut out: Vec<u8> = Vec::new();
-                    debug!("Pulling image layer");
-                    this.pull_blob(image, layer, &mut out).await?;
-                    Ok::<_, OciDistributionError>(ImageLayer::new(
+        let layers = manifest.layers.iter().try_fold(vec![], |mut acc, layer| {
+            let mut out: Vec<u8> = Vec::new();
+            debug!("Pulling image layer");
+            match self.pull_blob(image, layer, &mut out) {
+                Ok(_) => {
+                    acc.push(ImageLayer::new(
                         out,
                         layer.media_type.clone(),
                         layer.annotations.clone(),
-                    ))
+                    ));
+                    Ok(acc)
                 }
-            })
-            .boxed() // Workaround to rustc issue https://github.com/rust-lang/rust/issues/104382
-            .buffer_unordered(self.config.max_concurrent_download)
-            .try_collect()
-            .await?;
+                Err(e) => {
+                    warn!(error = ?e, "Failed to pull image layer");
+                    return Err(e);
+                }
+            }
+        })?;
 
         Ok(ImageData {
             layers,
@@ -319,8 +303,8 @@ impl Client {
     /// it from the provided image and config data.
     ///
     /// Returns pullable URL for the image
-    pub async fn push(
-        &self,
+    pub fn push(
+        &mut self,
         image_ref: &Reference,
         layers: &[ImageLayer],
         config: Config,
@@ -328,8 +312,7 @@ impl Client {
         manifest: Option<OciImageManifest>,
     ) -> Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
-        self.store_auth_if_needed(image_ref.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image_ref.resolve_registry(), auth);
 
         let manifest: OciImageManifest = match manifest {
             Some(m) => m,
@@ -337,27 +320,14 @@ impl Client {
         };
 
         // Upload layers
-        stream::iter(layers)
-            .map(|layer| {
-                // This avoids moving `self` which is &Self
-                // into the async block. We only want to capture
-                // as &Self
-                let this = &self;
-                async move {
-                    let digest = layer.sha256_digest();
-                    this.push_blob(image_ref, &layer.data, &digest).await?;
-                    Result::Ok(())
-                }
-            })
-            .boxed() // Workaround to rustc issue https://github.com/rust-lang/rust/issues/104382
-            .buffer_unordered(self.config.max_concurrent_upload)
-            .try_for_each(future::ok)
-            .await?;
+        layers.iter().try_for_each(|layer| {
+            let digest = layer.sha256_digest();
+            self.push_blob(image_ref, &layer.data, &digest)?;
+            Result::Ok(())
+        })?;
 
-        let config_url = self
-            .push_blob(image_ref, &config.data, &manifest.config.digest)
-            .await?;
-        let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
+        let config_url = self.push_blob(image_ref, &config.data, &manifest.config.digest)?;
+        let manifest_url = self.push_manifest(image_ref, &manifest.into())?;
 
         Ok(PushResponse {
             config_url,
@@ -366,22 +336,22 @@ impl Client {
     }
 
     /// Pushes a blob to the registry
-    pub async fn push_blob(
-        &self,
+    pub fn push_blob(
+        &mut self,
         image_ref: &Reference,
         data: &[u8],
         digest: &str,
     ) -> Result<String> {
         if self.config.use_monolithic_push {
-            return self.push_blob_monolithically(image_ref, data, digest).await;
+            return self.push_blob_monolithically(image_ref, data, digest);
         }
 
-        match self.push_blob_chunked(image_ref, data, digest).await {
+        match self.push_blob_chunked(image_ref, data, digest) {
             Ok(url) => Ok(url),
             Err(OciDistributionError::SpecViolationError(violation)) => {
                 warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
                 warn!("Attempting monolithic push");
-                self.push_blob_monolithically(image_ref, data, digest).await
+                self.push_blob_monolithically(image_ref, data, digest)
             }
             Err(e) => Err(e),
         }
@@ -390,66 +360,60 @@ impl Client {
     /// Pushes a blob to the registry as a monolith
     ///
     /// Returns the pullable location of the blob
-    async fn push_blob_monolithically(
-        &self,
+    fn push_blob_monolithically(
+        &mut self,
         image: &Reference,
         blob_data: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let location = self.begin_push_monolithical_session(image).await?;
+        let location = self.begin_push_monolithical_session(image)?;
         self.push_monolithically(&location, image, blob_data, blob_digest)
-            .await
     }
 
     /// Pushes a blob to the registry as a series of chunks
     ///
     /// Returns the pullable location of the blob
-    async fn push_blob_chunked(
-        &self,
+    fn push_blob_chunked(
+        &mut self,
         image: &Reference,
         blob_data: &[u8],
         blob_digest: &str,
     ) -> Result<String> {
-        let mut location = self.begin_push_chunked_session(image).await?;
+        let mut location = self.begin_push_chunked_session(image)?;
         let mut start: usize = 0;
         loop {
-            (location, start) = self.push_chunk(&location, image, blob_data, start).await?;
+            (location, start) = self.push_chunk(&location, image, blob_data, start)?;
             if start >= blob_data.len() {
                 break;
             }
         }
         self.end_push_chunked_session(&location, image, blob_digest)
-            .await
     }
 
     /// Perform an OAuth v2 auth request if necessary.
     ///
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
-    pub async fn auth(
-        &self,
+    pub fn auth(
+        &mut self,
         image: &Reference,
         authentication: &RegistryAuth,
         operation: RegistryOperation,
     ) -> Result<Option<String>> {
-        self.store_auth_if_needed(image.resolve_registry(), authentication)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), authentication);
         // preserve old caching behavior
-        match self._auth(image, authentication, operation).await {
+        match self._auth(image, authentication, operation) {
             Ok(Some(RegistryTokenType::Bearer(token))) => {
                 self.tokens
-                    .insert(image, operation, RegistryTokenType::Bearer(token.clone()))
-                    .await;
+                    .insert(image, operation, RegistryTokenType::Bearer(token.clone()));
                 Ok(Some(token.token().to_string()))
             }
             Ok(Some(RegistryTokenType::Basic(username, password))) => {
-                self.tokens
-                    .insert(
-                        image,
-                        operation,
-                        RegistryTokenType::Basic(username, password),
-                    )
-                    .await;
+                self.tokens.insert(
+                    image,
+                    operation,
+                    RegistryTokenType::Basic(username, password),
+                );
                 Ok(None)
             }
             Ok(None) => Ok(None),
@@ -458,7 +422,7 @@ impl Client {
     }
 
     /// Internal auth that retrieves token.
-    async fn _auth(
+    fn _auth(
         &self,
         image: &Reference,
         authentication: &RegistryAuth,
@@ -472,7 +436,7 @@ impl Client {
             image.resolve_registry()
         );
         debug!(?url);
-        let res = self.client.get(&url).send().await?;
+        let res = self.client.get(&url).send()?;
         let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
             Some(h) => h,
             None => return Ok(None),
@@ -515,12 +479,11 @@ impl Client {
             .get(realm)
             .query(&query)
             .apply_authentication(authentication)
-            .send()
-            .await?;
+            .send()?;
 
         match auth_res.status() {
             reqwest::StatusCode::OK => {
-                let text = auth_res.text().await?;
+                let text = auth_res.text()?;
                 debug!("Received response from auth request: {}", text);
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
@@ -528,7 +491,7 @@ impl Client {
                 Ok(Some(RegistryTokenType::Bearer(token)))
             }
             _ => {
-                let reason = auth_res.text().await?;
+                let reason = auth_res.text()?;
                 debug!("Failed to authenticate for image '{:?}': {}", image, reason);
                 Err(OciDistributionError::AuthenticationFailure(reason))
             }
@@ -543,27 +506,24 @@ impl Client {
     /// Will first attempt to read the `Docker-Content-Digest` header using a
     /// HEAD request. If this header is not present, will make a second GET
     /// request and return the SHA256 of the response body.
-    pub async fn fetch_manifest_digest(
-        &self,
+    pub fn fetch_manifest_digest(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<String> {
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
         let url = self.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
+            .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder()
-            .send()
-            .await?;
+            .send()?;
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
             let status = res.status();
-            let body = res.bytes().await?;
+            let body = res.bytes()?;
             validate_registry_response(status, &body, &url)?;
 
             // If the reference has a digest and the digest header has a matching algorithm, compare
@@ -587,15 +547,13 @@ impl Client {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                .apply_auth(image, RegistryOperation::Pull)
-                .await?
+                .apply_auth(image, RegistryOperation::Pull)?
                 .into_request_builder()
-                .send()
-                .await?;
+                .send()?;
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
-            let body = res.bytes().await?;
+            let body = res.bytes()?;
             validate_registry_response(status, &body, &url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
@@ -603,7 +561,7 @@ impl Client {
         }
     }
 
-    async fn validate_layers(
+    fn validate_layers(
         &self,
         manifest: &OciImageManifest,
         accepted_media_types: Vec<&str>,
@@ -633,15 +591,14 @@ impl Client {
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
-    pub async fn pull_image_manifest(
-        &self,
+    pub fn pull_image_manifest(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
-        self._pull_image_manifest(image).await
+        self._pull_image_manifest(image)
     }
 
     /// Pull a manifest from the remote OCI Distribution service without parsing it.
@@ -651,16 +608,15 @@ impl Client {
     ///
     /// A Tuple is returned containing raw byte representation of the manifest
     /// and the manifest content digest.
-    pub async fn pull_manifest_raw(
-        &self,
+    pub fn pull_manifest_raw(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: &[&str],
     ) -> Result<(Vec<u8>, String)> {
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
-        self._pull_manifest_raw(image, accepted_media_types).await
+        self._pull_manifest_raw(image, accepted_media_types)
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -670,15 +626,14 @@ impl Client {
     ///
     /// A Tuple is returned containing the [Manifest](crate::manifest::OciImageManifest)
     /// and the manifest content digest hash.
-    pub async fn pull_manifest(
-        &self,
+    pub fn pull_manifest(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciManifest, String)> {
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
-        self._pull_manifest(image).await
+        self._pull_manifest(image)
     }
 
     /// Pull an image manifest from the remote OCI Distribution service.
@@ -688,8 +643,8 @@ impl Client {
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
-    async fn _pull_image_manifest(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
-        let (manifest, digest) = self._pull_manifest(image).await?;
+    fn _pull_image_manifest(&mut self, image: &Reference) -> Result<(OciImageManifest, String)> {
+        let (manifest, digest) = self._pull_manifest(image)?;
         match manifest {
             OciManifest::Image(image_manifest) => Ok((image_manifest, digest)),
             OciManifest::ImageIndex(image_index_manifest) => {
@@ -704,16 +659,16 @@ impl Client {
                     Some(digest) => {
                         debug!("Selected manifest entry with digest: {}", digest);
                         let manifest_entry_reference = image.clone_with_digest(digest.clone());
-                        self._pull_manifest(&manifest_entry_reference)
-                            .await
-                            .and_then(|(manifest, _digest)| match manifest {
+                        self._pull_manifest(&manifest_entry_reference).and_then(
+                            |(manifest, _digest)| match manifest {
                                 OciManifest::Image(manifest) => Ok((manifest, digest)),
                                 OciManifest::ImageIndex(_) => {
                                     Err(OciDistributionError::ImageManifestNotFoundError(
                                         "received Image Index manifest instead".to_string(),
                                     ))
                                 }
-                            })
+                            },
+                        )
                     }
                     None => Err(OciDistributionError::ImageManifestNotFoundError(
                         "no entry found in image index manifest matching client's default platform"
@@ -728,8 +683,8 @@ impl Client {
     ///
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
-    async fn _pull_manifest_raw(
-        &self,
+    fn _pull_manifest_raw(
+        &mut self,
         image: &Reference,
         accepted_media_types: &[&str],
     ) -> Result<(Vec<u8>, String)> {
@@ -738,14 +693,12 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(accepted_media_types)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
+            .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder()
-            .send()
-            .await?;
+            .send()?;
         let status = res.status();
         let headers = res.headers().clone();
-        let body = res.bytes().await?;
+        let body = res.bytes()?;
 
         validate_registry_response(status, &body, &url)?;
 
@@ -759,12 +712,10 @@ impl Client {
     ///
     /// If the connection has already gone through authentication, this will
     /// use the bearer token. Otherwise, this will attempt an anonymous pull.
-    async fn _pull_manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
-        let (body, digest) = self
-            ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
-            .await?;
+    fn _pull_manifest(&mut self, image: &Reference) -> Result<(OciManifest, String)> {
+        let (body, digest) = self._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)?;
 
-        self.validate_image_manifest(&body).await?;
+        self.validate_image_manifest(&body)?;
 
         debug!("Parsing response as Manifest");
         let manifest = serde_json::from_slice(&body)
@@ -772,7 +723,7 @@ impl Client {
         Ok((manifest, digest))
     }
 
-    async fn validate_image_manifest(&self, body: &[u8]) -> Result<()> {
+    fn validate_image_manifest(&self, body: &[u8]) -> Result<()> {
         let versioned: Versioned = serde_json::from_slice(body)
             .map_err(|e| OciDistributionError::VersionedParsingError(e.to_string()))?;
         debug!(?versioned, "validating manifest");
@@ -802,16 +753,14 @@ impl Client {
     /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest),
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
-    pub async fn pull_manifest_and_config(
-        &self,
+    pub fn pull_manifest_and_config(
+        &mut self,
         image: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String, String)> {
-        self.store_auth_if_needed(image.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(image.resolve_registry(), auth);
 
         self._pull_manifest_and_config(image)
-            .await
             .and_then(|(manifest, digest, config)| {
                 Ok((
                     manifest,
@@ -826,15 +775,15 @@ impl Client {
             })
     }
 
-    async fn _pull_manifest_and_config(
-        &self,
+    fn _pull_manifest_and_config(
+        &mut self,
         image: &Reference,
     ) -> Result<(OciImageManifest, String, Config)> {
-        let (manifest, digest) = self._pull_image_manifest(image).await?;
+        let (manifest, digest) = self._pull_image_manifest(image)?;
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
-        self.pull_blob(image, &manifest.config, &mut out).await?;
+        self.pull_blob(image, &manifest.config, &mut out)?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
         Ok((manifest, digest, Config::new(out, media_type, annotations)))
@@ -843,16 +792,14 @@ impl Client {
     /// Push a manifest list to an OCI registry.
     ///
     /// This pushes a manifest list to an OCI registry.
-    pub async fn push_manifest_list(
-        &self,
+    pub fn push_manifest_list(
+        &mut self,
         reference: &Reference,
         auth: &RegistryAuth,
         manifest: OciImageIndex,
     ) -> Result<String> {
-        self.store_auth_if_needed(reference.resolve_registry(), auth)
-            .await;
+        self.store_auth_if_needed(reference.resolve_registry(), auth);
         self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
-            .await
     }
 
     /// Pull a single layer from an OCI registry.
@@ -862,13 +809,13 @@ impl Client {
     /// descriptor. The image reference is used to find the repository and the registry, but it is
     /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
     /// that.)
-    pub async fn pull_blob<T: AsyncWrite + Unpin>(
-        &self,
+    pub fn pull_blob<T: Write + Unpin>(
+        &mut self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let response = self.pull_blob_response(image, &layer, None, None).await?;
+        let response = self.pull_blob_response(image, &layer, None, None)?;
 
         let mut maybe_header_digester = digest_header_value(response.headers().clone())?
             .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
@@ -878,16 +825,12 @@ impl Client {
         let layer_digest = layer.as_layer_descriptor().digest.to_string();
         let mut layer_digester = Digester::new(&layer_digest)?;
 
-        let mut stream = response.error_for_status()?.bytes_stream();
-
-        while let Some(bytes) = stream.next().await {
-            let bytes = bytes?;
-            if let Some((ref mut digester, _)) = maybe_header_digester.as_mut() {
-                digester.update(&bytes);
-            }
-            layer_digester.update(&bytes);
-            out.write_all(&bytes).await?;
+        let bytes = response.error_for_status()?.bytes()?;
+        if let Some((ref mut digester, _)) = maybe_header_digester.as_mut() {
+            digester.update(&bytes);
         }
+        layer_digester.update(&bytes);
+        out.write_all(&bytes)?;
 
         if let Some((mut digester, expected)) = maybe_header_digester.take() {
             let digest = digester.finalize();
@@ -913,86 +856,9 @@ impl Client {
         Ok(())
     }
 
-    /// Stream a single layer from an OCI registry.
-    ///
-    /// This is a streaming version of [`Client::pull_blob`]. Returns [`SizedStream`], which
-    /// implements [`Stream`](futures_util::Stream) or can be used directly to get the content
-    /// length of the response
-    ///
-    /// # Example
-    /// ```rust
-    /// use std::future::Future;
-    /// use std::io::Error;
-    ///
-    /// use futures_util::TryStreamExt;
-    /// use oci_client::{Client, Reference};
-    /// use oci_client::client::ClientConfig;
-    /// use oci_client::manifest::OciDescriptor;
-    ///
-    /// async {
-    ///   let client = Client::new(Default::default());
-    ///   let imgRef: Reference = "busybox:latest".parse().unwrap();
-    ///   let desc = OciDescriptor { digest: "sha256:deadbeef".to_owned(), ..Default::default() };
-    ///   let mut stream = client.pull_blob_stream(&imgRef, &desc).await.unwrap();
-    ///   // Check the optional content length
-    ///   let content_length = stream.content_length.unwrap_or_default();
-    ///   // Use as a stream
-    ///   stream.try_next().await.unwrap().unwrap();
-    ///   // Use the underlying stream
-    ///   let mut stream = stream.stream;
-    /// };
-    /// ```
-    pub async fn pull_blob_stream(
-        &self,
-        image: &Reference,
-        layer: impl AsLayerDescriptor,
-    ) -> Result<SizedStream> {
-        stream_from_response(
-            self.pull_blob_response(image, &layer, None, None).await?,
-            layer,
-            true,
-        )
-    }
-
-    /// Stream a single layer from an OCI registry starting with a byte offset. This can be used to
-    /// continue downloading a layer after a network error. Please note that when doing a partial
-    /// download (meaning it returns the [`BlobResponse::Partial`] variant), the layer digest is not
-    /// verified as all the bytes are not available. The returned blob response will contain the
-    /// header from the request digest, if it was set, that can be used (in addition to the digest
-    /// from the layer) to verify the blob once all the bytes have been downloaded. Failure to do
-    /// this means your content will not be verified.
-    ///
-    /// Returns [`BlobResponse`] which indicates if the response was a full or partial response.
-    pub async fn pull_blob_stream_partial(
-        &self,
-        image: &Reference,
-        layer: impl AsLayerDescriptor,
-        offset: u64,
-        length: Option<u64>,
-    ) -> Result<BlobResponse> {
-        let response = self
-            .pull_blob_response(image, &layer, Some(offset), length)
-            .await?;
-
-        let status = response.status();
-        match status {
-            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(
-                response, &layer, true,
-            )?)),
-            StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(stream_from_response(
-                response, &layer, false,
-            )?)),
-            _ => Err(OciDistributionError::ServerError {
-                code: status.as_u16(),
-                url: response.url().to_string(),
-                message: response.text().await?,
-            }),
-        }
-    }
-
     /// Pull a single layer from an OCI registry.
-    async fn pull_blob_response(
-        &self,
+    fn pull_blob_response(
+        &mut self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
         offset: Option<u64>,
@@ -1003,8 +869,7 @@ impl Client {
 
         let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
+            .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder();
         if let (Some(off), Some(len)) = (offset, length) {
             let end = (off + len).saturating_sub(1);
@@ -1018,7 +883,7 @@ impl Client {
                 HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
             );
         }
-        let mut response = request.send().await?;
+        let mut response = request.send()?;
 
         if let Some(urls) = &layer.urls {
             for url in urls {
@@ -1043,7 +908,7 @@ impl Client {
                             HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
                         );
                     }
-                    response = request.send().await?
+                    response = request.send()?
                 }
             }
         }
@@ -1054,50 +919,44 @@ impl Client {
     /// Begins a session to push an image to registry in a monolithical way
     ///
     /// Returns URL with session UUID
-    async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
+    fn begin_push_monolithical_session(&mut self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             // We set "Content-Length" to 0 here even though the OCI Distribution
             // spec does not strictly require that. In practice we have seen that
             // certain registries require "Content-Length" to be present for all
             // types of push sessions.
             .header("Content-Length", 0)
-            .send()
-            .await?;
+            .send()?;
 
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
         self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-            .await
     }
 
     /// Begins a session to push an image to registry as a series of chunks
     ///
     /// Returns URL with session UUID
-    async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
+    fn begin_push_chunked_session(&mut self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .header("Content-Length", 0)
-            .send()
-            .await?;
+            .send()?;
 
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
         self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-            .await
     }
 
     /// Closes the chunked push session
     ///
     /// Returns the pullable URL for the image
-    async fn end_push_chunked_session(
-        &self,
+    fn end_push_chunked_session(
+        &mut self,
         location: &str,
         image: &Reference,
         digest: &str,
@@ -1105,21 +964,18 @@ impl Client {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .header("Content-Length", 0)
-            .send()
-            .await?;
+            .send()?;
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
-            .await
     }
 
     /// Pushes a layer to a registry as a monolithical blob.
     ///
     /// Returns the URL location for the next layer
-    async fn push_monolithically(
-        &self,
+    fn push_monolithically(
+        &mut self,
         location: &str,
         image: &Reference,
         layer: &[u8],
@@ -1141,25 +997,22 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
             .body(layer.to_vec())
-            .send()
-            .await?;
+            .send()?;
 
         // Returns location
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
-            .await
     }
 
     /// Pushes a single chunk of a blob to a registry,
     /// as part of a chunked blob upload.
     ///
     /// Returns the URL location for the next chunk
-    async fn push_chunk(
-        &self,
+    fn push_chunk(
+        &mut self,
         location: &str,
         image: &Reference,
         blob_data: &[u8],
@@ -1193,25 +1046,22 @@ impl Client {
         );
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
             .body(body)
-            .send()
-            .await?;
+            .send()?;
 
         // Returns location for next chunk and the start byte for the next range
         Ok((
-            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-                .await?,
+            self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)?,
             end_byte + 1,
         ))
     }
 
     /// Mounts a blob to the provided reference, from the given source
-    pub async fn mount_blob(
-        &self,
+    pub fn mount_blob(
+        &mut self,
         image: &Reference,
         source: &Reference,
         digest: &str,
@@ -1224,14 +1074,11 @@ impl Client {
         .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
-            .send()
-            .await?;
+            .send()?;
 
-        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
-            .await?;
+        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)?;
 
         Ok(())
     }
@@ -1239,7 +1086,7 @@ impl Client {
     /// Pushes the manifest for a specified image
     ///
     /// Returns pullable manifest URL
-    pub async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
+    pub fn push_manifest(&mut self, image: &Reference, manifest: &OciManifest) -> Result<String> {
         let mut headers = HeaderMap::new();
         let content_type = manifest.content_type();
         headers.insert("Content-Type", content_type.parse().unwrap());
@@ -1251,14 +1098,13 @@ impl Client {
         manifest.serialize(&mut ser).unwrap();
 
         self.push_manifest_raw(image, body, manifest.content_type().parse().unwrap())
-            .await
     }
 
     /// Pushes the manifest, provided as raw bytes, for a specified image
     ///
     /// Returns pullable manifest url
-    pub async fn push_manifest_raw(
-        &self,
+    pub fn push_manifest_raw(
+        &mut self,
         image: &Reference,
         body: Vec<u8>,
         content_type: HeaderValue,
@@ -1275,17 +1121,13 @@ impl Client {
         let manifest_hash = sha256_digest(&body);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)
-            .await?
+            .apply_auth(image, RegistryOperation::Push)?
             .into_request_builder()
             .headers(headers)
             .body(body)
-            .send()
-            .await?;
+            .send()?;
 
-        let ret = self
-            .extract_location_header(image, res, &reqwest::StatusCode::CREATED)
-            .await;
+        let ret = self.extract_location_header(image, res, &reqwest::StatusCode::CREATED);
 
         if matches!(ret, Err(OciDistributionError::RegistryNoLocationError)) {
             // The registry is violating the OCI Distribution Spec, BUT the OCI
@@ -1309,8 +1151,8 @@ impl Client {
     }
 
     /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
-    pub async fn pull_referrers(
-        &self,
+    pub fn pull_referrers(
+        &mut self,
         image: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<OciImageIndex> {
@@ -1319,13 +1161,11 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
+            .apply_auth(image, RegistryOperation::Pull)?
             .into_request_builder()
-            .send()
-            .await?;
+            .send()?;
         let status = res.status();
-        let body = res.bytes().await?;
+        let body = res.bytes()?;
 
         validate_registry_response(status, &body, &url)?;
         let manifest = serde_json::from_slice(&body)
@@ -1334,10 +1174,10 @@ impl Client {
         Ok(manifest)
     }
 
-    async fn extract_location_header(
+    fn extract_location_header(
         &self,
         image: &Reference,
-        res: reqwest::Response,
+        res: reqwest::blocking::Response,
         expected_status: &reqwest::StatusCode,
     ) -> Result<String> {
         debug!(expected_status_code=?expected_status.as_u16(),
@@ -1359,7 +1199,7 @@ impl Client {
         } else {
             let url = res.url().to_string();
             let code = res.status().as_u16();
-            let message = res.text().await?;
+            let message = res.text()?;
             Err(OciDistributionError::ServerError { url, code, message })
         }
     }
@@ -1496,52 +1336,11 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
     }
 }
 
-/// Converts a response into a stream
-fn stream_from_response(
-    response: Response,
-    layer: impl AsLayerDescriptor,
-    verify: bool,
-) -> Result<SizedStream> {
-    let content_length = response.content_length();
-    let headers = response.headers().clone();
-    let stream = response
-        .error_for_status()?
-        .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-    let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
-    let layer_digester = Digester::new(&expected_layer_digest)?;
-    let header_digester_and_digest = match digest_header_value(headers)? {
-        // If the digests match, we don't need to do both digesters
-        Some(digest) if digest == expected_layer_digest => None,
-        Some(digest) => Some((Digester::new(&digest)?, digest)),
-        None => None,
-    };
-    let header_digest = header_digester_and_digest
-        .as_ref()
-        .map(|(_, digest)| digest.to_owned());
-    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> = if verify {
-        Box::pin(VerifyingStream::new(
-            Box::pin(stream),
-            layer_digester,
-            expected_layer_digest,
-            header_digester_and_digest,
-        ))
-    } else {
-        Box::pin(stream)
-    };
-    Ok(SizedStream {
-        content_length,
-        digest_header_value: header_digest,
-        stream,
-    })
-}
-
 /// The request builder wrapper allows to be instantiated from a
 /// `Client` and allows composable operations on the request builder,
 /// to produce a `RequestBuilder` object that can be executed.
 struct RequestBuilderWrapper<'a> {
-    client: &'a Client,
+    client: &'a mut Client,
     request_builder: RequestBuilder,
 }
 
@@ -1551,8 +1350,8 @@ impl<'a> RequestBuilderWrapper<'a> {
     /// instantiating the internal `RequestBuilder` with the provided
     /// function `f`.
     fn from_client(
-        client: &'a Client,
-        f: impl Fn(&reqwest::Client) -> RequestBuilder,
+        client: &'a mut Client,
+        f: impl Fn(&reqwest::blocking::Client) -> RequestBuilder,
     ) -> RequestBuilderWrapper<'a> {
         let request_builder = f(&client.client);
         RequestBuilderWrapper {
@@ -1568,8 +1367,8 @@ impl<'a> RequestBuilderWrapper<'a> {
 }
 
 // Composable functions applicable to a `RequestBuilderWrapper`
-impl RequestBuilderWrapper<'_> {
-    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper> {
+impl<'a> RequestBuilderWrapper<'a> {
+    fn apply_accept(&mut self, accept: &[&str]) -> Result<RequestBuilderWrapper> {
         let request_builder = self
             .request_builder
             .try_clone()
@@ -1592,14 +1391,14 @@ impl RequestBuilderWrapper<'_> {
     /// Authorization header. It will also set the Accept header, which must
     /// be set on all OCI Registry requests. If the struct has HTTP Basic Auth
     /// credentials, these will be configured.
-    async fn apply_auth(
-        &self,
+    fn apply_auth(
+        &mut self,
         image: &Reference,
         op: RegistryOperation,
     ) -> Result<RequestBuilderWrapper> {
         let mut headers = HeaderMap::new();
 
-        if let Some(token) = self.client.get_auth_token(image, op).await {
+        if let Some(token) = self.client.get_auth_token(image, op) {
             match token {
                 RegistryTokenType::Bearer(token) => {
                     debug!("Using bearer token authentication.");
@@ -1822,7 +1621,7 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().is_some_and(|platform| {
+            entry.platform.as_ref().map_or(false, |platform| {
                 platform.os == go_os() && platform.architecture == go_arch()
             })
         })
@@ -1922,23 +1721,20 @@ mod test {
     use super::*;
     use std::collections::BTreeMap;
     use std::convert::TryFrom;
+    use std::fs;
+    use std::path;
     use std::result::Result;
-    use std::{fs, path};
 
     use rstest::rstest;
     use sha2::Digest as _;
     use tempfile::TempDir;
-
-    use tokio::io::AsyncReadExt;
-    use tokio_util::io::StreamReader;
-
-    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
-
     use testcontainers::{
         core::{Mount, WaitFor},
-        runners::AsyncRunner as _,
+        runners::SyncRunner as _,
         ContainerRequest, GenericImage, ImageExt as _,
     };
+
+    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
     const HELLO_IMAGE_TAG: &str = "webassembly.azurecr.io/hello-wasm:v1";
@@ -1962,7 +1758,7 @@ mod test {
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
         assert_eq!(
-            RequestBuilderWrapper::from_client(&Client::default(), |client| client
+            RequestBuilderWrapper::from_client(&mut Client::default(), |client| client
                 .get("https://example.com/some/module.wasm"))
             .apply_accept(&["*/*"])?
             .into_request_builder()
@@ -1972,7 +1768,7 @@ mod test {
         );
 
         assert_eq!(
-            RequestBuilderWrapper::from_client(&Client::default(), |client| client
+            RequestBuilderWrapper::from_client(&mut Client::default(), |client| client
                 .get("https://example.com/some/module.wasm"))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .into_request_builder()
@@ -1984,16 +1780,15 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_apply_auth_no_token() -> anyhow::Result<()> {
+    #[test]
+    fn test_apply_auth_no_token() -> anyhow::Result<()> {
         assert!(
-            !RequestBuilderWrapper::from_client(&Client::default(), |client| client
+            !RequestBuilderWrapper::from_client(&mut Client::default(), |client| client
                 .get("https://example.com/some/module.wasm"))
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
-            )
-            .await?
+            )?
             .into_request_builder()
             .build()?
             .headers()
@@ -2003,12 +1798,12 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
+    #[test]
+    fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
         use hmac::{Hmac, Mac};
         use jwt::SignWithKey;
         use sha2::Sha256;
-        let client = Client::default();
+        let mut client = Client::default();
         let header = jwt::header::Header {
             algorithm: jwt::algorithm::AlgorithmType::Hs256,
             key_id: None,
@@ -2023,31 +1818,25 @@ mod test {
             .to_string();
 
         // we have to have it in the stored auth so we'll get to the token cache check.
-        client
-            .store_auth(
-                Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
-                RegistryAuth::Anonymous,
-            )
-            .await;
+        client.store_auth(
+            Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
+            RegistryAuth::Anonymous,
+        );
 
-        client
-            .tokens
-            .insert(
-                &Reference::try_from(HELLO_IMAGE_TAG)?,
-                RegistryOperation::Pull,
-                RegistryTokenType::Bearer(RegistryToken::Token {
-                    token: token.clone(),
-                }),
-            )
-            .await;
+        client.tokens.insert(
+            &Reference::try_from(HELLO_IMAGE_TAG)?,
+            RegistryOperation::Pull,
+            RegistryTokenType::Bearer(RegistryToken::Token {
+                token: token.clone(),
+            }),
+        );
         assert_eq!(
-            RequestBuilderWrapper::from_client(&client, |client| client
+            RequestBuilderWrapper::from_client(&mut client, |client| client
                 .get("https://example.com/some/module.wasm"))
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
-            )
-            .await?
+            )?
             .into_request_builder()
             .build()?
             .headers()["Authorization"],
@@ -2321,18 +2110,17 @@ mod test {
         assert!(token.len() > 64);
     }
 
-    #[tokio::test]
-    async fn test_auth() {
+    #[test]
+    fn test_auth() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let mut c = Client::default();
             let token = c
                 .auth(
                     &reference,
                     &RegistryAuth::Anonymous,
                     RegistryOperation::Pull,
                 )
-                .await
                 .expect("result from auth request");
 
             assert!(token.is_some());
@@ -2341,7 +2129,6 @@ mod test {
             let tok = c
                 .tokens
                 .get(&reference, RegistryOperation::Pull)
-                .await
                 .expect("token is available");
             // We test that the token is longer than a minimal hash.
             if let RegistryTokenType::Bearer(tok) = tok {
@@ -2352,21 +2139,19 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg_attr(not(feature = "test-registry"), ignore)]
-    async fn test_list_tags() {
+    fn test_list_tags() {
         let test_container = registry_image_edge()
             .start()
-            .await
             .expect("Failed to start registry container");
         let port = test_container
             .get_host_port_ipv4(5000)
-            .await
             .expect("Failed to get port");
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        let client = Client::new(ClientConfig {
+        let mut client = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
@@ -2374,17 +2159,14 @@ mod test {
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
         client
             .auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
-            .await
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = client
             ._pull_image_manifest(&image)
-            .await
             .expect("failed to pull manifest");
 
         let image_data = client
             .pull(&image, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
-            .await
             .expect("failed to pull image");
 
         for i in 0..=3 {
@@ -2393,7 +2175,6 @@ mod test {
                 .unwrap();
             client
                 .auth(&push_image, &auth, RegistryOperation::Push)
-                .await
                 .expect("authenticated");
             client
                 .push(
@@ -2403,7 +2184,6 @@ mod test {
                     &auth,
                     Some(manifest.clone()),
                 )
-                .await
                 .expect("Failed to push Image");
         }
 
@@ -2412,33 +2192,29 @@ mod test {
             .unwrap();
         let response = client
             .list_tags(&image, &RegistryAuth::Anonymous, Some(2), Some("1.0.1"))
-            .await
             .expect("Cannot list Tags");
         assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
     }
 
-    #[tokio::test]
-    async fn test_pull_manifest_private() {
+    #[test]
+    fn test_pull_manifest_private() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             // Currently, pull_manifest does not perform Authz, so this will fail.
-            let c = Client::default();
+            let mut c = Client::default();
             c._pull_image_manifest(&reference)
-                .await
                 .expect_err("pull manifest should fail");
 
             // But this should pass
-            let c = Client::default();
+            let mut c = Client::default();
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
                 RegistryOperation::Pull,
             )
-            .await
             .expect("authenticated");
             let (manifest, _) = c
                 ._pull_image_manifest(&reference)
-                .await
                 .expect("pull manifest should not fail");
 
             // The test on the manifest checks all fields. This is just a brief sanity check.
@@ -2447,14 +2223,13 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_pull_manifest_public() {
+    #[test]
+    fn test_pull_manifest_public() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let mut c = Client::default();
             let (manifest, _) = c
                 .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
-                .await
                 .expect("pull manifest should not fail");
 
             // The test on the manifest checks all fields. This is just a brief sanity check.
@@ -2463,14 +2238,13 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn pull_manifest_and_config_public() {
+    #[test]
+    fn pull_manifest_and_config_public() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let mut c = Client::default();
             let (manifest, _, config) = c
                 .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
-                .await
                 .expect("pull manifest and config should not fail");
 
             // The test on the manifest checks all fields. This is just a brief sanity check.
@@ -2480,29 +2254,26 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_fetch_digest() {
-        let c = Client::default();
+    #[test]
+    fn test_fetch_digest() {
+        let mut c = Client::default();
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             c.fetch_manifest_digest(&reference, &RegistryAuth::Anonymous)
-                .await
                 .expect("pull manifest should not fail");
 
             // This should pass
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let mut c = Client::default();
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
                 RegistryOperation::Pull,
             )
-            .await
             .expect("authenticated");
             let digest = c
                 .fetch_manifest_digest(&reference, &RegistryAuth::Anonymous)
-                .await
                 .expect("pull manifest should not fail");
 
             assert_eq!(
@@ -2512,9 +2283,9 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_pull_blob() {
-        let c = Client::default();
+    #[test]
+    fn test_pull_blob() {
+        let mut c = Client::default();
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -2523,11 +2294,9 @@ mod test {
                 &RegistryAuth::Anonymous,
                 RegistryOperation::Pull,
             )
-            .await
             .expect("authenticated");
             let (manifest, _) = c
                 ._pull_image_manifest(&reference)
-                .await
                 .expect("failed to pull manifest");
 
             // Pull one specific layer
@@ -2537,13 +2306,13 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
+                if let Err(e) = c.pull_blob(&reference, layer0, &mut file) {
                     println!(
                         "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
                         i, e
                     );
                     last_error.replace(e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 } else {
                     last_error = None;
                     break;
@@ -2559,113 +2328,8 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_pull_blob_stream() {
-        let c = Client::default();
-
-        for &image in TEST_IMAGES {
-            let reference = Reference::try_from(image).expect("failed to parse reference");
-            c.auth(
-                &reference,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Pull,
-            )
-            .await
-            .expect("authenticated");
-            let (manifest, _) = c
-                ._pull_image_manifest(&reference)
-                .await
-                .expect("failed to pull manifest");
-
-            // Pull one specific layer
-            let mut file: Vec<u8> = Vec::new();
-            let layer0 = &manifest.layers[0];
-
-            let layer_stream = c
-                .pull_blob_stream(&reference, layer0)
-                .await
-                .expect("failed to pull blob stream");
-
-            assert_eq!(layer_stream.content_length, Some(layer0.size as u64));
-            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream.stream), &mut file)
-                .await
-                .unwrap();
-
-            // The manifest says how many bytes we should expect.
-            assert_eq!(file.len(), layer0.size as usize);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pull_blob_stream_partial() {
-        let c = Client::default();
-
-        for &image in TEST_IMAGES {
-            let reference = Reference::try_from(image).expect("failed to parse reference");
-            c.auth(
-                &reference,
-                &RegistryAuth::Anonymous,
-                RegistryOperation::Pull,
-            )
-            .await
-            .expect("authenticated");
-            let (manifest, _) = c
-                ._pull_image_manifest(&reference)
-                .await
-                .expect("failed to pull manifest");
-
-            // Pull part of one specific layer
-            let mut partial_file: Vec<u8> = Vec::new();
-            let layer0 = &manifest.layers[0];
-            let (offset, length) = (10, 6);
-
-            let partial_response = c
-                .pull_blob_stream_partial(&reference, layer0, offset, Some(length))
-                .await
-                .expect("failed to pull blob stream");
-            let full_response = c
-                .pull_blob_stream_partial(&reference, layer0, 0, Some(layer0.size as u64))
-                .await
-                .expect("failed to pull blob stream");
-
-            let layer_stream_partial = match partial_response {
-                BlobResponse::Full(_stream) => panic!("expected partial response"),
-                BlobResponse::Partial(stream) => stream,
-            };
-            assert_eq!(layer_stream_partial.content_length, Some(length));
-            AsyncReadExt::read_to_end(
-                &mut StreamReader::new(layer_stream_partial.stream),
-                &mut partial_file,
-            )
-            .await
-            .unwrap();
-
-            // Also pull the full layer into a separate file to compare with the partial.
-            let mut full_file: Vec<u8> = Vec::new();
-            let layer_stream_full = match full_response {
-                BlobResponse::Full(_stream) => panic!("expected partial response"),
-                BlobResponse::Partial(stream) => stream,
-            };
-            assert_eq!(layer_stream_full.content_length, Some(layer0.size as u64));
-            AsyncReadExt::read_to_end(
-                &mut StreamReader::new(layer_stream_full.stream),
-                &mut full_file,
-            )
-            .await
-            .unwrap();
-
-            // The partial read length says how many bytes we should expect.
-            assert_eq!(partial_file.len(), length as usize);
-            // The manifest says how many bytes we should expect on a full read.
-            assert_eq!(full_file.len(), layer0.size as usize);
-            // Check that the partial read retrieved the correct bytes.
-            let end: usize = (offset + length) as usize;
-            assert_eq!(partial_file, full_file[offset as usize..end]);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pull() {
+    #[test]
+    fn test_pull() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
 
@@ -2673,14 +2337,11 @@ mod test {
             let mut last_error = None;
             let mut image_data = None;
             for i in 1..6 {
-                match Client::default()
-                    .pull(
-                        &reference,
-                        &RegistryAuth::Anonymous,
-                        vec![manifest::WASM_LAYER_MEDIA_TYPE],
-                    )
-                    .await
-                {
+                match Client::default().pull(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    vec![manifest::WASM_LAYER_MEDIA_TYPE],
+                ) {
                     Ok(data) => {
                         image_data = Some(data);
                         last_error = None;
@@ -2692,7 +2353,7 @@ mod test {
                             i, e
                         );
                         last_error.replace(e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                 }
             }
@@ -2709,25 +2370,23 @@ mod test {
     }
 
     /// Attempting to pull an image without any layer validation should fail.
-    #[tokio::test]
-    async fn test_pull_without_layer_validation() {
+    #[test]
+    fn test_pull_without_layer_validation() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             assert!(Client::default()
                 .pull(&reference, &RegistryAuth::Anonymous, vec![],)
-                .await
                 .is_err());
         }
     }
 
     /// Attempting to pull an image with the wrong list of layer validations should fail.
-    #[tokio::test]
-    async fn test_pull_wrong_layer_validation() {
+    #[test]
+    fn test_pull_wrong_layer_validation() {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             assert!(Client::default()
                 .pull(&reference, &RegistryAuth::Anonymous, vec!["text/plain"],)
-                .await
                 .is_err());
         }
     }
@@ -2756,19 +2415,17 @@ mod test {
             .with_mount(Mount::bind_mount(auth_path, "/auth"))
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg_attr(not(feature = "test-registry"), ignore)]
-    async fn can_push_chunk() {
+    fn can_push_chunk() {
         let test_container = registry_image()
             .start()
-            .await
             .expect("Failed to start registry container");
         let port = test_container
             .get_host_port_ipv4(5000)
-            .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
+        let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
@@ -2776,19 +2433,16 @@ mod test {
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
-            .await
             .expect("result from auth request");
 
         let location = c
             .begin_push_chunked_session(&image)
-            .await
             .expect("failed to begin push session");
 
         let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
 
         let (next_location, next_byte) = c
             .push_chunk(&location, &image, &image_data[0], 0)
-            .await
             .expect("failed to push layer");
 
         // Location should include original URL with at session ID appended
@@ -2800,22 +2454,19 @@ mod test {
 
         let layer_location = c
             .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data[0]))
-            .await
             .expect("failed to end push session");
 
         assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b", port));
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg_attr(not(feature = "test-registry"), ignore)]
-    async fn can_push_multiple_chunks() {
+    fn can_push_multiple_chunks() {
         let test_container = registry_image()
             .start()
-            .await
             .expect("Failed to start registry container");
         let port = test_container
             .get_host_port_ipv4(5000)
-            .await
             .expect("Failed to get port");
 
         let mut c = Client::new(ClientConfig {
@@ -2828,7 +2479,6 @@ mod test {
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
-            .await
             .expect("result from auth request");
 
         let image_data: Vec<u8> =
@@ -2837,7 +2487,6 @@ mod test {
 
         let location = c
             .push_blob_chunked(&image, &image_data, &image_digest)
-            .await
             .expect("failed to begin push session");
 
         assert_eq!(
@@ -2849,20 +2498,19 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg_attr(not(feature = "test-registry"), ignore)]
-    async fn test_image_roundtrip_anon_auth() {
+    fn test_image_roundtrip_anon_auth() {
         let test_container = registry_image()
             .start()
-            .await
             .expect("Failed to start registry container");
 
-        test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
+        test_image_roundtrip(&RegistryAuth::Anonymous, &test_container);
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg_attr(not(feature = "test-registry"), ignore)]
-    async fn test_image_roundtrip_basic_auth() {
+    fn test_image_roundtrip_basic_auth() {
         let auth_dir = TempDir::new().expect("cannot create tmp directory");
         let htpasswd_path = path::Path::join(auth_dir.path(), "htpasswd");
         fs::write(htpasswd_path, HTPASSWD).expect("cannot write htpasswd file");
@@ -2873,25 +2521,24 @@ mod test {
                 .to_str()
                 .expect("cannot convert htpasswd_path to string"),
         );
-        let test_container = image.start().await.expect("cannot registry container");
+        let test_container = image.start().expect("cannot registry container");
 
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        test_image_roundtrip(&auth, &test_container).await;
+        test_image_roundtrip(&auth, &test_container);
     }
 
-    async fn test_image_roundtrip(
+    fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
-        test_container: &testcontainers::ContainerAsync<GenericImage>,
+        test_container: &testcontainers::Container<GenericImage>,
     ) {
         let _ = tracing_subscriber::fmt::try_init();
         let port = test_container
             .get_host_port_ipv4(5000)
-            .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
+        let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
@@ -2899,22 +2546,18 @@ mod test {
         // pulling webassembly.azurecr.io/hello-wasm:v1
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
-            .await
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = c
             ._pull_image_manifest(&image)
-            .await
             .expect("failed to pull manifest");
 
         let image_data = c
             .pull(&image, registry_auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
-            .await
             .expect("failed to pull image");
 
         let push_image: Reference = format!("localhost:{}/hello-wasm:v1", port).parse().unwrap();
         c.auth(&push_image, registry_auth, RegistryOperation::Push)
-            .await
             .expect("authenticated");
 
         c.push(
@@ -2924,7 +2567,6 @@ mod test {
             registry_auth,
             Some(manifest.clone()),
         )
-        .await
         .expect("failed to push image");
 
         let pulled_image_data = c
@@ -2933,12 +2575,10 @@ mod test {
                 registry_auth,
                 vec![manifest::WASM_LAYER_MEDIA_TYPE],
             )
-            .await
             .expect("failed to pull pushed image");
 
         let (pulled_manifest, _digest) = c
             ._pull_image_manifest(&push_image)
-            .await
             .expect("failed to pull pushed image manifest");
 
         assert!(image_data.layers.len() == 1);
@@ -2954,16 +2594,15 @@ mod test {
         assert_eq!(manifest.config.digest, pulled_manifest.config.digest);
     }
 
-    #[tokio::test]
-    async fn test_raw_manifest_digest() {
+    #[test]
+    fn test_raw_manifest_digest() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let c = Client::default();
+        let mut c = Client::default();
 
         // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
-            .await
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _) = c
@@ -2972,7 +2611,6 @@ mod test {
                 &RegistryAuth::Anonymous,
                 MIME_TYPES_DISTRIBUTION_MANIFEST,
             )
-            .await
             .expect("failed to pull manifest");
 
         // Compute the digest of the returned manifest text.
@@ -2983,22 +2621,18 @@ mod test {
         assert_eq!(image.digest().unwrap(), hex);
     }
 
-    #[tokio::test]
-    #[cfg(feature = "test-registry")]
-    async fn test_mount() {
+    #[test]
+    #[cfg_attr(not(feature = "test-registry"), ignore)]
+    fn test_mount() {
         // initialize the registry
 
         use crate::manifest::OciDescriptor;
-        let test_container = registry_image()
-            .start()
-            .await
-            .expect("Failed to start registry");
+        let test_container = registry_image().start().expect("Failed to start registry");
         let port = test_container
             .get_host_port_ipv4(5000)
-            .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
+        let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
             ..Default::default()
         });
@@ -3013,7 +2647,6 @@ mod test {
             ..Default::default()
         };
         c.push_blob(&layer_reference, &[1, 2, 3, 4], &layer.digest)
-            .await
             .expect("Failed to push");
 
         // Mount the layer at `image-repository`
@@ -3021,20 +2654,18 @@ mod test {
             .parse()
             .unwrap();
         c.mount_blob(&image_reference, &layer_reference, &layer.digest)
-            .await
             .expect("Failed to mount");
 
         // Pull the layer from `image-repository`
         let mut buf = Vec::new();
         c.pull_blob(&image_reference, &layer, &mut buf)
-            .await
             .expect("Failed to pull");
 
         assert_eq!(layer_data, buf);
     }
 
-    #[tokio::test]
-    async fn test_platform_resolution() {
+    #[test]
+    fn test_platform_resolution() {
         // test that we get an error when we pull a manifest list
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
         let mut c = Client::new(ClientConfig {
@@ -3043,7 +2674,6 @@ mod test {
         });
         let err = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
             .unwrap_err();
         assert_eq!(
             format!("{}", err),
@@ -3056,7 +2686,6 @@ mod test {
         });
         let (_manifest, digest) = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
             .expect("Couldn't pull manifest");
         assert_eq!(
             digest,
@@ -3064,22 +2693,21 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn test_pull_ghcr_io() {
+    #[test]
+    fn test_pull_ghcr_io() {
         let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
-        let c = Client::default();
+        let mut c = Client::default();
         let (manifest, _manifest_str) = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore]
-    async fn test_roundtrip_multiple_layers() {
+    fn test_roundtrip_multiple_layers() {
         let _ = tracing_subscriber::fmt::try_init();
-        let c = Client::new(ClientConfig {
+        let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
             ..Default::default()
         });
@@ -3093,7 +2721,6 @@ mod test {
                 &RegistryAuth::Anonymous,
                 vec![IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE],
             )
-            .await
             .expect("Failed to pull manifest");
         assert!(image.layers.len() > 1);
 
@@ -3110,16 +2737,14 @@ mod test {
             &RegistryAuth::Anonymous,
             manifest,
         )
-        .await
         .expect("Failed to pull manifest");
 
         c.pull_image_manifest(&dest_image, &RegistryAuth::Anonymous)
-            .await
             .expect("Failed to pull manifest");
     }
 
-    #[tokio::test]
-    async fn test_hashable_image_layer() {
+    #[test]
+    fn test_hashable_image_layer() {
         use itertools::Itertools;
 
         // First two should be identical; others differ

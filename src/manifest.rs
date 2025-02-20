@@ -2,8 +2,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    client::{Config, ImageLayer},
     sha256_digest,
+    types::{Config, ImageLayer},
 };
 
 /// The mediatype for WASM layers.
