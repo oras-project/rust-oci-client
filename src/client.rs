@@ -659,6 +659,13 @@ impl Client {
             image.resolve_registry()
         );
         debug!(?url);
+
+        if let RegistryAuth::Bearer(token) = authentication {
+            return Ok(Some(RegistryTokenType::Bearer(RegistryToken::Token {
+                token: token.clone(),
+            })));
+        }
+
         let res = self.client.get(&url).send().await?;
         let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
             Some(h) => h,

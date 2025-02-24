@@ -7,6 +7,8 @@ pub enum RegistryAuth {
     Anonymous,
     /// Access the registry using HTTP Basic authentication
     Basic(String, String),
+    /// Access the registry using Bearer token authentication
+    Bearer(String),
 }
 
 pub(crate) trait Authenticable {
@@ -18,6 +20,7 @@ impl Authenticable for reqwest::RequestBuilder {
         match auth {
             RegistryAuth::Anonymous => self,
             RegistryAuth::Basic(username, password) => self.basic_auth(username, Some(password)),
+            RegistryAuth::Bearer(token) => self.bearer_auth(token),
         }
     }
 }
