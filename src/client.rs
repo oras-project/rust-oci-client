@@ -328,6 +328,15 @@ impl TryFrom<ClientConfig> for Client {
             client_builder = client_builder.proxy(proxy);
         }
 
+        if let Some(proxy_addr) = &config.http_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+            let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
+
         let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
             config: Arc::new(config),
@@ -1917,6 +1926,11 @@ pub struct ClientConfig {
     /// This defaults to `None`.
     pub https_proxy: Option<String>,
 
+    /// Set the `HTTP PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub http_proxy: Option<String>,
+
     /// Set the `NO PROXY` used by the client.
     ///
     /// This defaults to `None`.
@@ -1940,6 +1954,7 @@ impl Default for ClientConfig {
             connect_timeout: None,
             user_agent: DEFAULT_USER_AGENT,
             https_proxy: None,
+            http_proxy: None,
             no_proxy: None,
         }
     }
