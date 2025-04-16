@@ -1679,13 +1679,19 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             status,
         ))),
         s if s.is_client_error() => {
-            let text = std::str::from_utf8(body)?;
-            // According to the OCI spec, we should see an error in the message body.
-            let envelope = serde_json::from_str::<OciEnvelope>(text)?;
-            Err(OciDistributionError::RegistryError {
-                envelope,
-                url: url.to_string(),
-            })
+            match serde_json::from_slice::<OciEnvelope>(body) {
+                // According to the OCI spec, we should see an error in the message body.
+                Ok(envelope) => Err(OciDistributionError::RegistryError {
+                    envelope,
+                    url: url.to_string(),
+                }),
+                // Fall back to a plain server error if the body isn't a valid `OciEnvelope`
+                Err(_) => Err(OciDistributionError::ServerError {
+                    code: s.as_u16(),
+                    url: url.to_string(),
+                    message: String::from_utf8_lossy(body).to_string(),
+                }),
+            }
         }
         s => {
             let text = std::str::from_utf8(body)?;
