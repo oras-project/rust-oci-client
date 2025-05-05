@@ -24,12 +24,18 @@ version = "0.14.0"
 [badges]
 maintenance = { status = "actively-developed" }
 
+[[example]]
+name = "blocking-get-manifest"
+path = "examples/blocking-get-manifest/main.rs"
+required-features = ["blocking"]
+
 [features]
-default = ["native-tls", "test-registry"]
+default = ["native-tls"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
 trust-dns = ["reqwest/trust-dns"]
+blocking = ["reqwest/blocking"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
 
@@ -70,6 +76,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
 # using the ring feature. Otherwise this fails to compile on Windows
-testcontainers = "0.23"
+testcontainers = { version = "0.23", features = ["blocking"] }
 tokio = { version = "1.21", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7.4", features = ["compat"] }
