@@ -506,6 +506,33 @@ impl Client {
         })
     }
 
+    /// Checks if a blob exists in the remote registry
+    pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        let url = self.to_v2_blob_url(image, digest);
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: self.client.head(&url),
+        };
+
+        let res = request
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        match res.error_for_status() {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if err.status() == Some(StatusCode::NOT_FOUND) {
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Push an image and return the uploaded URL of the image
     ///
     /// The client will check if it's already been authenticated and if
