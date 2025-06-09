@@ -5,8 +5,8 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::future;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use futures_util::{future, Stream};
 use http::header::RANGE;
 use http::{HeaderValue, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
@@ -613,6 +613,25 @@ impl Client {
             if start >= blob_data.len() {
                 break;
             }
+        }
+        self.end_push_chunked_session(&location, image, blob_digest)
+            .await
+    }
+
+    /// Pushes a blob to the registry as a series of chunks from an input stream
+    ///
+    /// Returns the pullable location of the blob
+    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>> + Unpin>(
+        &self,
+        image: &Reference,
+        mut blob_data_stream: T,
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut location = self.begin_push_chunked_session(image).await?;
+        while let Some(blob_data) = blob_data_stream.next().await {
+            (location, _) = self
+                .push_chunk(&location, image, blob_data?.as_ref(), 0)
+                .await?;
         }
         self.end_push_chunked_session(&location, image, blob_digest)
             .await
