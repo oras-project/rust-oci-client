@@ -506,6 +506,33 @@ impl Client {
         })
     }
 
+    /// Checks if a blob exists in the remote registry
+    pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        let url = self.to_v2_blob_url(image, digest);
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: self.client.head(&url),
+        };
+
+        let res = request
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        match res.error_for_status() {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if err.status() == Some(StatusCode::NOT_FOUND) {
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Push an image and return the uploaded URL of the image
     ///
     /// The client will check if it's already been authenticated and if
@@ -2173,6 +2200,10 @@ mod test {
     const HTPASSWD_USERNAME: &str = "testuser";
     const HTPASSWD_PASSWORD: &str = "testpassword";
 
+    const EMPTY_JSON_BLOB: &str = "{}";
+    const EMPTY_JSON_DIGEST: &str =
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
         assert_eq!(
@@ -3417,5 +3448,40 @@ mod test {
             deduped.len(),
             "after deduplication, there should be one less image layer"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_blob_exists() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+
+        let reference = Reference::try_from(format!("localhost:{}/empty", server_port))
+            .expect("failed to parse reference");
+
+        assert!(!client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
+        client
+            .push_blob(&reference, EMPTY_JSON_BLOB.as_bytes(), EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to push empty json blob");
+        assert!(client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
     }
 }
