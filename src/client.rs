@@ -635,13 +635,10 @@ impl Client {
     ) -> Result<String> {
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut start: usize = 0;
-        loop {
-            (location, start) = self
-                .push_chunk(&location, image, &blob_data[start..], start)
-                .await?;
-            if start >= blob_data.len() {
-                break;
-            }
+
+        for chunk in blob_data.chunks(self.push_chunk_size) {
+            let chunk = bytes::Bytes::from(chunk.to_vec());
+            (location, start) = self.push_chunk(&location, image, chunk, start).await?;
         }
         self.end_push_chunked_session(&location, image, blob_digest)
             .await
@@ -660,8 +657,9 @@ impl Client {
         let mut range_start = 0;
 
         while let Some(blob_data) = blob_data_stream.next().await {
-            // Make sure we respect the max chunk size
-            for chunk in blob_data?.chunks(self.push_chunk_size) {
+            let mut blob_data = blob_data?;
+            while !blob_data.is_empty() {
+                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
                 (location, range_start) = self
                     .push_chunk(&location, image, chunk, range_start)
                     .await?;
@@ -1410,25 +1408,23 @@ impl Client {
             .await
     }
 
-    /// Pushes a single chunk of a blob to a registry,
-    /// as part of a chunked blob upload.
+    /// Pushes a single chunk of a blob to a registry, as part of a chunked blob upload.
+    /// The caller is responsible for chunking the blob data into smaller parts, if needed.
     ///
-    /// Returns the URL location for the next chunk, alongside the start of the next range to upload
+    /// Returns the URL location for the next chunk, alongside the start of the next range to upload.
     async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
-        blob_data: &[u8],
+        blob_chunk: bytes::Bytes,
         range_start: usize,
     ) -> Result<(String, usize)> {
-        if blob_data.is_empty() {
+        if blob_chunk.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
         };
 
-        let range_size = self.push_chunk_size.min(blob_data.len());
-        let end_range_inclusive = range_start + range_size - 1;
-
-        let body = blob_data[..range_size].to_vec();
+        let chunk_size = blob_chunk.len();
+        let end_range_inclusive = range_start + chunk_size - 1;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1438,14 +1434,13 @@ impl Client {
                 .unwrap(),
         );
 
-        headers.insert("Content-Length", format!("{}", body.len()).parse().unwrap());
+        headers.insert("Content-Length", format!("{}", chunk_size).parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         debug!(
             ?range_start,
             ?end_range_inclusive,
-            blob_data_len = body.len(),
-            body_len = body.len(),
+            chunk_size,
             ?location,
             ?headers,
             "Pushing chunk"
@@ -1456,7 +1451,7 @@ impl Client {
             .await?
             .into_request_builder()
             .headers(headers)
-            .body(body)
+            .body(blob_chunk)
             .send()
             .await?;
 
@@ -3062,22 +3057,18 @@ mod test {
             .await
             .expect("failed to begin push session");
 
-        let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
-
+        let image_data = Bytes::from(b"iamawebassemblymodule".to_vec());
         let (next_location, next_byte) = c
-            .push_chunk(&location, &image, &image_data[0], 0)
+            .push_chunk(&location, &image, image_data.clone(), 0)
             .await
             .expect("failed to push layer");
 
         // Location should include original URL with at session ID appended
         assert!(next_location.len() >= url.len() + "6987887f-0196-45ee-91a1-2dfad901bea0".len());
-        assert_eq!(
-            next_byte,
-            "iamawebassemblymodule".to_string().into_bytes().len()
-        );
+        assert_eq!(next_byte, image_data.len());
 
         let layer_location = c
-            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data[0]))
+            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data))
             .await
             .expect("failed to end push session");
 
