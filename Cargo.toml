@@ -70,6 +70,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
 # using the ring feature. Otherwise this fails to compile on Windows
-testcontainers = "0.24"
+testcontainers = "0.25"
 tokio = { version = "1.21", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7.4", features = ["compat"] }
