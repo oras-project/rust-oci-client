@@ -137,7 +137,7 @@ impl AsLayerDescriptor for &LayerDescriptor<'_> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
     /// The data of this layer
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// The media type of this layer
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
@@ -148,12 +148,12 @@ pub struct ImageLayer {
 impl ImageLayer {
     /// Constructs a new ImageLayer struct with provided data and media type
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
         media_type: String,
         annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         ImageLayer {
-            data,
+            data: data.into(),
             media_type,
             annotations,
         }
@@ -161,12 +161,18 @@ impl ImageLayer {
 
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
     }
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1_gzip(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -180,7 +186,7 @@ impl ImageLayer {
 #[derive(Clone)]
 pub struct Config {
     /// The data of this config object
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// The media type of this object
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
@@ -191,12 +197,12 @@ pub struct Config {
 impl Config {
     /// Constructs a new Config struct with provided data and media type
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
         media_type: String,
         annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         Config {
-            data,
+            data: data.into(),
             media_type,
             annotations,
         }
@@ -204,7 +210,10 @@ impl Config {
 
     /// Constructs a new Config struct with provided data and
     /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -232,7 +241,7 @@ impl TryFrom<Config> for ConfigFile {
     type Error = crate::errors::OciDistributionError;
 
     fn try_from(config: Config) -> Result<Self> {
-        let config = String::from_utf8(config.data)
+        let config = String::from_utf8(config.data.into())
             .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
         let config_file: ConfigFile = serde_json::from_str(&config)
             .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
@@ -568,7 +577,8 @@ impl Client {
                 let this = &self;
                 async move {
                     let digest = layer.sha256_digest();
-                    this.push_blob(image_ref, &layer.data, &digest).await?;
+                    this.push_blob(image_ref, layer.data.clone(), &digest)
+                        .await?;
                     Result::Ok(())
                 }
             })
@@ -578,7 +588,7 @@ impl Client {
             .await?;
 
         let config_url = self
-            .push_blob(image_ref, &config.data, &manifest.config.digest)
+            .push_blob(image_ref, config.data, &manifest.config.digest)
             .await?;
         let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
 
@@ -592,14 +602,20 @@ impl Client {
     pub async fn push_blob(
         &self,
         image_ref: &Reference,
-        data: &[u8],
+        data: impl Into<bytes::Bytes>,
         digest: &str,
     ) -> Result<String> {
         if self.config.use_monolithic_push {
             return self.push_blob_monolithically(image_ref, data, digest).await;
         }
-
-        match self.push_blob_chunked(image_ref, data, digest).await {
+        let data = data.into();
+        // Cloning the bytes here is cheap (e.g. doesn't allocate anything except some space for
+        // some pointers). If any cloning happened, it is because the caller's passed data was not
+        // already a `Bytes` type or static data.
+        match self
+            .push_blob_chunked(image_ref, data.clone(), digest)
+            .await
+        {
             Ok(url) => Ok(url),
             Err(OciDistributionError::SpecViolationError(violation)) => {
                 warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
@@ -616,7 +632,7 @@ impl Client {
     async fn push_blob_monolithically(
         &self,
         image: &Reference,
-        blob_data: &[u8],
+        blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let location = self.begin_push_monolithical_session(image).await?;
@@ -630,14 +646,16 @@ impl Client {
     async fn push_blob_chunked(
         &self,
         image: &Reference,
-        blob_data: &[u8],
+        blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut start: usize = 0;
 
-        for chunk in blob_data.chunks(self.push_chunk_size) {
-            let chunk = bytes::Bytes::from(chunk.to_vec());
+        let mut blob_data: bytes::Bytes = blob_data.into();
+        while !blob_data.is_empty() {
+            let chunk_size = self.push_chunk_size.min(blob_data.len());
+            let chunk = blob_data.split_to(chunk_size);
             (location, start) = self.push_chunk(&location, image, chunk, start).await?;
         }
         self.end_push_chunked_session(&location, image, blob_digest)
@@ -910,7 +928,7 @@ impl Client {
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: &[&str],
-    ) -> Result<(Vec<u8>, String)> {
+    ) -> Result<(bytes::Bytes, String)> {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
@@ -986,7 +1004,7 @@ impl Client {
         &self,
         image: &Reference,
         accepted_media_types: &[&str],
-    ) -> Result<(Vec<u8>, String)> {
+    ) -> Result<(bytes::Bytes, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
@@ -1006,7 +1024,7 @@ impl Client {
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
 
-        Ok((body.to_vec(), digest))
+        Ok((body, digest))
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -1070,10 +1088,9 @@ impl Client {
                 Ok((
                     manifest,
                     digest,
-                    String::from_utf8(config.data).map_err(|e| {
+                    String::from_utf8(config.data.into()).map_err(|e| {
                         OciDistributionError::GenericError(Some(format!(
-                            "Cannot not UTF8 compliant: {}",
-                            e
+                            "Cannot not UTF8 compliant: {e}"
                         )))
                     })?,
                 ))
@@ -1376,13 +1393,14 @@ impl Client {
         &self,
         location: &str,
         image: &Reference,
-        layer: &[u8],
+        layer: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let mut url = Url::parse(location).unwrap();
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
+        let layer = layer.into();
         debug!(size = layer.len(), location = ?url, "Pushing monolithically");
         if layer.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
@@ -1399,7 +1417,7 @@ impl Client {
             .await?
             .into_request_builder()
             .headers(headers)
-            .body(layer.to_vec())
+            .body(layer)
             .send()
             .await?;
 
@@ -1429,12 +1447,12 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
-            format!("{}-{}", range_start, end_range_inclusive)
+            format!("{range_start}-{end_range_inclusive}")
                 .parse()
                 .unwrap(),
         );
 
-        headers.insert("Content-Length", format!("{}", chunk_size).parse().unwrap());
+        headers.insert("Content-Length", format!("{chunk_size}").parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         debug!(
@@ -1514,7 +1532,7 @@ impl Client {
     pub async fn push_manifest_raw(
         &self,
         image: &Reference,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
         content_type: HeaderValue,
     ) -> Result<String> {
         let url = self.to_v2_manifest_url(image);
@@ -1522,6 +1540,8 @@ impl Client {
 
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", content_type);
+
+        let body = body.into();
 
         // Calculate the digest of the manifest, this is useful
         // if the remote registry is violating the OCI Distribution Specification.
@@ -1554,7 +1574,7 @@ impl Client {
             let url_base = url
                 .strip_suffix(image.tag().unwrap_or("latest"))
                 .expect("The manifest URL always ends with the image tag suffix");
-            let url_by_digest = format!("{}{}", url_base, manifest_hash);
+            let url_by_digest = format!("{url_base}{manifest_hash}");
 
             return Ok(url_by_digest);
         }
@@ -1767,7 +1787,7 @@ fn stream_from_response(
     let stream = response
         .error_for_status()?
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(std::io::Error::other);
 
     let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
     let layer_digester = Digester::new(&expected_layer_digest)?;
@@ -2027,9 +2047,10 @@ pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
-                platform.os == "linux" && platform.architecture == "amd64"
-            })
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|platform| platform.os == "linux" && platform.architecture == "amd64")
         })
         .map(|entry| entry.digest.clone())
 }
@@ -2039,7 +2060,7 @@ pub fn windows_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
+            entry.platform.as_ref().is_some_and(|platform| {
                 platform.os == "windows" && platform.architecture == "amd64"
             })
         })
@@ -2087,7 +2108,7 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
+            entry.platform.as_ref().is_some_and(|platform| {
                 platform.os == go_os() && platform.architecture == go_arch()
             })
         })
@@ -2135,7 +2156,7 @@ impl TryFrom<&HeaderValue> for BearerChallenge {
         let parser = ChallengeParser::new(
             value
                 .to_str()
-                .map_err(|e| format!("cannot convert header value to string: {:?}", e))?,
+                .map_err(|e| format!("cannot convert header value to string: {e:?}"))?,
         );
         parser
             .filter_map(|parser_res| {
@@ -2658,7 +2679,7 @@ mod test {
             .expect("failed to pull image");
 
         for i in 0..=3 {
-            let push_image: Reference = format!("localhost:{}/hello-wasm:1.0.{}", port, i)
+            let push_image: Reference = format!("localhost:{port}/hello-wasm:1.0.{i}")
                 .parse()
                 .unwrap();
             client
@@ -2677,7 +2698,7 @@ mod test {
                 .expect("Failed to push Image");
         }
 
-        let image: Reference = format!("localhost:{}/hello-wasm:1.0.1", port)
+        let image: Reference = format!("localhost:{port}/hello-wasm:1.0.1")
             .parse()
             .unwrap();
         let response = client
@@ -2808,10 +2829,7 @@ mod test {
             let mut last_error = None;
             for i in 1..6 {
                 if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
-                    println!(
-                        "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
-                        i, e
-                    );
+                    println!("Got error on pull_blob call attempt {i}. Will retry in 1s: {e:?}");
                     last_error.replace(e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 } else {
@@ -2821,7 +2839,7 @@ mod test {
             }
 
             if let Some(e) = last_error {
-                panic!("Unable to pull layer: {:?}", e);
+                panic!("Unable to pull layer: {e:?}");
             }
 
             // The manifest says how many bytes we should expect.
@@ -2957,10 +2975,7 @@ mod test {
                         break;
                     }
                     Err(e) => {
-                        println!(
-                            "Got error on pull call attempt {}. Will retry in 1s: {:?}",
-                            i, e
-                        );
+                        println!("Got error on pull call attempt {i}. Will retry in 1s: {e:?}");
                         last_error.replace(e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
@@ -2968,7 +2983,7 @@ mod test {
             }
 
             if let Some(e) = last_error {
-                panic!("Unable to pull layer: {:?}", e);
+                panic!("Unable to pull layer: {e:?}");
             }
 
             assert!(image_data.is_some());
@@ -3045,7 +3060,7 @@ mod test {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
-        let url = format!("localhost:{}/hello-wasm:v1", port);
+        let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -3072,7 +3087,7 @@ mod test {
             .await
             .expect("failed to end push session");
 
-        assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b", port));
+        assert_eq!(layer_location, format!("http://localhost:{port}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b"));
     }
 
     #[tokio::test]
@@ -3093,7 +3108,7 @@ mod test {
         });
         // set a super small chunk size - done to force multiple pushes
         c.push_chunk_size = 3;
-        let url = format!("localhost:{}/hello-wasm:v1", port);
+        let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -3105,16 +3120,13 @@ mod test {
         let image_digest = sha256_digest(&image_data);
 
         let location = c
-            .push_blob_chunked(&image, &image_data, &image_digest)
+            .push_blob_chunked(&image, image_data, &image_digest)
             .await
             .expect("failed to begin push session");
 
         assert_eq!(
             location,
-            format!(
-                "http://localhost:{}/v2/hello-wasm/blobs/{}",
-                port, image_digest
-            )
+            format!("http://localhost:{port}/v2/hello-wasm/blobs/{image_digest}")
         );
     }
 
@@ -3182,7 +3194,7 @@ mod test {
             .await
             .expect("failed to pull image");
 
-        let push_image: Reference = format!("localhost:{}/hello-wasm:v1", port).parse().unwrap();
+        let push_image: Reference = format!("localhost:{port}/hello-wasm:v1").parse().unwrap();
         c.auth(&push_image, registry_auth, RegistryOperation::Push)
             .await
             .expect("authenticated");
@@ -3247,7 +3259,7 @@ mod test {
 
         // Compute the digest of the returned manifest text.
         let digest = sha2::Sha256::digest(manifest);
-        let hex = format!("sha256:{:x}", digest);
+        let hex = format!("sha256:{digest:x}");
 
         // Validate that the computed digest and the digest in the pulled reference match.
         assert_eq!(image.digest().unwrap(), hex);
@@ -3272,7 +3284,7 @@ mod test {
         });
 
         // Create a dummy layer and push it to `layer-repository`
-        let layer_reference: Reference = format!("localhost:{}/layer-repository", port)
+        let layer_reference: Reference = format!("localhost:{port}/layer-repository")
             .parse()
             .unwrap();
         let layer_data = vec![1u8, 2, 3, 4];
@@ -3280,12 +3292,16 @@ mod test {
             digest: sha256_digest(&layer_data),
             ..Default::default()
         };
-        c.push_blob(&layer_reference, &[1, 2, 3, 4], &layer.digest)
-            .await
-            .expect("Failed to push");
+        c.push_blob(
+            &layer_reference,
+            Bytes::copy_from_slice(&layer_data),
+            &layer.digest,
+        )
+        .await
+        .expect("Failed to push");
 
         // Mount the layer at `image-repository`
-        let image_reference: Reference = format!("localhost:{}/image-repository", port)
+        let image_reference: Reference = format!("localhost:{port}/image-repository")
             .parse()
             .unwrap();
         c.mount_blob(&image_reference, &layer_reference, &layer.digest)
@@ -3314,7 +3330,7 @@ mod test {
             .await
             .unwrap_err();
         assert_eq!(
-            format!("{}", err),
+            format!("{err}"),
             "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
         );
 
@@ -3393,7 +3409,7 @@ mod test {
         // First two should be identical; others differ
         let image_layers = Vec::from([
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -3401,7 +3417,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("2".to_owned(), "3".to_owned()),
@@ -3409,7 +3425,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "different_media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -3417,7 +3433,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2]),
+                data: Bytes::from_static(&[0, 1, 2]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -3425,7 +3441,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("1".to_owned(), "0".to_owned()),
@@ -3489,7 +3505,7 @@ mod test {
             ..Default::default()
         });
 
-        let reference = Reference::try_from(format!("localhost:{}/empty", server_port))
+        let reference = Reference::try_from(format!("localhost:{server_port}/empty"))
             .expect("failed to parse reference");
 
         assert!(!client
@@ -3533,7 +3549,7 @@ mod test {
                 .map(Ok)
         };
 
-        let reference = Reference::try_from(format!("localhost:{}/test-push-stream", server_port))
+        let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
             .expect("failed to parse reference");
 
         // Sanity check: verify that the server rejects the push if the blob has a mismatched digest

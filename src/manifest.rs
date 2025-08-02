@@ -42,6 +42,7 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
 /// An image, or image index, OCI manifest
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum OciManifest {
     /// An OCI image manifest
     Image(OciImageManifest),
@@ -188,8 +189,8 @@ impl From<OciImageManifest> for OciManifest {
 impl std::fmt::Display for OciManifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OciManifest::Image(oci_image_manifest) => write!(f, "{}", oci_image_manifest),
-            OciManifest::ImageIndex(oci_image_index) => write!(f, "{}", oci_image_index),
+            OciManifest::Image(oci_image_manifest) => write!(f, "{oci_image_manifest}"),
+            OciManifest::ImageIndex(oci_image_index) => write!(f, "{oci_image_index}"),
         }
     }
 }

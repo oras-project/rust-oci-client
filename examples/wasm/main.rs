@@ -29,7 +29,7 @@ fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     match docker_credential::get_credential(server) {
         Err(CredentialRetrievalError::ConfigNotFound) => RegistryAuth::Anonymous,
         Err(CredentialRetrievalError::NoCredentialConfigured) => RegistryAuth::Anonymous,
-        Err(e) => panic!("Error handling docker configuration file: {}", e),
+        Err(e) => panic!("Error handling docker configuration file: {e}"),
         Ok(DockerCredential::UsernamePassword(username, password)) => {
             debug!("Found docker credentials");
             RegistryAuth::Basic(username, password)
