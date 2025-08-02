@@ -5,8 +5,8 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::future;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use futures_util::{future, Stream};
 use http::header::RANGE;
 use http::{HeaderValue, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
@@ -506,6 +506,33 @@ impl Client {
         })
     }
 
+    /// Checks if a blob exists in the remote registry
+    pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        let url = self.to_v2_blob_url(image, digest);
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: self.client.head(&url),
+        };
+
+        let res = request
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        match res.error_for_status() {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if err.status() == Some(StatusCode::NOT_FOUND) {
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Push an image and return the uploaded URL of the image
     ///
     /// The client will check if it's already been authenticated and if
@@ -608,10 +635,34 @@ impl Client {
     ) -> Result<String> {
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut start: usize = 0;
-        loop {
-            (location, start) = self.push_chunk(&location, image, blob_data, start).await?;
-            if start >= blob_data.len() {
-                break;
+
+        for chunk in blob_data.chunks(self.push_chunk_size) {
+            let chunk = bytes::Bytes::from(chunk.to_vec());
+            (location, start) = self.push_chunk(&location, image, chunk, start).await?;
+        }
+        self.end_push_chunked_session(&location, image, blob_digest)
+            .await
+    }
+
+    /// Pushes a blob to the registry as a series of chunks from an input stream
+    ///
+    /// Returns the pullable location of the blob
+    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>> + Unpin>(
+        &self,
+        image: &Reference,
+        mut blob_data_stream: T,
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut location = self.begin_push_chunked_session(image).await?;
+        let mut range_start = 0;
+
+        while let Some(blob_data) = blob_data_stream.next().await {
+            let mut blob_data = blob_data?;
+            while !blob_data.is_empty() {
+                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+                (location, range_start) = self
+                    .push_chunk(&location, image, chunk, range_start)
+                    .await?;
             }
         }
         self.end_push_chunked_session(&location, image, blob_digest)
@@ -1357,39 +1408,39 @@ impl Client {
             .await
     }
 
-    /// Pushes a single chunk of a blob to a registry,
-    /// as part of a chunked blob upload.
+    /// Pushes a single chunk of a blob to a registry, as part of a chunked blob upload.
+    /// The caller is responsible for chunking the blob data into smaller parts, if needed.
     ///
-    /// Returns the URL location for the next chunk
+    /// Returns the URL location for the next chunk, alongside the start of the next range to upload.
     async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
-        blob_data: &[u8],
-        start_byte: usize,
+        blob_chunk: bytes::Bytes,
+        range_start: usize,
     ) -> Result<(String, usize)> {
-        if blob_data.is_empty() {
+        if blob_chunk.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
         };
-        let end_byte = if (start_byte + self.push_chunk_size) < blob_data.len() {
-            start_byte + self.push_chunk_size - 1
-        } else {
-            blob_data.len() - 1
-        };
-        let body = blob_data[start_byte..end_byte + 1].to_vec();
+
+        let chunk_size = blob_chunk.len();
+        let end_range_inclusive = range_start + chunk_size - 1;
+
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
-            format!("{}-{}", start_byte, end_byte).parse().unwrap(),
+            format!("{}-{}", range_start, end_range_inclusive)
+                .parse()
+                .unwrap(),
         );
-        headers.insert("Content-Length", format!("{}", body.len()).parse().unwrap());
+
+        headers.insert("Content-Length", format!("{}", chunk_size).parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         debug!(
-            ?start_byte,
-            ?end_byte,
-            blob_data_len = blob_data.len(),
-            body_len = body.len(),
+            ?range_start,
+            ?end_range_inclusive,
+            chunk_size,
             ?location,
             ?headers,
             "Pushing chunk"
@@ -1400,7 +1451,7 @@ impl Client {
             .await?
             .into_request_builder()
             .headers(headers)
-            .body(body)
+            .body(blob_chunk)
             .send()
             .await?;
 
@@ -1408,7 +1459,7 @@ impl Client {
         Ok((
             self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
                 .await?,
-            end_byte + 1,
+            end_range_inclusive + 1,
         ))
     }
 
@@ -2139,6 +2190,7 @@ mod test {
     use std::path;
     use std::result::Result;
 
+    use bytes::Bytes;
     use rstest::rstest;
     use sha2::Digest as _;
     use tempfile::TempDir;
@@ -2172,6 +2224,10 @@ mod test {
     const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
     const HTPASSWD_USERNAME: &str = "testuser";
     const HTPASSWD_PASSWORD: &str = "testpassword";
+
+    const EMPTY_JSON_BLOB: &str = "{}";
+    const EMPTY_JSON_DIGEST: &str =
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
@@ -3001,22 +3057,18 @@ mod test {
             .await
             .expect("failed to begin push session");
 
-        let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
-
+        let image_data = Bytes::from(b"iamawebassemblymodule".to_vec());
         let (next_location, next_byte) = c
-            .push_chunk(&location, &image, &image_data[0], 0)
+            .push_chunk(&location, &image, image_data.clone(), 0)
             .await
             .expect("failed to push layer");
 
         // Location should include original URL with at session ID appended
         assert!(next_location.len() >= url.len() + "6987887f-0196-45ee-91a1-2dfad901bea0".len());
-        assert_eq!(
-            next_byte,
-            "iamawebassemblymodule".to_string().into_bytes().len()
-        );
+        assert_eq!(next_byte, image_data.len());
 
         let layer_location = c
-            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data[0]))
+            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data))
             .await
             .expect("failed to end push session");
 
@@ -3417,5 +3469,88 @@ mod test {
             deduped.len(),
             "after deduplication, there should be one less image layer"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_blob_exists() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+
+        let reference = Reference::try_from(format!("localhost:{}/empty", server_port))
+            .expect("failed to parse reference");
+
+        assert!(!client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
+        client
+            .push_blob(&reference, EMPTY_JSON_BLOB.as_bytes(), EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to push empty json blob");
+        assert!(client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+        client.push_chunk_size = 253;
+
+        // hash for a byte array counting 16 times from 0 to 255 ([0, 1. 2...., 255] * 16)
+        let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
+        let data_stream = |repeat| {
+            futures_util::stream::repeat(Bytes::from_iter(0..=255))
+                .take(repeat)
+                .map(Ok)
+        };
+
+        let reference = Reference::try_from(format!("localhost:{}/test-push-stream", server_port))
+            .expect("failed to parse reference");
+
+        // Sanity check: verify that the server rejects the push if the blob has a mismatched digest
+        client
+            .push_blob_stream(&reference, data_stream(1), data_hash)
+            .await
+            .expect_err("expected push to fail with mismatched digest");
+
+        // Now push the stream with the correct digest
+        client
+            .push_blob_stream(&reference, data_stream(16), data_hash)
+            .await
+            .expect("failed to push stream");
+
+        assert!(client
+            .blob_exists(&reference, data_hash)
+            .await
+            .expect("failed to check blob existence"));
     }
 }
