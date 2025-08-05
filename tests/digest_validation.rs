@@ -127,7 +127,7 @@ impl BadServer {
         let listener = TcpListener::bind(addr).await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let port = server_addr.port();
-        let server = format!("127.0.0.1:{}", port);
+        let server = format!("127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });

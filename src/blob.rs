@@ -85,8 +85,7 @@ impl Stream for VerifyingStream {
                         // Check the header digester and then the layer digester before returning
                         let digest = digester.finalize();
                         if digest != *expected {
-                            return Poll::Ready(Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Poll::Ready(Some(Err(std::io::Error::other(
                                 DigestError::VerificationError {
                                     expected: expected.clone(),
                                     actual: digest,
@@ -97,8 +96,7 @@ impl Stream for VerifyingStream {
                         if digest == this.expected_layer_digest {
                             Poll::Ready(None)
                         } else {
-                            Poll::Ready(Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            Poll::Ready(Some(Err(std::io::Error::other(
                                 DigestError::VerificationError {
                                     expected: expected.clone(),
                                     actual: digest,
@@ -111,8 +109,7 @@ impl Stream for VerifyingStream {
                         if digest == this.expected_layer_digest {
                             Poll::Ready(None)
                         } else {
-                            Poll::Ready(Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            Poll::Ready(Some(Err(std::io::Error::other(
                                 DigestError::VerificationError {
                                     expected: this.expected_layer_digest.clone(),
                                     actual: digest,
