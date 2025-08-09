@@ -59,6 +59,11 @@ pub enum RegistryOperation {
     Pull,
 }
 
+#[derive(Debug, Deserialize)]
+struct BearerTokenClaims {
+    exp: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TokenCacheKey {
     registry: String,
@@ -97,36 +102,53 @@ impl TokenCache {
             RegistryTokenType::Basic(_, _) => u64::MAX,
             RegistryTokenType::Bearer(ref t) => {
                 let token_str = t.token();
-                match jwt::Token::<
-                        jwt::header::Header,
-                        jwt::claims::Claims,
-                        jwt::token::Unverified,
-                    >::parse_unverified(token_str)
-                    {
-                        Ok(token) => token.claims().registered.expiration.unwrap_or(u64::MAX),
-                        Err(jwt::Error::NoClaimsComponent) => {
-                            // the token doesn't have a claim that states a
-                            // value for the expiration. We assume it has a 60
-                            // seconds validity as indicated here:
-                            // https://docs.docker.com/registry/spec/auth/token/#requesting-a-token
-                            // > (Optional) The duration in seconds since the token was issued
-                            // > that it will remain valid. When omitted, this defaults to 60 seconds.
-                            // > For compatibility with older clients, a token should never be returned
-                            // > with less than 60 seconds to live.
-                            let now = SystemTime::now();
-                            let epoch = now
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_secs();
-                            let expiration = epoch + self.default_expiration_secs as u64;
-                            debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", self.default_expiration_secs);
-                            expiration
-                        },
-                        Err(error) => {
-                            warn!(?error, "Invalid bearer token");
-                            return;
-                        }
+
+                // This might be able to change if/when jsonwebtoken provides a simpler API for
+                // looking through jwt claims without validating the token.
+                // See the following GitHub issue for more details:
+                // https://github.com/Keats/jsonwebtoken/issues/401
+                let mut validation = jsonwebtoken::Validation::default();
+                validation.insecure_disable_signature_validation();
+                validation.required_spec_claims.clear();
+                validation.validate_aud = false;
+                validation.validate_exp = false;
+                validation.validate_nbf = false;
+
+                match jsonwebtoken::decode::<BearerTokenClaims>(
+                    token_str,
+                    &jsonwebtoken::DecodingKey::from_secret(&[]),
+                    &validation,
+                ) {
+                    Ok(token) => {
+                        let token_exp = match token.claims.exp {
+                            Some(exp) => exp,
+                            None => {
+                                // the token doesn't have a claim that states a
+                                // value for the expiration. We assume it has a 60
+                                // seconds validity as indicated here:
+                                // https://docs.docker.com/reference/api/registry/auth/#token-response-fields
+                                // > (Optional) The duration in seconds since the token was issued
+                                // > that it will remain valid. When omitted, this defaults to 60 seconds.
+                                // > For compatibility with older clients, a token should never be returned
+                                // > with less than 60 seconds to live.
+                                let now = SystemTime::now();
+                                let epoch = now
+                                    .duration_since(UNIX_EPOCH)
+                                    .expect("Time went backwards")
+                                    .as_secs();
+                                let expiration = epoch + self.default_expiration_secs as u64;
+                                debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", self.default_expiration_secs);
+                                expiration
+                            }
+                        };
+
+                        token_exp
                     }
+                    Err(error) => {
+                        warn!(?error, "Invalid bearer token");
+                        return;
+                    }
+                }
             }
         };
         let registry = reference.resolve_registry().to_string();
