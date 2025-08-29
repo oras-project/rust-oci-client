@@ -58,7 +58,6 @@ unicase = "2.6"
 
 [dev-dependencies]
 assert-json-diff = "2.0.2"
-async-std = "1.12"
 anyhow = "1.0"
 axum = "0.8"
 clap = { version = "4.0", features = ["derive"] }
@@ -71,5 +70,5 @@ tempfile = "3.3"
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
 # using the ring feature. Otherwise this fails to compile on Windows
 testcontainers = "0.25"
-tokio = { version = "1.21", features = ["macros", "fs", "rt-multi-thread"] }
-tokio-util = { version = "0.7.4", features = ["compat"] }
+tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["compat"] }
