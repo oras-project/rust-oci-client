@@ -19,7 +19,7 @@ pub(crate) async fn pull_wasm(
         .map(|layer| layer.data)
         .expect("No data found");
 
-    async_std::fs::write(output, image_content)
+    tokio::fs::write(output, image_content)
         .await
         .expect("Cannot write to file");
     println!("Wasm module successfully written to {output}");

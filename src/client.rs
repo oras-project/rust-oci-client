@@ -1849,7 +1849,7 @@ impl<'a> RequestBuilderWrapper<'a> {
 
 // Composable functions applicable to a `RequestBuilderWrapper`
 impl<'a> RequestBuilderWrapper<'a> {
-    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper> {
+    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper<'_>> {
         let request_builder = self
             .request_builder
             .try_clone()
@@ -1876,7 +1876,7 @@ impl<'a> RequestBuilderWrapper<'a> {
         &self,
         image: &Reference,
         op: RegistryOperation,
-    ) -> Result<RequestBuilderWrapper> {
+    ) -> Result<RequestBuilderWrapper<'_>> {
         let mut headers = HeaderMap::new();
 
         if let Some(token) = self.client.get_auth_token(image, op).await {
