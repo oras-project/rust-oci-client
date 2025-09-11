@@ -16,7 +16,7 @@ pub(crate) async fn push_wasm(
 ) {
     info!(?reference, ?module, "pushing wasm module");
 
-    let data = async_std::fs::read(module)
+    let data = tokio::fs::read(module)
         .await
         .expect("Cannot read Wasm module from disk");
 
