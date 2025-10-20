@@ -39,7 +39,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 http = "1.3"
 http-auth = { version = "0.1", default-features = false }
-jsonwebtoken = "9.3"
+jsonwebtoken = "10.1"
 lazy_static = "1.4"
 oci-spec = "0.8"
 olpc-cjson = "0.1"
