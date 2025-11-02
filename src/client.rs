@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::hash::Hash;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -665,14 +666,16 @@ impl Client {
     /// Pushes a blob to the registry as a series of chunks from an input stream
     ///
     /// Returns the pullable location of the blob
-    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>> + Unpin>(
+    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>>>(
         &self,
         image: &Reference,
-        mut blob_data_stream: T,
+        blob_data_stream: T,
         blob_digest: &str,
     ) -> Result<String> {
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut range_start = 0;
+
+        let mut blob_data_stream = pin!(blob_data_stream);
 
         while let Some(blob_data) = blob_data_stream.next().await {
             let mut blob_data = blob_data?;
@@ -1133,11 +1136,11 @@ impl Client {
     /// descriptor. The image reference is used to find the repository and the registry, but it is
     /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
     /// that.)
-    pub async fn pull_blob<T: AsyncWrite + Unpin>(
+    pub async fn pull_blob<T: AsyncWrite>(
         &self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
-        mut out: T,
+        out: T,
     ) -> Result<()> {
         let response = self.pull_blob_response(image, &layer, None, None).await?;
 
@@ -1150,6 +1153,8 @@ impl Client {
         let mut layer_digester = Digester::new(&layer_digest)?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
+
+        let mut out = pin!(out);
 
         while let Some(bytes) = stream.next().await {
             let bytes = bytes?;
