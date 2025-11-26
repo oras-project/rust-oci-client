@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
         with:
           name: just
@@ -30,7 +30,7 @@ jobs:
         # but bash does!
         shell: bash
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
         with:
           name: just
@@ -50,7 +50,7 @@ jobs:
           - advisories
           - bans licenses sources
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - uses: EmbarkStudios/cargo-deny-action@f2ba7abc2abebaf185c833c3961145a3c275caad # v2.0.3
         with:
           command: check ${{ matrix.checks }}
