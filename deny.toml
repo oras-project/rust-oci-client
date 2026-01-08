@@ -1,4 +1,7 @@
 [advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0134", reason = "Transitive development dependency of `testcontainers`. We need to wait for a new release from upstream." },
+]
 
 [licenses]
 version = 2
