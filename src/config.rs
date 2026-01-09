@@ -10,85 +10,12 @@ use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer}
 /// The CPU architecture which the binaries in this image are
 /// built to run on.
 /// Validated values are listed in [Go Language document for GOARCH](https://golang.org/doc/install/source#environment)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Architecture {
-    /// Arm
-    Arm,
-    /// Arm 64bit
-    Arm64,
-    /// Amd64/x86-64
-    #[default]
-    Amd64,
-    /// Intel i386
-    #[serde(rename = "386")]
-    I386,
-    /// Wasm
-    Wasm,
-    /// Loong64
-    Loong64,
-    /// MIPS
-    Mips,
-    /// MIPSle
-    Mipsle,
-    /// MIPS64
-    Mips64,
-    /// MIPS64le
-    Mips64le,
-    /// Power PC64
-    PPC64,
-    /// Power PC64le
-    PPC64le,
-    /// RiscV 64
-    Riscv64,
-    /// IBM s390x
-    S390x,
-    /// With this field empty
-    #[serde(rename = "")]
-    None,
-}
+pub type Architecture = oci_spec::image::Arch;
 
 /// The name of the operating system which the image is
 /// built to run on.
 /// Validated values are listed in [Go Language document for GOARCH](https://golang.org/doc/install/source#environment)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Os {
-    /// IBM AIX
-    Aix,
-    /// Android
-    Android,
-    /// Apple Darwin
-    Darwin,
-    /// FreeBSD Dragonfly
-    Dragonfly,
-    /// FreeBSD
-    Freebsd,
-    /// Illumos
-    Illumos,
-    /// iOS
-    Ios,
-    /// Js
-    Js,
-    /// Linux
-    #[default]
-    Linux,
-    /// NetBSD
-    Netbsd,
-    /// OpenBSD
-    Openbsd,
-    /// Plan9 from Bell Labs
-    Plan9,
-    /// Solaris
-    Solaris,
-    /// WASI Preview 1
-    Wasip1,
-    /// Microsoft Windows
-    Windows,
-    /// With this field empty
-    #[serde(rename = "")]
-    None,
-}
+pub type Os = oci_spec::image::Os;
 
 /// An OCI Image is an ordered collection of root filesystem changes
 /// and the corresponding execution parameters for use within a
@@ -310,11 +237,12 @@ pub struct History {
 mod tests {
     use assert_json_diff::assert_json_eq;
     use chrono::DateTime;
+    use oci_spec::image::Arch;
     use rstest::*;
     use serde_json::Value;
     use std::collections::{HashMap, HashSet};
 
-    use super::{Architecture, Config, ConfigFile, History, Os, Rootfs};
+    use super::{Config, ConfigFile, History, Os, Rootfs};
 
     const EXAMPLE_CONFIG: &str = r#"
     {
@@ -431,7 +359,7 @@ mod tests {
                     .into(),
             ),
             author: Some("Alyssa P. Hacker <alyspdev@example.com>".into()),
-            architecture: Architecture::Amd64,
+            architecture: Arch::Amd64,
             os: Os::Linux,
             config: Some(config),
             rootfs,
@@ -462,7 +390,7 @@ mod tests {
         };
 
         ConfigFile {
-            architecture: Architecture::Amd64,
+            architecture: Arch::Amd64,
             os: Os::Linux,
             config: None,
             rootfs,
@@ -522,7 +450,7 @@ mod tests {
         };
 
         ConfigFile {
-            architecture: Architecture::Arm64,
+            architecture: Arch::ARM64,
             os: Os::Linux,
             config,
             rootfs,
