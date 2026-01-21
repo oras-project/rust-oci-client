@@ -25,7 +25,7 @@ version = "0.15.0"
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["native-tls", "test-registry"]
+default = ["rustls-tls", "test-registry"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls"]
 hickory-dns = ["reqwest/hickory-dns"]
