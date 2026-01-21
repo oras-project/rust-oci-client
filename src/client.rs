@@ -15,8 +15,7 @@ use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -85,7 +84,18 @@ pub struct TagResponse {
     /// Repository Name
     pub name: String,
     /// List of existing Tags
+    #[serde(deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
+}
+
+/// Helper to deserialize an empty value from a JSON `null`.
+fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let res = <Option<T>>::deserialize(d)?.unwrap_or_default();
+    Ok(res)
 }
 
 /// The data returned by a successful catalog request.
@@ -3764,6 +3774,39 @@ mod test {
             .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tags_ghcr_io() {
+        const MAX_TAGS_PER_LIST: usize = 100;
+        const MAX_TAG_REQUESTS: usize = 10;
+
+        let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
+        let c = Client::default();
+
+        // When listing beyond the last tag in the repository, ghcr.io has been observed to emit
+        // a JSON `null` for the "tags" field rather than an empty array. This must be handled
+        // to paginate through tags using the `last` parameter.
+        let mut last_tag = None;
+        for _ in 0..MAX_TAG_REQUESTS {
+            let mut response = c
+                .list_tags(
+                    &reference,
+                    &RegistryAuth::Anonymous,
+                    Some(MAX_TAGS_PER_LIST),
+                    last_tag.as_deref(),
+                )
+                .await
+                .expect("failed to list tags in registry");
+
+            if let Some(tag) = response.tags.pop() {
+                last_tag = Some(tag);
+            } else {
+                return;
+            }
+        }
+
+        panic!("failed to list all tags for {GHCR_IO_IMAGE} in {MAX_TAG_REQUESTS} requests");
     }
 
     #[tokio::test]
