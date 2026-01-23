@@ -8,4 +8,4 @@ test:
     cargo test --doc --all
 
 check-deny:
-    cargo deny  --all-features check bans licenses sources
+    cargo deny  --all-features check bans licenses sources advisories
