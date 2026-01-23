@@ -159,22 +159,7 @@ impl TokenCache {
 }
 
 fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
-    // This might be able to change if/when jsonwebtoken provides a simpler API for
-    // looking through jwt claims without validating the token.
-    // See the following GitHub issue for more details:
-    // https://github.com/Keats/jsonwebtoken/issues/401
-    let mut validation = jsonwebtoken::Validation::default();
-    validation.insecure_disable_signature_validation();
-    validation.required_spec_claims.clear();
-    validation.validate_aud = false;
-    validation.validate_exp = false;
-    validation.validate_nbf = false;
-
-    match jsonwebtoken::decode::<BearerTokenClaims>(
-        token_str,
-        &jsonwebtoken::DecodingKey::from_secret(&[]),
-        &validation,
-    ) {
+    match jsonwebtoken::dangerous::insecure_decode::<BearerTokenClaims>(token_str) {
         Ok(token) => {
             let token_exp = match token.claims.exp {
                 Some(exp) => exp,
