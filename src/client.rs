@@ -10,6 +10,7 @@ use futures_util::{future, Stream};
 use http::header::RANGE;
 use http::{HeaderValue, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
+use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
@@ -2047,10 +2048,9 @@ pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry
-                .platform
-                .as_ref()
-                .is_some_and(|platform| platform.os == "linux" && platform.architecture == "amd64")
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == Os::Linux && platform.architecture == Arch::Amd64
+            })
         })
         .map(|entry| entry.digest.clone())
 }
@@ -2061,45 +2061,10 @@ pub fn windows_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
         .iter()
         .find(|entry| {
             entry.platform.as_ref().is_some_and(|platform| {
-                platform.os == "windows" && platform.architecture == "amd64"
+                platform.os == Os::Windows && platform.architecture == Arch::Amd64
             })
         })
         .map(|entry| entry.digest.clone())
-}
-
-const MACOS: &str = "macos";
-const DARWIN: &str = "darwin";
-
-fn go_os() -> &'static str {
-    // Massage Rust OS var to GO OS:
-    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.OS.html
-    // - Go: https://golang.org/doc/install/source#environment
-    match std::env::consts::OS {
-        MACOS => DARWIN,
-        other => other,
-    }
-}
-
-const X86_64: &str = "x86_64";
-const AMD64: &str = "amd64";
-const X86: &str = "x86";
-const AMD: &str = "amd";
-const ARM64: &str = "arm64";
-const AARCH64: &str = "aarch64";
-const POWERPC64: &str = "powerpc64";
-const PPC64LE: &str = "ppc64le";
-
-fn go_arch() -> &'static str {
-    // Massage Rust Architecture vars to GO equivalent:
-    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.ARCH.html
-    // - Go: https://golang.org/doc/install/source#environment
-    match std::env::consts::ARCH {
-        X86_64 => AMD64,
-        X86 => AMD,
-        AARCH64 => ARM64,
-        POWERPC64 => PPC64LE,
-        other => other,
-    }
 }
 
 /// A platform resolver that chooses the first variant matching the running OS/Arch, if present.
@@ -2109,7 +2074,7 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
         .iter()
         .find(|entry| {
             entry.platform.as_ref().is_some_and(|platform| {
-                platform.os == go_os() && platform.architecture == go_arch()
+                platform.os == Os::default() && platform.architecture == Arch::default()
             })
         })
         .map(|entry| entry.digest.clone())

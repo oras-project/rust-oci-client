@@ -1,6 +1,8 @@
 //! OCI Manifest
 use std::collections::BTreeMap;
 
+use oci_spec::image::{Arch, Os};
+
 use crate::{
     client::{Config, ImageLayer},
     sha256_digest,
@@ -420,11 +422,11 @@ pub struct Platform {
     /// This REQUIRED property specifies the CPU architecture.
     /// Image indexes SHOULD use, and implementations SHOULD understand, values
     /// listed in the Go Language document for [`GOARCH`](https://golang.org/doc/install/source#environment).
-    pub architecture: String,
+    pub architecture: Arch,
     /// This REQUIRED property specifies the operating system.
     /// Image indexes SHOULD use, and implementations SHOULD understand, values
     /// listed in the Go Language document for [`GOOS`](https://golang.org/doc/install/source#environment).
-    pub os: String,
+    pub os: Os,
     /// This OPTIONAL property specifies the version of the operating system
     /// targeted by the referenced blob.
     /// Implementations MAY refuse to use manifests where `os.version` is not known
