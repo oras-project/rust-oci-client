@@ -2,6 +2,7 @@
 
 use http::HeaderMap;
 use sha2::Digest as _;
+use std::fmt::{Display, Formatter};
 
 use crate::sha256_digest;
 
@@ -36,6 +37,13 @@ pub enum DigestError {
 pub struct Digest<'a> {
     pub algorithm: &'a str,
     pub digest: &'a str,
+}
+
+impl<'a> Display for Digest<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Digest { algorithm, digest } = self;
+        write!(f, "{algorithm}:{digest}")
+    }
 }
 
 impl<'a> Digest<'a> {
@@ -111,16 +119,18 @@ pub fn validate_digest(
     digest_header: Option<String>,
     reference_digest: Option<&str>,
 ) -> Result<String> {
+    let digest_header = digest_header.as_ref().map(|s| Digest::new(s)).transpose()?;
+    let reference_digest = reference_digest.map(Digest::new).transpose()?;
     match (digest_header, reference_digest) {
         // If both digests are equal, then just calculate once
         (Some(digest), Some(reference)) if digest == reference => {
-            calculate_and_validate(body, &digest)
+            calculate_and_validate(body, digest)
         }
         (Some(digest), Some(reference)) => {
             calculate_and_validate(body, reference)?;
-            calculate_and_validate(body, &digest)
+            calculate_and_validate(body, digest)
         }
-        (Some(digest), None) => calculate_and_validate(body, &digest),
+        (Some(digest), None) => calculate_and_validate(body, digest),
         (None, Some(reference)) => calculate_and_validate(body, reference),
         // If we have neither, just digest the body
         (None, None) => Ok(sha256_digest(body)),
@@ -128,23 +138,29 @@ pub fn validate_digest(
 }
 
 /// Helper for calculating and validating the digest of the given content
-fn calculate_and_validate(content: &[u8], digest: &str) -> Result<String> {
-    let parsed_digest = Digest::new(digest)?;
+fn calculate_and_validate(content: &[u8], parsed_digest: Digest) -> Result<String> {
     let digest_calculated = match parsed_digest.algorithm {
         "sha256" => format!("{:x}", sha2::Sha256::digest(content)),
         "sha384" => format!("{:x}", sha2::Sha384::digest(content)),
         "sha512" => format!("{:x}", sha2::Sha512::digest(content)),
         other => return Err(DigestError::UnsupportedAlgorithm(other.to_string())),
     };
-    let hex = format!("{}:{digest_calculated}", parsed_digest.algorithm);
+    let hex = Digest {
+        algorithm: parsed_digest.algorithm,
+        digest: &digest_calculated,
+    };
     tracing::debug!(%hex, "Computed digest of payload");
-    if hex != digest {
+    if hex != parsed_digest {
         return Err(DigestError::VerificationError {
-            expected: digest.to_owned(),
-            actual: hex,
+            expected: parsed_digest.to_string(),
+            actual: Digest {
+                algorithm: parsed_digest.algorithm,
+                digest: &digest_calculated,
+            }
+            .to_string(),
         });
     }
-    Ok(hex)
+    Ok(hex.to_string())
 }
 
 #[cfg(test)]
