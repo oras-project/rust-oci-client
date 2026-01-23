@@ -114,13 +114,13 @@ pub fn digest_header_value(headers: HeaderMap) -> Result<Option<String>> {
 /// digest. If both digests are provided, but they use different algorithms, then the header digest
 /// is returned after validation as according to the spec it is the "canonical" digest for the given
 /// content.
-pub(crate) fn validate_digest(
+pub fn validate_digest(
     body: &[u8],
     digest_header: Option<String>,
     reference_digest: Option<&str>,
 ) -> Result<String> {
     let digest_header = digest_header.as_ref().map(|s| Digest::new(s)).transpose()?;
-    let reference_digest = reference_digest.map(|s| Digest::new(s)).transpose()?;
+    let reference_digest = reference_digest.map(Digest::new).transpose()?;
     match (digest_header, reference_digest) {
         // If both digests are equal, then just calculate once
         (Some(digest), Some(reference)) if digest == reference => {
