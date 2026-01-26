@@ -312,12 +312,13 @@ impl TryFrom<ClientConfig> for Client {
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        for c in &config.extra_root_certificates {
-            let cert = match c.encoding {
-                CertificateEncoding::Der => reqwest::Certificate::from_der(c.data.as_slice())?,
-                CertificateEncoding::Pem => reqwest::Certificate::from_pem(c.data.as_slice())?,
-            };
-            client_builder = client_builder.add_root_certificate(cert);
+        {
+            if !config.tls_certs_only.is_empty() {
+                client_builder =
+                    client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+            }
+            client_builder = client_builder
+                .tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
         }
 
         if let Some(timeout) = config.read_timeout {
@@ -1938,6 +1939,21 @@ pub struct Certificate {
     pub data: Vec<u8>,
 }
 
+impl TryFrom<&Certificate> for reqwest::Certificate {
+    type Error = OciDistributionError;
+
+    fn try_from(cert: &Certificate) -> Result<Self> {
+        match cert.encoding {
+            CertificateEncoding::Der => Ok(reqwest::Certificate::from_der(cert.data.as_slice())?),
+            CertificateEncoding::Pem => Ok(reqwest::Certificate::from_pem(cert.data.as_slice())?),
+        }
+    }
+}
+
+fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
+    certs.iter().map(reqwest::Certificate::try_from).collect()
+}
+
 /// A client configuration
 pub struct ClientConfig {
     /// Which protocol the client should use
@@ -1952,6 +1968,12 @@ pub struct ClientConfig {
 
     /// Use monolithic push for pushing blobs. Defaults to false
     pub use_monolithic_push: bool,
+
+    /// Use only the provided certificate roots.
+    ///
+    /// This option disables any native or built-in roots, and **only** uses
+    /// the roots provided to this method.
+    pub tls_certs_only: Vec<Certificate>,
 
     /// A list of extra root certificate to trust. This can be used to connect
     /// to servers using self-signed certificates
@@ -2023,6 +2045,7 @@ impl Default for ClientConfig {
             accept_invalid_hostnames: false,
             accept_invalid_certificates: false,
             use_monolithic_push: false,
+            tls_certs_only: Vec::new(),
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
