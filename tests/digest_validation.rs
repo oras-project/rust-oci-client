@@ -48,7 +48,11 @@ async fn manifest_handler(
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert(DIGEST_HEADER, resp_digest.parse().unwrap());
+    if state.empty_digest {
+        headers.insert(DIGEST_HEADER, "".parse().unwrap());
+    } else {
+        headers.insert(DIGEST_HEADER, resp_digest.parse().unwrap());
+    }
     headers.insert(
         "Content-Type",
         "application/vnd.docker.distribution.manifest.v2+json"
@@ -103,6 +107,7 @@ struct ServerConfig {
     bad_config: bool,
     bad_blob: bool,
     blob_sha512: bool,
+    empty_digest: bool,
 }
 
 struct BadServer {
@@ -141,6 +146,7 @@ async fn test_bad_manifest() {
         bad_config: false,
         bad_blob: false,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
 
@@ -170,6 +176,7 @@ async fn test_bad_config() {
         bad_config: true,
         bad_blob: false,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
 
@@ -207,6 +214,7 @@ async fn test_bad_blob() {
         bad_config: false,
         bad_blob: true,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
     let client = Client::new(ClientConfig {
@@ -243,6 +251,7 @@ async fn test_good_pull() {
         bad_config: false,
         bad_blob: false,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
 
@@ -277,6 +286,7 @@ async fn test_different_reference_sha() {
         bad_config: false,
         bad_blob: false,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
 
@@ -318,6 +328,7 @@ async fn test_different_manifest_algos() {
         bad_config: false,
         bad_blob: false,
         blob_sha512: false,
+        empty_digest: false,
     })
     .await;
     let client = Client::new(ClientConfig {
@@ -346,6 +357,7 @@ async fn test_different_blob_algos() {
         bad_config: false,
         bad_blob: false,
         blob_sha512: true,
+        empty_digest: false,
     })
     .await;
 
@@ -371,4 +383,35 @@ async fn test_different_blob_algos() {
         )
         .await
         .expect("Expected a good pull");
+}
+
+#[tokio::test]
+async fn test_empty_digest_header() {
+    let server = BadServer::new(ServerConfig {
+        bad_manifest: false,
+        bad_config: false,
+        bad_blob: false,
+        blob_sha512: false,
+        empty_digest: true,
+    })
+    .await;
+
+    let client = Client::new(ClientConfig {
+        protocol: ClientProtocol::Http,
+        platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        ..Default::default()
+    });
+    let auth = &oci_client::secrets::RegistryAuth::Anonymous;
+
+    let reference = Reference::try_from(format!(
+        "{}/busybox@{}",
+        server.server,
+        MANIFEST_DIGEST.as_str()
+    ))
+    .expect("failed to parse reference");
+
+    client
+        .pull_manifest(&reference, auth)
+        .await
+        .expect("Expected empty digest header to be treated as missing");
 }

@@ -103,7 +103,12 @@ impl Digester {
 pub fn digest_header_value(headers: HeaderMap) -> Result<Option<String>> {
     headers
         .get(DOCKER_DIGEST_HEADER)
-        .map(|hv| hv.to_str().map(|s| s.to_string()))
+        .and_then(|hv| {
+            hv.to_str()
+                // Treat present but empty header as missing
+                .map(|s| (!s.is_empty()).then(|| s.to_string()))
+                .transpose()
+        })
         .transpose()
         .map_err(DigestError::from)
 }
