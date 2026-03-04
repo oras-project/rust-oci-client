@@ -1167,6 +1167,9 @@ impl Client {
             out.write_all(&bytes).await?;
         }
 
+        // Ensure all buffered writes are flushed before returning.
+        out.flush().await?;
+
         if let Some((mut digester, expected)) = maybe_header_digester.take() {
             let digest = digester.finalize();
 
