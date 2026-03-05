@@ -205,3 +205,106 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header};
+    use oci_spec::distribution::Reference;
+    use serde::Serialize;
+
+    // An opaque token as issued by registries like GHCR — not a JWT.
+    const OPAQUE_TOKEN: &str = "ghs_exampleOpaqueTokenFromGHCR1234567890";
+
+    #[derive(Serialize)]
+    struct ClaimsWithExp {
+        exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct ClaimsWithoutExp {
+        sub: &'static str,
+    }
+
+    fn make_jwt_with_exp(exp: u64) -> String {
+        jsonwebtoken::encode(
+            &Header::default(),
+            &ClaimsWithExp { exp },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("failed to encode JWT with exp")
+    }
+
+    fn make_jwt_without_exp() -> String {
+        jsonwebtoken::encode(
+            &Header::default(),
+            &ClaimsWithoutExp { sub: "test" },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("failed to encode JWT without exp")
+    }
+
+    #[test]
+    fn jwt_with_exp_uses_claims_expiration() {
+        let token = make_jwt_with_exp(9999999999);
+        let exp = parse_expiration_from_jwt(&token, 60)
+            .expect("should return Some for valid JWT with exp");
+        assert_eq!(exp, 9999999999);
+    }
+
+    #[test]
+    fn jwt_without_exp_uses_default_expiration() {
+        let token = make_jwt_without_exp();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp =
+            parse_expiration_from_jwt(&token, 60).expect("should return Some for JWT without exp");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(exp >= before + 60);
+        assert!(exp <= after + 60);
+    }
+
+    #[test]
+    fn opaque_token_uses_default_expiration() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = parse_expiration_from_jwt(OPAQUE_TOKEN, 60)
+            .expect("opaque token should return Some with default expiration");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(exp >= before + 60);
+        assert!(exp <= after + 60);
+    }
+
+    #[tokio::test]
+    async fn opaque_token_is_cached() {
+        let cache = TokenCache::new(60);
+        let reference: Reference = "ghcr.io/kubewarden/policies/pod-privileged:v1.0.10"
+            .parse()
+            .unwrap();
+        let token = RegistryTokenType::Bearer(RegistryToken::Token {
+            token: OPAQUE_TOKEN.to_string(),
+        });
+
+        cache
+            .insert(&reference, RegistryOperation::Pull, token)
+            .await;
+
+        assert!(
+            cache
+                .get(&reference, RegistryOperation::Pull)
+                .await
+                .is_some(),
+            "opaque bearer token should be cached"
+        );
+    }
+}
