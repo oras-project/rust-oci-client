@@ -185,6 +185,20 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
 
             Some(token_exp)
         }
+        Err(error) if error.kind() == &jsonwebtoken::errors::ErrorKind::InvalidToken => {
+            // The token is not a JWT (e.g., an opaque token issued by registries
+            // like GHCR). Use the default expiration as a best-effort assumption,
+            // mirroring the behaviour for JWT tokens that carry no `exp` claim.
+            let epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs();
+            debug!(
+                "Bearer token is not a JWT, assuming a {} seconds validity",
+                default_expiration_secs
+            );
+            Some(epoch + default_expiration_secs as u64)
+        }
         Err(error) => {
             warn!(?error, "Invalid bearer token");
             None
