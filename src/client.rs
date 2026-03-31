@@ -2295,6 +2295,7 @@ mod test {
 
     #[tokio::test]
     async fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let _ = tracing_subscriber::fmt::try_init();
         let client = Client::default();
         let header = jsonwebtoken::Header::default();
@@ -3250,7 +3251,7 @@ mod test {
 
         // Compute the digest of the returned manifest text.
         let digest = sha2::Sha256::digest(manifest);
-        let hex = format!("sha256:{digest:x}");
+        let hex = format!("sha256:{}", hex::encode(digest));
 
         // Validate that the computed digest and the digest in the pulled reference match.
         assert_eq!(image.digest().unwrap(), hex);

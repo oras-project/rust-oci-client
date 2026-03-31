@@ -135,7 +135,7 @@ mod tests {
     async fn test_verifying_stream() {
         // Test with correct SHA
         let data = b"Hello, world!";
-        let correct_sha = format!("sha256:{:x}", sha2::Sha256::digest(data));
+        let correct_sha = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
         let stream = VerifyingStream::new(
             Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
                 data,
@@ -176,7 +176,7 @@ mod tests {
         );
 
         // Test with correct SHA and header
-        let correct_header_sha = format!("sha512:{:x}", sha2::Sha512::digest(data));
+        let correct_header_sha = format!("sha512:{}", hex::encode(sha2::Sha512::digest(data)));
         let stream = VerifyingStream::new(
             Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
                 data,
