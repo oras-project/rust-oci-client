@@ -88,6 +88,13 @@ pub struct TagResponse {
     pub tags: Vec<String>,
 }
 
+/// The data returned by a successful catalog request.
+#[derive(Deserialize, Debug)]
+pub struct CatalogResponse {
+    /// List of available repositories in the registry.
+    pub repositories: Vec<String>,
+}
+
 /// Layer descriptor required to pull a layer
 pub struct LayerDescriptor<'a> {
     /// The digest of the layer
@@ -1618,6 +1625,53 @@ impl Client {
         Ok(manifest)
     }
 
+    /// Lists available repositories in the registry.
+    ///
+    /// Implements the OCI Distribution Spec catalog endpoint (`/v2/_catalog`).
+    /// Supports pagination via `n` (page size) and `last` (last repo from
+    /// previous page).
+    pub async fn catalog(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<CatalogResponse> {
+        let op = RegistryOperation::Pull;
+        let url = self.to_catalog_url(image);
+
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        let request = self.client.get(&url);
+        let request = if let Some(num) = n {
+            request.query(&[("n", num)])
+        } else {
+            request
+        };
+        let request = if let Some(l) = last {
+            request.query(&[("last", l)])
+        } else {
+            request
+        };
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: request,
+        };
+        let res = request
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        validate_registry_response(status, &body, &url)?;
+
+        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
+    }
+
     async fn extract_location_header(
         &self,
         image: &Reference,
@@ -1717,6 +1771,14 @@ impl Client {
                 .namespace()
                 .map(|ns| format!("?ns={ns}"))
                 .unwrap_or_default(),
+        )
+    }
+
+    fn to_catalog_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/_catalog",
+            scheme = self.config.protocol.scheme_for(registry),
         )
     }
 
@@ -2400,6 +2462,23 @@ mod test {
     }
 
     #[test]
+    fn test_to_catalog_url() {
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let c = Client::default();
+
+        assert_eq!(
+            c.to_catalog_url(&image),
+            "https://webassembly.azurecr.io/v2/_catalog"
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_catalog_url(&image),
+            "https://docker.mirror.io/v2/_catalog"
+        );
+    }
+
+    #[test]
     fn manifest_url_generation_respects_http_protocol() {
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2698,6 +2777,95 @@ mod test {
             .await
             .expect("Cannot list Tags");
         assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
+    }
+
+    #[cfg(feature = "test-registry")]
+    #[tokio::test]
+    async fn test_catalog() {
+        let test_container = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+        let auth =
+            RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
+
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        client
+            .auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _digest) = client
+            ._pull_image_manifest(&image)
+            .await
+            .expect("failed to pull manifest");
+
+        let image_data = client
+            .pull(&image, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
+            .await
+            .expect("failed to pull image");
+
+        // Push to two different repositories
+        for repo in &["hello-catalog-a", "hello-catalog-b"] {
+            let push_image: Reference = format!("localhost:{port}/{repo}:latest").parse().unwrap();
+            client
+                .auth(&push_image, &auth, RegistryOperation::Push)
+                .await
+                .expect("authenticated");
+            client
+                .push(
+                    &push_image,
+                    &image_data.layers,
+                    image_data.config.clone(),
+                    &auth,
+                    Some(manifest.clone()),
+                )
+                .await
+                .expect("Failed to push Image");
+        }
+
+        // Use any valid reference for the same registry to call catalog
+        let catalog_ref: Reference = format!("localhost:{port}/hello-catalog-a:latest")
+            .parse()
+            .unwrap();
+        let response = client
+            .catalog(&catalog_ref, &RegistryAuth::Anonymous, None, None)
+            .await
+            .expect("Cannot list catalog");
+        assert!(response
+            .repositories
+            .contains(&"hello-catalog-a".to_string()));
+        assert!(response
+            .repositories
+            .contains(&"hello-catalog-b".to_string()));
+
+        // Test pagination: request 1 result at a time
+        let page1 = client
+            .catalog(&catalog_ref, &RegistryAuth::Anonymous, Some(1), None)
+            .await
+            .expect("Cannot list catalog page 1");
+        assert_eq!(page1.repositories.len(), 1);
+
+        let page2 = client
+            .catalog(
+                &catalog_ref,
+                &RegistryAuth::Anonymous,
+                Some(1),
+                Some(&page1.repositories[0]),
+            )
+            .await
+            .expect("Cannot list catalog page 2");
+        assert_eq!(page2.repositories.len(), 1);
+        assert_ne!(page1.repositories[0], page2.repositories[0]);
     }
 
     #[tokio::test]
