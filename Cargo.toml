@@ -63,7 +63,7 @@ axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 rstest = "0.26"
 docker_credential = "1.3"
-hmac = "0.12"
+hmac = "0.13"
 jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 itertools = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
