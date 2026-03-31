@@ -30,11 +30,11 @@ lazy_static::lazy_static! {
 }
 
 fn digest(data: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(data))
+    format!("sha256:{}", hex::encode(Sha256::digest(data)))
 }
 
 fn digest_sha512(data: &[u8]) -> String {
-    format!("sha512:{:x}", Sha512::digest(data))
+    format!("sha512:{}", hex::encode(Sha512::digest(data)))
 }
 
 async fn manifest_handler(

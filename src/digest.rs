@@ -92,9 +92,9 @@ impl Digester {
 
     pub fn finalize(&mut self) -> String {
         match self {
-            Self::Sha256(d) => format!("sha256:{:x}", d.finalize_reset()),
-            Self::Sha384(d) => format!("sha384:{:x}", d.finalize_reset()),
-            Self::Sha512(d) => format!("sha512:{:x}", d.finalize_reset()),
+            Self::Sha256(d) => format!("sha256:{}", hex::encode(d.finalize_reset())),
+            Self::Sha384(d) => format!("sha384:{}", hex::encode(d.finalize_reset())),
+            Self::Sha512(d) => format!("sha512:{}", hex::encode(d.finalize_reset())),
         }
     }
 }
@@ -145,9 +145,9 @@ pub fn validate_digest(
 /// Helper for calculating and validating the digest of the given content
 fn calculate_and_validate(content: &[u8], parsed_digest: Digest) -> Result<String> {
     let digest_calculated = match parsed_digest.algorithm {
-        "sha256" => format!("{:x}", sha2::Sha256::digest(content)),
-        "sha384" => format!("{:x}", sha2::Sha384::digest(content)),
-        "sha512" => format!("{:x}", sha2::Sha512::digest(content)),
+        "sha256" => hex::encode(sha2::Sha256::digest(content)),
+        "sha384" => hex::encode(sha2::Sha384::digest(content)),
+        "sha512" => hex::encode(sha2::Sha512::digest(content)),
         other => return Err(DigestError::UnsupportedAlgorithm(other.to_string())),
     };
     let hex = Digest {
@@ -175,8 +175,8 @@ mod tests {
     #[test]
     fn test_validate_digest() {
         let body = b"hello world";
-        let digest_sha256 = format!("sha256:{:x}", sha2::Sha256::digest(body));
-        let digest_sha384 = format!("sha384:{:x}", sha2::Sha384::digest(body));
+        let digest_sha256 = format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)));
+        let digest_sha384 = format!("sha384:{}", hex::encode(sha2::Sha384::digest(body)));
 
         // Test case 1: Both digests are equal
         assert_eq!(

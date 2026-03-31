@@ -3251,7 +3251,7 @@ mod test {
 
         // Compute the digest of the returned manifest text.
         let digest = sha2::Sha256::digest(manifest);
-        let hex = format!("sha256:{digest:x}");
+        let hex = format!("sha256:{}", hex::encode(digest));
 
         // Validate that the computed digest and the digest in the pulled reference match.
         assert_eq!(image.digest().unwrap(), hex);
