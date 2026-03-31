@@ -24,3 +24,16 @@ pub use token_cache::RegistryOperation;
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", sha2::Sha256::digest(bytes))
 }
+
+#[cfg(test)]
+mod test_helpers {
+    use std::sync::OnceLock;
+
+    static PROVIDER_INIT: OnceLock<()> = OnceLock::new();
+
+    pub(crate) fn jsonwebtoken_install_default_crypto_provider() {
+        PROVIDER_INIT.get_or_init(|| {
+            let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+        });
+    }
+}

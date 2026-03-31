@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn jwt_with_exp_uses_claims_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_with_exp(9999999999);
         let exp = parse_expiration_from_jwt(&token, 60)
             .expect("should return Some for valid JWT with exp");
@@ -254,6 +255,7 @@ mod tests {
 
     #[test]
     fn jwt_without_exp_uses_default_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_without_exp();
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
