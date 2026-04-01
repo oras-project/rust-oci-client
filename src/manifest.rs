@@ -252,7 +252,9 @@ pub struct Versioned {
 
 /// The OCI descriptor is a generic object used to describe other objects.
 ///
-/// It is defined in the [OCI Image Specification](https://github.com/opencontainers/image-spec/blob/main/descriptor.md#properties):
+/// It is defined in the [OCI Image Specification][descriptor]:
+///
+/// [descriptor]: https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
@@ -290,6 +292,21 @@ pub struct OciDescriptor {
     /// <https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
+
+    /// This OPTIONAL property contains the type of an artifact when the descriptor
+    /// points to an artifact.
+    ///
+    /// This is the value of the config descriptor `mediaType` when the descriptor
+    /// references an [image manifest][manifest]. If defined, the value MUST comply
+    /// with [RFC 6838][rfc6838], including the [naming requirements in its section 4.2][rfc6838-s4.2],
+    /// and MAY be registered with [IANA][iana].
+    ///
+    /// [manifest]: https://github.com/opencontainers/image-spec/blob/v1.1.1/manifest.md
+    /// [rfc6838]: https://tools.ietf.org/html/rfc6838
+    /// [rfc6838-s4.2]: https://tools.ietf.org/html/rfc6838#section-4.2
+    /// [iana]: https://www.iana.org/assignments/media-types/media-types.xhtml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
 }
 
 impl std::fmt::Display for OciDescriptor {
@@ -299,8 +316,9 @@ impl std::fmt::Display for OciDescriptor {
 
         write!(
             f,
-            "( media-type: '{}', digest: '{}', size: '{}', urls: '{:?}', annotations: '{:?}' )",
-            self.media_type, self.digest, self.size, urls, annotations,
+            "( media-type: '{}', digest: '{}', size: '{}', urls: '{:?}', \
+            annotations: '{:?}', artifact_type: '{:?}' )",
+            self.media_type, self.digest, self.size, urls, annotations, self.artifact_type
         )
     }
 }
@@ -313,6 +331,7 @@ impl Default for OciDescriptor {
             size: 0,
             urls: None,
             annotations: None,
+            artifact_type: None,
         }
     }
 }
@@ -357,7 +376,9 @@ pub struct OciImageIndex {
 /// The manifest entry of an `ImageIndex`.
 ///
 /// It is part of the OCI specification, and is defined in the `manifests`
-/// section [here](https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions):
+/// section [here][image-index]:
+///
+/// [image-index]: https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md#image-index-property-descriptions
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageIndexEntry {
@@ -393,6 +414,13 @@ pub struct ImageIndexEntry {
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
+
+    /// This OPTIONAL property contains the artifact type of the manifest the index
+    /// entry is pointing to.
+    ///
+    /// See [`OciDescriptor::artifact_type`] for more information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
 }
 
 impl std::fmt::Display for ImageIndexEntry {
