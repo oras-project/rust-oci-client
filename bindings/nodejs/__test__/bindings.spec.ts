@@ -42,7 +42,11 @@ import {
   type PlatformSpec,
   type Manifest,
 } from '../index.js'
-import { MockRegistry, MANIFEST_DIGEST, CONFIG_DIGEST, BLOB_DIGEST } from './mock-registry.js'
+import {
+  MockRegistry,
+  MANIFEST_DIGEST, CONFIG_DIGEST, BLOB_DIGEST,
+  AMD64_MANIFEST_DIGEST, ARM64_MANIFEST_DIGEST, IMAGE_INDEX_DIGEST,
+} from './mock-registry.js'
 import { ZotRegistry, shouldSkipZotTests } from './zot-registry.js'
 
 // =============================================================================
@@ -467,6 +471,106 @@ test.serial('storeAuth - should store auth for later use', async (t) => {
 })
 
 // =============================================================================
+// Multi-Platform Image Tests (Mock Registry)
+// =============================================================================
+
+test.serial('multiarch pullManifest - should return Image Index with platform entries', async (t) => {
+  const result = await mockClient.pullManifest(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, IMAGE_INDEX_DIGEST)
+  t.is(result.manifest.manifestType, ManifestType.ImageIndex)
+  t.truthy(result.manifest.imageIndex)
+
+  const index = result.manifest.imageIndex!
+  t.is(index.manifests.length, 2)
+
+  const amd64Entry = index.manifests.find((m) => m.platform?.architecture === 'amd64')
+  t.truthy(amd64Entry)
+  t.is(amd64Entry!.platform!.os, 'linux')
+  t.is(amd64Entry!.digest, AMD64_MANIFEST_DIGEST)
+
+  const arm64Entry = index.manifests.find((m) => m.platform?.architecture === 'arm64')
+  t.truthy(arm64Entry)
+  t.is(arm64Entry!.platform!.os, 'linux')
+  t.is(arm64Entry!.digest, ARM64_MANIFEST_DIGEST)
+})
+
+test.serial('multiarch pullImageManifest - should select linux/amd64 with platform filter', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'amd64' },
+  })
+
+  const result = await client.pullImageManifest(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, AMD64_MANIFEST_DIGEST)
+  t.is(result.manifest.schemaVersion, 2)
+})
+
+test.serial('multiarch pullImageManifest - should select linux/arm64 with platform filter', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'arm64' },
+  })
+
+  const result = await client.pullImageManifest(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, ARM64_MANIFEST_DIGEST)
+  t.is(result.manifest.schemaVersion, 2)
+})
+
+test.serial('multiarch pullImageManifest - should fail for non-existent platform', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'freebsd', architecture: 's390x' },
+  })
+
+  const err = await t.throwsAsync(
+    client.pullImageManifest(
+      `${MOCK_REGISTRY}/test-multiarch:latest`,
+      anonymousAuth()
+    )
+  )
+
+  t.truthy(err)
+  t.true(err!.message.includes('no entry found'))
+})
+
+test.serial('multiarch pull - should pull full image with platform filter (linux/amd64)', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'amd64' },
+  })
+
+  const imageData: ImageData = await client.pull(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth(),
+    [IMAGE_LAYER_MEDIA_TYPE]
+  )
+
+  t.truthy(imageData)
+  t.truthy(imageData.layers)
+  t.is(imageData.layers.length, 1)
+  t.truthy(imageData.config)
+
+  const configJson = JSON.parse(imageData.config.data.toString('utf-8'))
+  t.is(configJson.architecture, 'amd64')
+  t.is(configJson.os, 'linux')
+})
+
+// =============================================================================
 // Push Tests with Zot Registry
 // =============================================================================
 
@@ -634,5 +738,182 @@ zotTest('push - should push a complete image using the push() method', async (t)
   t.is(pulledResult.manifest.manifestType, ManifestType.Image)
   const pulledManifest = pulledResult.manifest.image!
   t.is(pulledManifest.layers!.length, 2)
+})
+
+// =============================================================================
+// Multi-Platform Tests with Zot Registry
+// =============================================================================
+
+zotTest('pushManifestList + pullManifest - should round-trip platform fields', async (t) => {
+  const ZOT_MULTIARCH = zot.repo('test-multiarch-roundtrip')
+
+  // Push a minimal image for amd64
+  const amd64Config = Buffer.from(JSON.stringify({
+    architecture: 'amd64', os: 'linux',
+    config: {}, rootfs: { type: 'layers', diff_ids: [] },
+  }))
+  const amd64ConfigDigest = `sha256:${crypto.createHash('sha256').update(amd64Config).digest('hex')}`
+  const amd64Layer = Buffer.from('amd64-zot-layer-' + Date.now())
+  const amd64LayerDigest = `sha256:${crypto.createHash('sha256').update(amd64Layer).digest('hex')}`
+
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:amd64`, amd64Config, amd64ConfigDigest)
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:amd64`, amd64Layer, amd64LayerDigest)
+
+  const amd64Manifest: ImageManifest = {
+    schemaVersion: 2,
+    mediaType: OCI_IMAGE_MEDIA_TYPE,
+    config: { mediaType: IMAGE_CONFIG_MEDIA_TYPE, digest: amd64ConfigDigest, size: amd64Config.length },
+    layers: [{ mediaType: IMAGE_LAYER_MEDIA_TYPE, digest: amd64LayerDigest, size: amd64Layer.length }],
+  }
+  await zotClient.pushManifest(`${ZOT_MULTIARCH}:amd64`, { manifestType: ManifestType.Image, image: amd64Manifest })
+
+  // Push a minimal image for arm64
+  const arm64Config = Buffer.from(JSON.stringify({
+    architecture: 'arm64', os: 'linux',
+    config: {}, rootfs: { type: 'layers', diff_ids: [] },
+  }))
+  const arm64ConfigDigest = `sha256:${crypto.createHash('sha256').update(arm64Config).digest('hex')}`
+  const arm64Layer = Buffer.from('arm64-zot-layer-' + Date.now())
+  const arm64LayerDigest = `sha256:${crypto.createHash('sha256').update(arm64Layer).digest('hex')}`
+
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:arm64`, arm64Config, arm64ConfigDigest)
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:arm64`, arm64Layer, arm64LayerDigest)
+
+  const arm64Manifest: ImageManifest = {
+    schemaVersion: 2,
+    mediaType: OCI_IMAGE_MEDIA_TYPE,
+    config: { mediaType: IMAGE_CONFIG_MEDIA_TYPE, digest: arm64ConfigDigest, size: arm64Config.length },
+    layers: [{ mediaType: IMAGE_LAYER_MEDIA_TYPE, digest: arm64LayerDigest, size: arm64Layer.length }],
+  }
+  await zotClient.pushManifest(`${ZOT_MULTIARCH}:arm64`, { manifestType: ManifestType.Image, image: arm64Manifest })
+
+  // Get exact digests and sizes for the index entries
+  const amd64Digest = await zotClient.fetchManifestDigest(`${ZOT_MULTIARCH}:amd64`, anonymousAuth())
+  const arm64Digest = await zotClient.fetchManifestDigest(`${ZOT_MULTIARCH}:arm64`, anonymousAuth())
+  const amd64Raw = await zotClient.pullManifestRaw(`${ZOT_MULTIARCH}:amd64`, anonymousAuth(), [OCI_IMAGE_MEDIA_TYPE])
+  const arm64Raw = await zotClient.pullManifestRaw(`${ZOT_MULTIARCH}:arm64`, anonymousAuth(), [OCI_IMAGE_MEDIA_TYPE])
+
+  // Push the Image Index
+  const index: ImageIndex = {
+    schemaVersion: 2,
+    mediaType: OCI_IMAGE_INDEX_MEDIA_TYPE,
+    manifests: [
+      {
+        mediaType: OCI_IMAGE_MEDIA_TYPE,
+        digest: amd64Digest,
+        size: amd64Raw.length,
+        platform: { architecture: 'amd64', os: 'linux' },
+      },
+      {
+        mediaType: OCI_IMAGE_MEDIA_TYPE,
+        digest: arm64Digest,
+        size: arm64Raw.length,
+        platform: { architecture: 'arm64', os: 'linux' },
+      },
+    ],
+  }
+  await zotClient.pushManifestList(`${ZOT_MULTIARCH}:multiarch`, anonymousAuth(), index)
+
+  // Pull back and verify platform fields survived the round-trip
+  const pulled = await zotClient.pullManifest(`${ZOT_MULTIARCH}:multiarch`, anonymousAuth())
+  t.is(pulled.manifest.manifestType, ManifestType.ImageIndex)
+  const pulledIndex = pulled.manifest.imageIndex!
+  t.is(pulledIndex.manifests.length, 2)
+
+  const pulledAmd64 = pulledIndex.manifests.find((m) => m.digest === amd64Digest)
+  t.truthy(pulledAmd64)
+  t.is(pulledAmd64!.platform!.os, 'linux')
+  t.is(pulledAmd64!.platform!.architecture, 'amd64')
+
+  const pulledArm64 = pulledIndex.manifests.find((m) => m.digest === arm64Digest)
+  t.truthy(pulledArm64)
+  t.is(pulledArm64!.platform!.os, 'linux')
+  t.is(pulledArm64!.platform!.architecture, 'arm64')
+})
+
+zotTest('pullImageManifest - should select correct platform from multi-arch image via Zot', async (t) => {
+  const ZOT_MULTIARCH = zot.repo('test-multiarch-filter')
+
+  // Push amd64 image
+  const amd64Config = Buffer.from(JSON.stringify({
+    architecture: 'amd64', os: 'linux',
+    config: {}, rootfs: { type: 'layers', diff_ids: [] },
+  }))
+  const amd64ConfigDigest = `sha256:${crypto.createHash('sha256').update(amd64Config).digest('hex')}`
+  const amd64Layer = Buffer.from('amd64-filter-layer-' + Date.now())
+  const amd64LayerDigest = `sha256:${crypto.createHash('sha256').update(amd64Layer).digest('hex')}`
+
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:amd64`, amd64Config, amd64ConfigDigest)
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:amd64`, amd64Layer, amd64LayerDigest)
+  await zotClient.pushManifest(`${ZOT_MULTIARCH}:amd64`, {
+    manifestType: ManifestType.Image,
+    image: {
+      schemaVersion: 2,
+      mediaType: OCI_IMAGE_MEDIA_TYPE,
+      config: { mediaType: IMAGE_CONFIG_MEDIA_TYPE, digest: amd64ConfigDigest, size: amd64Config.length },
+      layers: [{ mediaType: IMAGE_LAYER_MEDIA_TYPE, digest: amd64LayerDigest, size: amd64Layer.length }],
+    },
+  })
+
+  // Push arm64 image
+  const arm64Config = Buffer.from(JSON.stringify({
+    architecture: 'arm64', os: 'linux',
+    config: {}, rootfs: { type: 'layers', diff_ids: [] },
+  }))
+  const arm64ConfigDigest = `sha256:${crypto.createHash('sha256').update(arm64Config).digest('hex')}`
+  const arm64Layer = Buffer.from('arm64-filter-layer-' + Date.now())
+  const arm64LayerDigest = `sha256:${crypto.createHash('sha256').update(arm64Layer).digest('hex')}`
+
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:arm64`, arm64Config, arm64ConfigDigest)
+  await zotClient.pushBlob(`${ZOT_MULTIARCH}:arm64`, arm64Layer, arm64LayerDigest)
+  await zotClient.pushManifest(`${ZOT_MULTIARCH}:arm64`, {
+    manifestType: ManifestType.Image,
+    image: {
+      schemaVersion: 2,
+      mediaType: OCI_IMAGE_MEDIA_TYPE,
+      config: { mediaType: IMAGE_CONFIG_MEDIA_TYPE, digest: arm64ConfigDigest, size: arm64Config.length },
+      layers: [{ mediaType: IMAGE_LAYER_MEDIA_TYPE, digest: arm64LayerDigest, size: arm64Layer.length }],
+    },
+  })
+
+  // Get exact digests and sizes
+  const amd64Digest = await zotClient.fetchManifestDigest(`${ZOT_MULTIARCH}:amd64`, anonymousAuth())
+  const arm64Digest = await zotClient.fetchManifestDigest(`${ZOT_MULTIARCH}:arm64`, anonymousAuth())
+  const amd64Raw = await zotClient.pullManifestRaw(`${ZOT_MULTIARCH}:amd64`, anonymousAuth(), [OCI_IMAGE_MEDIA_TYPE])
+  const arm64Raw = await zotClient.pullManifestRaw(`${ZOT_MULTIARCH}:arm64`, anonymousAuth(), [OCI_IMAGE_MEDIA_TYPE])
+
+  // Push Image Index
+  await zotClient.pushManifestList(`${ZOT_MULTIARCH}:multiarch`, anonymousAuth(), {
+    schemaVersion: 2,
+    mediaType: OCI_IMAGE_INDEX_MEDIA_TYPE,
+    manifests: [
+      {
+        mediaType: OCI_IMAGE_MEDIA_TYPE,
+        digest: amd64Digest,
+        size: amd64Raw.length,
+        platform: { architecture: 'amd64', os: 'linux' },
+      },
+      {
+        mediaType: OCI_IMAGE_MEDIA_TYPE,
+        digest: arm64Digest,
+        size: arm64Raw.length,
+        platform: { architecture: 'arm64', os: 'linux' },
+      },
+    ],
+  })
+
+  // Pull with platform filter -- this should select the amd64 manifest
+  const platformClient = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'amd64' },
+  })
+
+  const result = await platformClient.pullImageManifest(
+    `${ZOT_MULTIARCH}:multiarch`,
+    anonymousAuth()
+  )
+
+  t.is(result.digest, amd64Digest)
+  t.is(result.manifest.schemaVersion, 2)
 })
 
