@@ -249,8 +249,8 @@ impl ClientConfig {
         }
 
         if let Some(p) = &self.platform {
-            let os = Os::Other(p.os.clone());
-            let arch = Arch::Other(p.architecture.clone());
+            let os = Os::from(p.os.as_str());
+            let arch = Arch::from(p.architecture.as_str());
             let variant = p.variant.clone();
             config.platform_resolver = Some(Box::new(move |manifests| {
                 manifests
@@ -458,8 +458,8 @@ impl From<Platform> for PlatformSpec {
 impl From<PlatformSpec> for Platform {
     fn from(p: PlatformSpec) -> Self {
         Platform {
-            architecture: Arch::Other(p.architecture),
-            os: Os::Other(p.os),
+            architecture: Arch::from(p.architecture.as_str()),
+            os: Os::from(p.os.as_str()),
             os_version: p.os_version,
             os_features: p.os_features,
             variant: p.variant,
