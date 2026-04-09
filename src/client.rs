@@ -921,6 +921,29 @@ impl Client {
         self._pull_image_manifest(image).await
     }
 
+    /// Pull a manifest from the remote OCI Distribution service.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// Returns `(image_manifest, manifest_digest, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    pub async fn pull_image_manifest_and_list_digest(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(OciImageManifest, String, Option<String>)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_image_manifest_and_list_digest(image).await
+    }
+
     /// Pull a manifest from the remote OCI Distribution service without parsing it.
     ///
     /// The client will check if it's already been authenticated and if
@@ -966,25 +989,48 @@ impl Client {
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
     async fn _pull_image_manifest(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
+        let (manifest, digest, _list_digest) =
+            self._pull_image_manifest_and_list_digest(image).await?;
+        Ok((manifest, digest))
+    }
+
+    /// Pull an image manifest from the remote OCI Distribution service,
+    /// also returning the manifest list digest if the image is multi-arch.
+    ///
+    /// If the connection has already gone through authentication, this will
+    /// use the bearer token. Otherwise, this will attempt an anonymous pull.
+    ///
+    /// Returns `(image_manifest, manifest_digest, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    async fn _pull_image_manifest_and_list_digest(
+        &self,
+        image: &Reference,
+    ) -> Result<(OciImageManifest, String, Option<String>)> {
         let (manifest, digest) = self._pull_manifest(image).await?;
         match manifest {
-            OciManifest::Image(image_manifest) => Ok((image_manifest, digest)),
+            OciManifest::Image(image_manifest) => Ok((image_manifest, digest, None)),
             OciManifest::ImageIndex(image_index_manifest) => {
+                let list_digest = digest;
                 debug!("Inspecting Image Index Manifest");
-                let digest = if let Some(resolver) = &self.config.platform_resolver {
+                let platform_digest = if let Some(resolver) = &self.config.platform_resolver {
                     resolver(&image_index_manifest.manifests)
                 } else {
                     return Err(OciDistributionError::ImageIndexParsingNoPlatformResolverError);
                 };
 
-                match digest {
-                    Some(digest) => {
-                        debug!("Selected manifest entry with digest: {}", digest);
-                        let manifest_entry_reference = image.clone_with_digest(digest.clone());
+                match platform_digest {
+                    Some(platform_digest) => {
+                        debug!("Selected manifest entry with digest: {}", platform_digest);
+                        let manifest_entry_reference =
+                            image.clone_with_digest(platform_digest.clone());
                         self._pull_manifest(&manifest_entry_reference)
                             .await
                             .and_then(|(manifest, _digest)| match manifest {
-                                OciManifest::Image(manifest) => Ok((manifest, digest)),
+                                OciManifest::Image(manifest) => {
+                                    Ok((manifest, platform_digest, Some(list_digest)))
+                                }
                                 OciManifest::ImageIndex(_) => {
                                     Err(OciDistributionError::ImageManifestNotFoundError(
                                         "received Image Index manifest instead".to_string(),
@@ -1095,9 +1141,45 @@ impl Client {
                     digest,
                     String::from_utf8(config.data.into()).map_err(|e| {
                         OciDistributionError::GenericError(Some(format!(
-                            "Cannot not UTF8 compliant: {e}"
+                            "Cannot parse config as UTF-8 string: {e}"
                         )))
                     })?,
+                ))
+            })
+    }
+
+    /// Pull a manifest and its config from the remote OCI Distribution service.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// Returns `(image_manifest, manifest_digest, config_json, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    pub async fn pull_manifest_and_config_and_list_digest(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(OciImageManifest, String, String, Option<String>)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_manifest_and_config_and_list_digest(image)
+            .await
+            .and_then(|(manifest, digest, config, list_digest)| {
+                Ok((
+                    manifest,
+                    digest,
+                    String::from_utf8(config.data.into()).map_err(|e| {
+                        OciDistributionError::GenericError(Some(format!(
+                            "Cannot parse config as UTF-8 string: {e}"
+                        )))
+                    })?,
+                    list_digest,
                 ))
             })
     }
@@ -1106,14 +1188,30 @@ impl Client {
         &self,
         image: &Reference,
     ) -> Result<(OciImageManifest, String, Config)> {
-        let (manifest, digest) = self._pull_image_manifest(image).await?;
+        let (manifest, digest, config, _list_digest) = self
+            ._pull_manifest_and_config_and_list_digest(image)
+            .await?;
+        Ok((manifest, digest, config))
+    }
+
+    async fn _pull_manifest_and_config_and_list_digest(
+        &self,
+        image: &Reference,
+    ) -> Result<(OciImageManifest, String, Config, Option<String>)> {
+        let (manifest, digest, list_digest) =
+            self._pull_image_manifest_and_list_digest(image).await?;
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
         self.pull_blob(image, &manifest.config, &mut out).await?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
-        Ok((manifest, digest, Config::new(out, media_type, annotations)))
+        Ok((
+            manifest,
+            digest,
+            Config::new(out, media_type, annotations),
+            list_digest,
+        ))
     }
 
     /// Push a manifest list to an OCI registry.
