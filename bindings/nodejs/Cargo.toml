@@ -30,9 +30,6 @@ oci-spec.workspace = true
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Bytes for efficient buffer handling
-bytes = "1"
-
 # OpenSSL - optional, only for vendored builds (cross-compiled Linux targets)
 openssl = { version = "0.10", optional = true }
 
