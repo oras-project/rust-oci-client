@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "bindings/nodejs"]
+default-members = ["."]
 
 [workspace.package]
 version = "0.16.1"
