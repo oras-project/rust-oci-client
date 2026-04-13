@@ -1,0 +1,334 @@
+name: Node.js Bindings Build and Test Call
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  DEBUG: napi:*
+  APP_NAME: oci-client
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+  CARGO_INCREMENTAL: '1'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Oxlint
+        working-directory: bindings/nodejs
+        run: yarn lint
+
+  build:
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          # All targets use native-tls (platform TLS: Security.framework on macOS,
+          # OpenSSL on Linux, Schannel on Windows). This avoids aws-lc-sys
+          # cross-compilation issues and ensures consistent TLS behavior.
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: yarn napi build --platform --release --target x86_64-apple-darwin --no-default-features --features native-tls && yarn fix-const-enums
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: yarn napi build --platform --release --target aarch64-apple-darwin --no-default-features --features native-tls && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: yarn napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: yarn napi build --platform --release --target x86_64-pc-windows-msvc --no-default-features --features native-tls && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: yarn napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          # Cross-compiled Linux targets use vendored OpenSSL (compiled from source, since cross-toolchain sysroots don't ship it)
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: yarn napi build --platform --release --target x86_64-unknown-linux-musl -x --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: yarn napi build --platform --release --target aarch64-unknown-linux-musl -x --no-default-features --features native-tls-vendored && yarn fix-const-enums
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.napi-rs
+            .cargo-cache
+            target/
+          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock', 'bindings/nodejs/yarn.lock') }}
+          restore-keys: |
+            ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # ratchet:mlugg/setup-zig@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@85b24a67ef0c632dfefad70b9d5ce8fddb040754 # ratchet:taiki-e/install-action@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Build
+        working-directory: bindings/nodejs
+        run: ${{ matrix.settings.build }}
+        shell: bash
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: bindings/nodejs/${{ env.APP_NAME }}.*.node
+          if-no-files-found: error
+
+      - name: Upload generated JS/TS bindings
+        if: matrix.settings.target == 'aarch64-apple-darwin'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: bindings-js
+          path: |
+            bindings/nodejs/index.js
+            bindings/nodejs/index.d.ts
+          if-no-files-found: error
+
+  test-macOS-windows-binding:
+    name: Test - ${{ matrix.settings.target }} - node@${{ matrix.node }}
+    needs: build
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            architecture: x64
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            architecture: x64
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.settings.architecture }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Test bindings
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          # Skip Zot registry tests - no container runtime available on macOS/Windows CI
+          REQUIRE_PUSH_TESTS: 'false'
+
+  test-linux-x64-binding:
+    name: Test - x86_64-unknown-linux-gnu - node@${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Test bindings
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          REQUIRE_PUSH_TESTS: 'false'
+
+  test-linux-binding:
+    name: Test - ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set up QEMU
+        if: contains(matrix.target, 'aarch64')
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # ratchet:docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["current", "arm64", "x64"]'
+          yarn config set --json supportedArchitectures.libc '["current", "musl", "gnu"]'
+          yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-${{ matrix.target }}
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Test bindings in container
+        uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # ratchet:addnab/docker-run-action@v3
+        with:
+          image: node:${{ matrix.node }}${{ contains(matrix.target, 'musl') && '-alpine' || '-slim' }}
+          options: >-
+            ${{ contains(matrix.target, 'aarch64') && '--platform linux/arm64' || '' }}
+            -v ${{ github.workspace }}:/build -w /build/bindings/nodejs
+            -e REQUIRE_PUSH_TESTS=false
+          run: corepack enable && yarn test
+
+  test-zot-integration:
+    name: Integration Tests (Zot Registry)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Run integration tests with Zot registry
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          # Require push tests - Docker is available on ubuntu-latest
+          REQUIRE_PUSH_TESTS: 'true'
+          # Use Docker (pre-installed on GitHub Actions Ubuntu runners)
+          CONTAINER_RUNTIME: docker
