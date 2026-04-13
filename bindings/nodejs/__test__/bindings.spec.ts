@@ -8,7 +8,8 @@
  * Push tests use a Zot registry container (requires Docker or Podman).
  */
 
-import test from 'ava'
+import test, { registerCompletionHandler } from 'ava'
+registerCompletionHandler(() => process.exit(0))
 import * as crypto from 'crypto'
 import {
   OciClient,
