@@ -331,7 +331,10 @@ export class MockRegistry {
 
   async stop(): Promise<void> {
     if (this.server) {
-      return new Promise((resolve) => this.server!.close(() => resolve()))
+      return new Promise((resolve) => {
+        this.server!.close(() => resolve())
+        this.server!.closeAllConnections()
+      })
     }
   }
 }
