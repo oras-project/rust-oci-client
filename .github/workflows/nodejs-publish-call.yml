@@ -24,6 +24,10 @@ jobs:
         with:
           node-version: 22
 
+      - name: Verify version consistency
+        working-directory: bindings/nodejs
+        run: node scripts/sync-version.js --check
+
       - name: Enable Corepack
         run: corepack enable
 
