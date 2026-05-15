@@ -912,7 +912,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest)
+    /// A Tuple is returned containing the [OciImageManifest]
     /// and the manifest content digest hash.
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
@@ -1129,7 +1129,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest),
+    /// A Tuple is returned containing the [OciImageManifest],
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
     pub async fn pull_manifest_and_config(
@@ -1302,7 +1302,7 @@ impl Client {
     /// Stream a single layer from an OCI registry.
     ///
     /// This is a streaming version of [`Client::pull_blob`]. Returns [`SizedStream`], which
-    /// implements [`Stream`](futures_util::Stream) or can be used directly to get the content
+    /// implements [`Stream`] or can be used directly to get the content
     /// length of the response
     ///
     /// # Example
@@ -2149,7 +2149,7 @@ pub struct ClientConfig {
 
     /// A function that defines the client's behaviour if an Image Index Manifest
     /// (i.e Manifest List) is encountered when pulling an image.
-    /// Defaults to [current_platform_resolver](self::current_platform_resolver),
+    /// Defaults to [current_platform_resolver],
     /// which attempts to choose an image matching the running OS and Arch.
     ///
     /// If set to None, an error is raised if an Image Index manifest is received
@@ -2186,7 +2186,7 @@ pub struct ClientConfig {
 
     /// Set the `User-Agent` used by the client.
     ///
-    /// This defaults to [`DEFAULT_USER_AGENT`].
+    /// This defaults to `oci-client/<version>` where `<version>` is the crate version.
     pub user_agent: &'static str,
 
     /// Set the `HTTPS PROXY` used by the client.
