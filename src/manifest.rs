@@ -393,6 +393,14 @@ pub struct ImageIndexEntry {
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
+
+    /// This OPTIONAL property contains the type of an artifact.
+    ///
+    /// Used in the referrers list (from the OCI Distribution Spec referrers API
+    /// or the referrers tag schema) to identify the kind of artifact each entry
+    /// represents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
 }
 
 impl std::fmt::Display for ImageIndexEntry {
