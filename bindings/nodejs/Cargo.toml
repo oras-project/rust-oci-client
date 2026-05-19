@@ -1,0 +1,38 @@
+[package]
+name = "oci-client-nodejs-bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Node.js bindings for rust-oci-client"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["native-tls"]
+native-tls = ["oci-client/native-tls"]
+# Vendored OpenSSL for cross-compiled Linux targets where system OpenSSL isn't available
+native-tls-vendored = ["oci-client/native-tls", "openssl/vendored"]
+
+[dependencies]
+# NAPI-RS for Node.js bindings
+napi = { version = "3", default-features = false, features = ["async", "napi4", "tokio_rt"] }
+napi-derive = "3"
+
+# Core OCI client - path dependency to parent crate
+oci-client = { path = "../..", default-features = false }
+
+# OCI spec types for Platform arch/os enums
+oci-spec.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# OpenSSL - optional, only for vendored builds (cross-compiled Linux targets)
+openssl = { version = "0.10", optional = true }
+
+[build-dependencies]
+napi-build = "2"
+

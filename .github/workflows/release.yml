@@ -3,11 +3,31 @@ on:
   push:
     tags:
       - "v*"
+
 jobs:
+  verify-versions:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Node.js is pre-installed on GitHub-hosted Ubuntu runners
+      - name: Check version consistency
+        working-directory: bindings/nodejs
+        run: node scripts/sync-version.js --check --tag "$GITHUB_REF_NAME"
+
   publish:
     name: publish to crates.io
     runs-on: ubuntu-latest
+    needs: verify-versions
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: publish oci-distribution to crates.io
         run: cargo publish --token ${{ secrets.CargoToken }}
+
+  # Publish Node.js packages to npm
+  publish-nodejs-bindings:
+    name: Publish to npm
+    needs: verify-versions
+    uses: ./.github/workflows/nodejs-publish-call.yml
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

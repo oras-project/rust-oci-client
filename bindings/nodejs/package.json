@@ -1,0 +1,81 @@
+{
+  "name": "@oras-project/oci-client",
+  "version": "0.16.1",
+  "description": "Node.js bindings for rust-oci-client - OCI Distribution client",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.d.ts",
+    "index.js"
+  ],
+  "napi": {
+    "binaryName": "oci-client",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-musl"
+    ]
+  },
+  "engines": {
+    "node": ">= 22"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "yarn sync-version && napi build --platform --release && yarn fix-const-enums",
+    "build:debug": "yarn sync-version && napi build --platform && yarn fix-const-enums",
+    "fix-const-enums": "node scripts/fix-const-enums.js",
+    "lint": "oxlint .",
+    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
+    "test": "ava",
+    "version": "napi version",
+    "sync-version": "node scripts/sync-version.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.2.0",
+    "@oxc-node/core": "^0.0.35",
+    "@types/node": "^20.0.0",
+    "ava": "^6.4.1",
+    "oxlint": "^1.14.0",
+    "typescript": "^5.9.2"
+  },
+  "ava": {
+    "extensions": {
+      "ts": "module"
+    },
+    "timeout": "2m",
+    "workerThreads": false,
+    "environmentVariables": {
+      "OXC_TSCONFIG_PATH": "./__test__/tsconfig.json"
+    },
+    "nodeArguments": [
+      "--import",
+      "@oxc-node/core/register"
+    ]
+  },
+  "keywords": [
+    "oci",
+    "registry",
+    "container",
+    "docker",
+    "distribution",
+    "napi",
+    "rust",
+    "bindings"
+  ],
+  "author": "dfestal@redhat.com",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oras-project/rust-oci-client.git",
+    "directory": "bindings/nodejs"
+  },
+  "packageManager": "yarn@4.12.0"
+}
