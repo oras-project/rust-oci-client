@@ -1,6 +1,9 @@
 build +FLAGS='':
     cargo build {{FLAGS}}
 
+doc:
+    RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --workspace --all-features --no-deps
+
 test:
     cargo fmt --all -- --check
     cargo clippy --workspace

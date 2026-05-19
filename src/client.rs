@@ -912,7 +912,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest)
+    /// A Tuple is returned containing the [OciImageManifest]
     /// and the manifest content digest hash.
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
@@ -1129,7 +1129,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest),
+    /// A Tuple is returned containing the [OciImageManifest],
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
     pub async fn pull_manifest_and_config(
@@ -1302,7 +1302,7 @@ impl Client {
     /// Stream a single layer from an OCI registry.
     ///
     /// This is a streaming version of [`Client::pull_blob`]. Returns [`SizedStream`], which
-    /// implements [`Stream`](futures_util::Stream) or can be used directly to get the content
+    /// implements [`Stream`] or can be used directly to get the content
     /// length of the response
     ///
     /// # Example
@@ -1698,6 +1698,26 @@ impl Client {
     }
 
     /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
+    ///
+    /// Implements the [OCI Distribution Spec referrers API][oci-referrers] with an automatic
+    /// fallback to the [referrers tag schema][oci-tag-schema] when the registry returns a
+    /// `404 Not Found` for the native endpoint (as required by the spec).
+    ///
+    /// Many registries (e.g. ghcr.io) do not implement the native
+    /// `/v2/<name>/referrers/<digest>` endpoint and return 404 instead. The OCI spec
+    /// defines a fallback: the referrers index is stored as a regular OCI Image Index
+    /// under a tag derived from the subject digest by replacing `:` with `-`
+    /// (e.g. `sha256:abc…` → tag `sha256-abc…`).
+    ///
+    /// When the fallback is used, `artifact_type` filtering is applied client-side,
+    /// since the tag schema stores a single unfiltered index with no query-parameter
+    /// support.
+    ///
+    /// If both the native API and the tag schema fail, an empty `OciImageIndex` is
+    /// returned, as per the spec recommendation.
+    ///
+    /// [oci-referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+    /// [oci-tag-schema]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema
     pub async fn pull_referrers(
         &self,
         image: &Reference,
@@ -1716,11 +1736,97 @@ impl Client {
         let status = res.status();
         let body = res.bytes().await?;
 
+        // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
+        // registry does not support it; fall back to the referrers tag schema.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!(
+                url = %url,
+                "Native referrers API returned 404; falling back to OCI referrers tag schema"
+            );
+            return self
+                .pull_referrers_via_tag_schema(image, artifact_type)
+                .await;
+        }
+
         validate_registry_response(status, &body, &url)?;
         let manifest = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
         Ok(manifest)
+    }
+
+    /// Pulls the referrers index using the OCI referrers tag schema fallback.
+    ///
+    /// The tag is the subject digest with `:` replaced by `-`
+    /// (e.g. `sha256:abc…` → `sha256-abc…`).
+    ///
+    /// If `artifact_type` is provided, the returned index is filtered client-side
+    /// to include only entries whose `artifact_type` matches.
+    ///
+    /// If the tag does not exist or does not contain a valid image index, an empty
+    /// `OciImageIndex` is returned as per the OCI spec recommendation.
+    async fn pull_referrers_via_tag_schema(
+        &self,
+        image: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<OciImageIndex> {
+        let digest = image.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
+        let fallback_tag = digest.replace(':', "-");
+        let fallback_ref = Reference::with_tag(
+            image.resolve_registry().to_string(),
+            image.repository().to_string(),
+            fallback_tag.clone(),
+        );
+
+        debug!(
+            tag = %fallback_tag,
+            "Pulling referrers via tag schema"
+        );
+
+        let manifest = match self._pull_manifest(&fallback_ref).await {
+            Ok((manifest, _digest)) => manifest,
+            Err(e) => match &e {
+                OciDistributionError::ImageManifestNotFoundError(_)
+                | OciDistributionError::RegistryError { .. }
+                | OciDistributionError::ServerError { code: 404, .. } => {
+                    debug!(
+                        error = ?e,
+                        "Referrers tag schema not found; assuming no referrers"
+                    );
+                    return Ok(empty_image_index());
+                }
+                _ => return Err(e),
+            },
+        };
+
+        let mut index = match manifest {
+            OciManifest::ImageIndex(idx) => idx,
+            OciManifest::Image(_) => {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "referrers tag schema: tag '{fallback_tag}' contains an Image manifest; \
+                     expected an OCI Image Index"
+                )));
+            }
+        };
+
+        // Apply client-side artifact_type filtering when requested, since the tag
+        // schema stores a single unfiltered index.
+        if let Some(at) = artifact_type {
+            index.manifests.retain(|entry| {
+                entry
+                    .artifact_type
+                    .as_deref()
+                    .map(|t| t == at)
+                    .unwrap_or(false)
+            });
+        }
+
+        Ok(index)
     }
 
     /// Lists available repositories in the registry.
@@ -1946,6 +2052,17 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
     }
 }
 
+/// Returns an empty OCI Image Index, as used when no referrers exist.
+fn empty_image_index() -> OciImageIndex {
+    OciImageIndex {
+        schema_version: 2,
+        media_type: Some(crate::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        annotations: None,
+        manifests: vec![],
+    }
+}
+
 /// Converts a response into a stream
 fn stream_from_response(
     response: Response,
@@ -2149,7 +2266,7 @@ pub struct ClientConfig {
 
     /// A function that defines the client's behaviour if an Image Index Manifest
     /// (i.e Manifest List) is encountered when pulling an image.
-    /// Defaults to [current_platform_resolver](self::current_platform_resolver),
+    /// Defaults to [current_platform_resolver],
     /// which attempts to choose an image matching the running OS and Arch.
     ///
     /// If set to None, an error is raised if an Image Index manifest is received
@@ -2186,7 +2303,7 @@ pub struct ClientConfig {
 
     /// Set the `User-Agent` used by the client.
     ///
-    /// This defaults to [`DEFAULT_USER_AGENT`].
+    /// This defaults to `oci-client/<version>` where `<version>` is the crate version.
     pub user_agent: &'static str,
 
     /// Set the `HTTPS PROXY` used by the client.
@@ -3826,5 +3943,266 @@ mod test {
             .blob_exists(&reference, data_hash)
             .await
             .expect("failed to check blob existence"));
+    }
+
+    /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
+    /// return its digest.
+    ///
+    /// The manifest is pushed under the given `reference`.  The caller is responsible for
+    /// authenticating the client for push operations beforehand.
+    #[cfg(feature = "test-registry")]
+    async fn push_minimal_manifest(
+        client: &Client,
+        reference: &Reference,
+        artifact_type: Option<&str>,
+    ) -> String {
+        // Empty config blob.
+        let config_data = b"{}";
+        let config_digest = sha256_digest(config_data);
+        client
+            .push_blob(reference, config_data.as_slice(), &config_digest)
+            .await
+            .expect("failed to push config blob");
+
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: Some(manifest::OCI_IMAGE_MEDIA_TYPE.to_string()),
+            artifact_type: artifact_type.map(str::to_string),
+            config: OciDescriptor {
+                media_type: manifest::IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                digest: config_digest.clone(),
+                size: config_data.len() as i64,
+                ..Default::default()
+            },
+            layers: vec![],
+            subject: None,
+            annotations: None,
+        };
+
+        let oci_manifest = OciManifest::Image(manifest);
+        client
+            .push_manifest(reference, &oci_manifest)
+            .await
+            .expect("failed to push manifest")
+            // push_manifest returns the URL; extract the digest from the end
+            .rsplit('/')
+            .next()
+            .expect("manifest URL has no digest component")
+            .to_string()
+    }
+
+    /// `distribution/distribution` does not implement the native OCI referrers API — it returns 404 for
+    /// `/v2/<name>/referrers/<digest>`.  These tests verify that `pull_referrers` correctly
+    /// falls back to the referrers tag schema in that situation.
+    ///
+    /// Referrers support is being tracked upstream by this issue: https://github.com/distribution/distribution/issues/3716
+    ///
+    /// Setup overview:
+    ///   1. Push a "target" image manifest to get its digest.
+    ///   2. Manually build and push an `OciImageIndex` as the referrers tag
+    ///      (`sha256-<target-digest>`), containing descriptor entries for two
+    ///      hypothetical referrers with different `artifact_type` values.
+    ///   3. Call `pull_referrers` and verify that the fallback is used and the
+    ///      returned index contains the expected entries (both unfiltered and filtered).
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_pull_referrers_with_tag_schema_fallback() {
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
+            ..Default::default()
+        });
+
+        let repo = format!("localhost:{port}/referrers-test");
+
+        // --- Step 1: push the target manifest ---
+        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
+        client
+            .auth(
+                &target_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Push,
+            )
+            .await
+            .expect("failed to authenticate for push");
+        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
+
+        // --- Step 2: push a referrers tag index ---
+        //
+        // The tag is the target digest with ':' replaced by '-'.
+        // We include two descriptors so we can also test artifact_type filtering:
+        //   - one with artifact_type "application/vnd.test.sig"
+        //   - one with artifact_type "application/vnd.test.sbom"
+        const SIG_ARTIFACT_TYPE: &str = "application/vnd.test.sig";
+        const SBOM_ARTIFACT_TYPE: &str = "application/vnd.test.sbom";
+
+        // Push two real minimal manifests to use as referrer entries.
+        let sig_ref: Reference = format!("{repo}:sig").parse().unwrap();
+        let sig_digest = push_minimal_manifest(&client, &sig_ref, Some(SIG_ARTIFACT_TYPE)).await;
+
+        let sbom_ref: Reference = format!("{repo}:sbom").parse().unwrap();
+        let sbom_digest = push_minimal_manifest(&client, &sbom_ref, Some(SBOM_ARTIFACT_TYPE)).await;
+
+        // Pull the manifests back to get the accurate serialised sizes.
+        let (sig_raw, _) = client
+            .pull_manifest_raw(
+                &sig_ref,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull sig manifest raw");
+        let sig_size = sig_raw.len() as i64;
+
+        let (sbom_raw, _) = client
+            .pull_manifest_raw(
+                &sbom_ref,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull sbom manifest raw");
+        let sbom_size = sbom_raw.len() as i64;
+
+        let referrers_index = OciImageIndex {
+            schema_version: 2,
+            media_type: Some(manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+            artifact_type: None,
+            annotations: None,
+            manifests: vec![
+                ImageIndexEntry {
+                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                    digest: sig_digest,
+                    size: sig_size,
+                    artifact_type: Some(SIG_ARTIFACT_TYPE.to_string()),
+                    platform: None,
+                    annotations: None,
+                },
+                ImageIndexEntry {
+                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                    digest: sbom_digest,
+                    size: sbom_size,
+                    artifact_type: Some(SBOM_ARTIFACT_TYPE.to_string()),
+                    platform: None,
+                    annotations: None,
+                },
+            ],
+        };
+
+        let fallback_tag = target_digest.replace(':', "-");
+        let tag_ref: Reference = format!("{repo}:{fallback_tag}").parse().unwrap();
+        client
+            .push_manifest(&tag_ref, &OciManifest::ImageIndex(referrers_index))
+            .await
+            .expect("failed to push referrers tag index");
+
+        // --- Step 3: pull_referrers — no filter, expect both entries ---
+        let digest_ref = Reference::with_digest(
+            format!("localhost:{port}"),
+            "referrers-test".to_string(),
+            target_digest.clone(),
+        );
+        client
+            .auth(
+                &digest_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("failed to authenticate for pull");
+
+        let index = client
+            .pull_referrers(&digest_ref, None)
+            .await
+            .expect("pull_referrers failed");
+        assert_eq!(
+            index.manifests.len(),
+            2,
+            "expected 2 referrers (unfiltered), got {:?}",
+            index.manifests
+        );
+
+        // --- Step 4: pull_referrers — filtered by SIG_ARTIFACT_TYPE ---
+        let index_filtered = client
+            .pull_referrers(&digest_ref, Some(SIG_ARTIFACT_TYPE))
+            .await
+            .expect("pull_referrers with artifact_type filter failed");
+        assert_eq!(
+            index_filtered.manifests.len(),
+            1,
+            "expected 1 referrer after filtering by {SIG_ARTIFACT_TYPE}, got {:?}",
+            index_filtered.manifests
+        );
+        assert_eq!(
+            index_filtered.manifests[0].artifact_type.as_deref(),
+            Some(SIG_ARTIFACT_TYPE),
+        );
+    }
+
+    /// Verify that `pull_referrers` returns an empty index when neither the native referrers
+    /// API nor the referrers tag schema returns anything — i.e. the target image exists but
+    /// has no referrers at all.
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_pull_referrers_no_tag_schema() {
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
+            ..Default::default()
+        });
+
+        let repo = format!("localhost:{port}/referrers-none-test");
+
+        // Push a target manifest — but do NOT push any referrers tag.
+        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
+        client
+            .auth(
+                &target_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Push,
+            )
+            .await
+            .expect("failed to authenticate for push");
+        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
+
+        let digest_ref = Reference::with_digest(
+            format!("localhost:{port}"),
+            "referrers-none-test".to_string(),
+            target_digest,
+        );
+        client
+            .auth(
+                &digest_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("failed to authenticate for pull");
+
+        let index = client
+            .pull_referrers(&digest_ref, None)
+            .await
+            .expect("pull_referrers should succeed (returning empty index)");
+        assert!(
+            index.manifests.is_empty(),
+            "expected empty referrers index, got {:?}",
+            index.manifests
+        );
     }
 }
