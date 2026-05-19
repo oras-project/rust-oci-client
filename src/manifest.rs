@@ -437,8 +437,8 @@ impl std::fmt::Display for ImageIndexEntry {
 
         write!(
             f,
-            "(media-type: '{}', digest: '{}', size: '{}', platform: '{}', annotations: {:?})",
-            self.media_type, self.digest, self.size, platform, annotations,
+            "(media-type: '{}', digest: '{}', size: '{}', platform: '{}', annotations: {:?}, artifact_type: '{:?}')",
+            self.media_type, self.digest, self.size, platform, annotations, self.artifact_type,
         )
     }
 }
