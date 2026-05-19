@@ -1,7 +1,8 @@
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2025-0134", reason = "Transitive development dependency of `testcontainers`. We need to wait for a new release from upstream." },
     { id = "RUSTSEC-2023-0071", reason = "rsa side channel attack, no fix exists yet" },
+    { id = "RUSTSEC-2026-0118", reason = "transitive dependency of reqwest, waiting for reqwest upgrade" },
+    { id = "RUSTSEC-2026-0119", reason = "transitive dependency of reqwest, waiting for reqwest upgrade" },
 ]
 
 [licenses]
@@ -17,7 +18,6 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
-    "OpenSSL",
     "Unicode-3.0",
     "Zlib",
 ]
