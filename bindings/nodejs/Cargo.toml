@@ -24,6 +24,9 @@ napi-derive = "3"
 # Core OCI client - path dependency to parent crate
 oci-client = { path = "../..", default-features = false }
 
+# Non-poisoning mutex for interior mutability (already a transitive dep via tokio/h2)
+parking_lot = "0.12"
+
 # OCI spec types for Platform arch/os enums
 oci-spec.workspace = true
 

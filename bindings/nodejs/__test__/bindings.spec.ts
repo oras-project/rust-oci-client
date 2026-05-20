@@ -8,8 +8,7 @@
  * Push tests use a Zot registry container (requires Docker or Podman).
  */
 
-import test, { registerCompletionHandler } from 'ava'
-registerCompletionHandler(() => process.exit(0))
+import test from 'ava'
 import * as crypto from 'crypto'
 import {
   OciClient,
@@ -194,6 +193,20 @@ SIb3DQEBCwUAA0EAG9NxyMEKYE8fzhzLgDz7MQMP3XL7kDqPqRnvJQGLNJQrvSj5
 })
 
 // =============================================================================
+// Close Tests
+// =============================================================================
+
+test('close - should release the client and prevent further operations', async (t) => {
+  const client = new OciClient()
+  t.is(client.close(), true, 'first close returns true')
+  t.is(client.close(), false, 'second close returns false (idempotent)')
+  await t.throwsAsync(
+    () => client.pull('localhost:5000/test:latest', anonymousAuth(), []),
+    { message: /Client is closed/ },
+  )
+})
+
+// =============================================================================
 // Type Structure Tests
 // =============================================================================
 
@@ -341,6 +354,7 @@ test.before(async () => {
 })
 
 test.after(async () => {
+  mockClient.close()
   await mockRegistry.stop()
 })
 
@@ -591,6 +605,7 @@ if (!skipZot) {
   })
 
   test.after(async () => {
+    zotClient.close()
     await zot.stop()
   })
 }

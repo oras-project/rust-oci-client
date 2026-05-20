@@ -686,16 +686,23 @@ pub struct PullImageManifestResult {
 /// Provides pull, push, and manifest operations.
 #[napi]
 pub struct OciClient {
-    inner: Client,
+    inner: parking_lot::Mutex<Option<Client>>,
 }
 
 #[napi]
 impl OciClient {
+    fn client(&self) -> Result<Client> {
+        self.inner
+            .lock()
+            .clone()
+            .ok_or_else(|| Error::from_reason("Client is closed"))
+    }
+
     /// Create a new OCI client with default configuration.
     #[napi(constructor)]
     pub fn new() -> Self {
         OciClient {
-            inner: Client::default(),
+            inner: parking_lot::Mutex::new(Some(Client::default())),
         }
     }
 
@@ -703,8 +710,24 @@ impl OciClient {
     #[napi(factory)]
     pub fn with_config(config: ClientConfig) -> Self {
         OciClient {
-            inner: Client::new(config.to_native()),
+            inner: parking_lot::Mutex::new(Some(Client::new(config.to_native()))),
         }
+    }
+
+    /// Explicitly release the underlying connection pool.
+    ///
+    /// This is **idempotent** — calling `close()` on an already-closed client
+    /// is a safe no-op that returns `false`.
+    ///
+    /// **In-flight operations are not cancelled.** Any async method that already
+    /// cloned the inner client will run to completion; only the shared pool
+    /// reference held by the `OciClient` is dropped. The connection pool is
+    /// fully reclaimed when the last in-flight clone finishes.
+    ///
+    /// After `close()`, all subsequent method calls will throw `"Client is closed"`.
+    #[napi]
+    pub fn close(&self) -> bool {
+        self.inner.lock().take().is_some()
     }
 
     /// Pull an image from the registry.
@@ -719,13 +742,13 @@ impl OciClient {
         auth: RegistryAuth,
         accepted_media_types: Vec<String>,
     ) -> Result<ImageData> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
         let media_types: Vec<&str> = accepted_media_types.iter().map(|s| s.as_str()).collect();
 
-        let image_data = self
-            .inner
+        let image_data = client
             .pull(&reference, &native_auth, media_types)
             .await
             .map_err(|e| oci_error("Pull failed", e))?;
@@ -747,6 +770,7 @@ impl OciClient {
         auth: RegistryAuth,
         manifest: Option<ImageManifest>,
     ) -> Result<PushResponse> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image_ref)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
@@ -754,8 +778,7 @@ impl OciClient {
         let native_config = config.to_native();
         let native_manifest: Option<OciImageManifest> = manifest.map(|m| m.into());
 
-        let response = self
-            .inner
+        let response = client
             .push(
                 &reference,
                 &native_layers,
@@ -780,11 +803,11 @@ impl OciClient {
         image: String,
         artifact_type: Option<String>,
     ) -> Result<ImageIndex> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
 
-        let referrers = self
-            .inner
+        let referrers = client
             .pull_referrers(&reference, artifact_type.as_deref())
             .await
             .map_err(|e| oci_error("Pull referrers failed", e))?;
@@ -804,12 +827,13 @@ impl OciClient {
         auth: RegistryAuth,
         manifest: ImageIndex,
     ) -> Result<String> {
+        let client = self.client()?;
         let ref_parsed = Reference::from_str(&reference)
             .map_err(|e| Error::from_reason(format!("Invalid reference: {}", e)))?;
         let native_auth = auth.to_native()?;
         let native_manifest: OciImageIndex = manifest.into();
 
-        self.inner
+        client
             .push_manifest_list(&ref_parsed, &native_auth, native_manifest)
             .await
             .map_err(|e| oci_error("Push manifest list failed", e))
@@ -829,12 +853,12 @@ impl OciClient {
         image: String,
         auth: RegistryAuth,
     ) -> Result<PullImageManifestResult> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
 
-        let (manifest, digest) = self
-            .inner
+        let (manifest, digest) = client
             .pull_image_manifest(&reference, &native_auth)
             .await
             .map_err(|e| oci_error("Pull image manifest failed", e))?;
@@ -853,10 +877,9 @@ impl OciClient {
     /// This is useful for pre-authenticating before multiple operations.
     #[napi]
     pub async fn store_auth(&self, registry: String, auth: RegistryAuth) -> Result<()> {
+        let client = self.client()?;
         let native_auth = auth.to_native()?;
-        self.inner
-            .store_auth_if_needed(&registry, &native_auth)
-            .await;
+        client.store_auth_if_needed(&registry, &native_auth).await;
         Ok(())
     }
 
@@ -868,12 +891,12 @@ impl OciClient {
         image: String,
         auth: RegistryAuth,
     ) -> Result<PullManifestResult> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
 
-        let (manifest, digest) = self
-            .inner
+        let (manifest, digest) = client
             .pull_manifest(&reference, &native_auth)
             .await
             .map_err(|e| oci_error("Pull manifest failed", e))?;
@@ -892,13 +915,13 @@ impl OciClient {
         auth: RegistryAuth,
         accepted_media_types: Vec<String>,
     ) -> Result<Buffer> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
         let media_types: Vec<&str> = accepted_media_types.iter().map(|s| s.as_str()).collect();
 
-        let (bytes, _digest) = self
-            .inner
+        let (bytes, _digest) = client
             .pull_manifest_raw(&reference, &native_auth, &media_types)
             .await
             .map_err(|e| oci_error("Pull manifest raw failed", e))?;
@@ -910,6 +933,7 @@ impl OciClient {
     /// Returns the manifest URL.
     #[napi]
     pub async fn push_manifest(&self, image: String, manifest: Manifest) -> Result<String> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
 
@@ -917,7 +941,7 @@ impl OciClient {
             .try_into()
             .map_err(|e: String| Error::from_reason(e))?;
 
-        self.inner
+        client
             .push_manifest(&reference, &native_manifest)
             .await
             .map_err(|e| oci_error("Push manifest failed", e))
@@ -927,10 +951,11 @@ impl OciClient {
     /// Returns the blob digest.
     #[napi]
     pub async fn push_blob(&self, image: String, data: Buffer, digest: String) -> Result<String> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
 
-        self.inner
+        client
             .push_blob(&reference, data.to_vec(), &digest)
             .await
             .map_err(|e| oci_error("Push blob failed", e))
@@ -940,11 +965,12 @@ impl OciClient {
     /// Returns the blob data.
     #[napi]
     pub async fn pull_blob(&self, image: String, digest: String) -> Result<Buffer> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
 
         let mut data = Vec::new();
-        self.inner
+        client
             .pull_blob(&reference, digest.as_str(), &mut data)
             .await
             .map_err(|e| oci_error("Pull blob failed", e))?;
@@ -955,10 +981,11 @@ impl OciClient {
     /// Check if a blob exists in the registry.
     #[napi]
     pub async fn blob_exists(&self, image: String, digest: String) -> Result<bool> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
 
-        self.inner
+        client
             .blob_exists(&reference, &digest)
             .await
             .map_err(|e| oci_error("Blob exists check failed", e))
@@ -967,12 +994,13 @@ impl OciClient {
     /// Mount a blob from another repository.
     #[napi]
     pub async fn mount_blob(&self, target: String, source: String, digest: String) -> Result<()> {
+        let client = self.client()?;
         let target_ref = Reference::from_str(&target)
             .map_err(|e| Error::from_reason(format!("Invalid target reference: {}", e)))?;
         let source_ref = Reference::from_str(&source)
             .map_err(|e| Error::from_reason(format!("Invalid source reference: {}", e)))?;
 
-        self.inner
+        client
             .mount_blob(&target_ref, &source_ref, &digest)
             .await
             .map_err(|e| oci_error("Mount blob failed", e))
@@ -987,12 +1015,12 @@ impl OciClient {
         n: Option<u32>,
         last: Option<String>,
     ) -> Result<Vec<String>> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
 
-        let tags = self
-            .inner
+        let tags = client
             .list_tags(
                 &reference,
                 &native_auth,
@@ -1008,11 +1036,12 @@ impl OciClient {
     /// Fetch manifest digest without downloading the full manifest.
     #[napi]
     pub async fn fetch_manifest_digest(&self, image: String, auth: RegistryAuth) -> Result<String> {
+        let client = self.client()?;
         let reference = Reference::from_str(&image)
             .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
         let native_auth = auth.to_native()?;
 
-        self.inner
+        client
             .fetch_manifest_digest(&reference, &native_auth)
             .await
             .map_err(|e| oci_error("Fetch manifest digest failed", e))
