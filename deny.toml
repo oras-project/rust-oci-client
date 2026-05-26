@@ -1,8 +1,6 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa side channel attack, no fix exists yet" },
-    { id = "RUSTSEC-2026-0118", reason = "transitive dependency of reqwest, waiting for reqwest upgrade" },
-    { id = "RUSTSEC-2026-0119", reason = "transitive dependency of reqwest, waiting for reqwest upgrade" },
 ]
 
 [licenses]
