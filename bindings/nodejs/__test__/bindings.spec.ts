@@ -41,6 +41,8 @@ import {
   type Descriptor,
   type PlatformSpec,
   type Manifest,
+  type PullImageManifestAndListDigestResult,
+  type PullManifestAndConfigAndListDigestResult,
 } from '../index.js'
 import {
   MockRegistry,
@@ -182,6 +184,31 @@ SIb3DQEBCwUAA0EAG9NxyMEKYE8fzhzLgDz7MQMP3XL7kDqPqRnvJQGLNJQrvSj5
   const config: ClientConfig = {
     protocol: ClientProtocol.Https,
     extraRootCertificates: [
+      {
+        encoding: CertificateEncoding.Pem,
+        data: dummyCertPem,
+      },
+    ],
+  }
+  const client = OciClient.withConfig(config)
+  t.truthy(client)
+})
+
+test('OciClient.withConfig - should create client with tlsCertsOnly', (t) => {
+  const dummyCertPem = Buffer.from(`-----BEGIN CERTIFICATE-----
+MIIBkTCB+wIJAKHBfpB+dEzxMA0GCSqGSIb3DQEBCwUAMBExDzANBgNVBAMMBnVu
+dXNlZDAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAwMDBaMBExDzANBgNVBAMM
+BnVudXNlZDBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC5mG0lCDMvz/n9WQH7dlfN
+zQkFqW9sMSqvX9qPxN1LmQE7fv/9k1p7q8VDqy6RhDz1f9nNqvHXX1XqHqXJKJBp
+AgMBAAGjUzBRMB0GA1UdDgQWBBQJ7W7lXPqXtdJ9gJ8cKo9E7VtZyjAfBgNVHSME
+GDAWgBQJ7W7lXPqXtdJ9gJ8cKo9E7VtZyjAPBgNVHRMBAf8EBTADAQH/MA0GCSqG
+SIb3DQEBCwUAA0EAG9NxyMEKYE8fzhzLgDz7MQMP3XL7kDqPqRnvJQGLNJQrvSj5
+5M/hDp3eXrWzLgJPqPcC1H3B9cCNqLz8NB/32g==
+-----END CERTIFICATE-----`)
+
+  const config: ClientConfig = {
+    protocol: ClientProtocol.Https,
+    tlsCertsOnly: [
       {
         encoding: CertificateEncoding.Pem,
         data: dummyCertPem,
@@ -486,6 +513,47 @@ test.serial('storeAuth - should store auth for later use', async (t) => {
 })
 
 // =============================================================================
+// Catalog Tests (Mock Registry)
+// =============================================================================
+
+test.serial('catalog - should list repositories from mock registry', async (t) => {
+  const repos = await mockClient.catalog(
+    `${MOCK_REGISTRY}/test`,
+    anonymousAuth()
+  )
+
+  t.true(Array.isArray(repos))
+  t.true(repos.length > 0)
+  t.true(repos.includes('test'))
+  t.true(repos.includes('test-multiarch'))
+})
+
+test.serial('catalog - should support pagination with n parameter', async (t) => {
+  const repos = await mockClient.catalog(
+    `${MOCK_REGISTRY}/test`,
+    anonymousAuth(),
+    2
+  )
+
+  t.is(repos.length, 2)
+  t.is(repos[0], 'test')
+  t.is(repos[1], 'test-multiarch')
+})
+
+test.serial('catalog - should support pagination with n and last parameters', async (t) => {
+  const repos = await mockClient.catalog(
+    `${MOCK_REGISTRY}/test`,
+    anonymousAuth(),
+    2,
+    'test-multiarch'
+  )
+
+  t.is(repos.length, 2)
+  t.is(repos[0], 'library/alpine')
+  t.is(repos[1], 'library/nginx')
+})
+
+// =============================================================================
 // Multi-Platform Image Tests (Mock Registry)
 // =============================================================================
 
@@ -561,6 +629,58 @@ test.serial('multiarch pullImageManifest - should fail for non-existent platform
 
   t.truthy(err)
   t.true(err!.message.includes('no entry found'))
+})
+
+test.serial('multiarch pullImageManifestAndListDigest - should return list digest for multi-arch image', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'amd64' },
+  })
+
+  const result: PullImageManifestAndListDigestResult = await client.pullImageManifestAndListDigest(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, AMD64_MANIFEST_DIGEST)
+  t.is(result.manifest.schemaVersion, 2)
+  t.truthy(result.listDigest)
+  t.is(result.listDigest, IMAGE_INDEX_DIGEST)
+})
+
+test.serial('pullImageManifestAndListDigest - should return null list digest for single-platform image', async (t) => {
+  const result: PullImageManifestAndListDigestResult = await mockClient.pullImageManifestAndListDigest(
+    `${MOCK_REGISTRY}/test:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, MANIFEST_DIGEST)
+  t.is(result.manifest.schemaVersion, 2)
+  t.is(result.listDigest, undefined)
+})
+
+test.serial('multiarch pullManifestAndConfigAndListDigest - should return manifest, config and list digest', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Http,
+    platform: { os: 'linux', architecture: 'amd64' },
+  })
+
+  const result: PullManifestAndConfigAndListDigestResult = await client.pullManifestAndConfigAndListDigest(
+    `${MOCK_REGISTRY}/test-multiarch:latest`,
+    anonymousAuth()
+  )
+
+  t.truthy(result)
+  t.is(result.digest, AMD64_MANIFEST_DIGEST)
+  t.is(result.manifest.schemaVersion, 2)
+  t.truthy(result.config)
+  const configJson = JSON.parse(result.config)
+  t.is(configJson.architecture, 'amd64')
+  t.is(configJson.os, 'linux')
+  t.truthy(result.listDigest)
+  t.is(result.listDigest, IMAGE_INDEX_DIGEST)
 })
 
 test.serial('multiarch pull - should pull full image with platform filter (linux/amd64)', async (t) => {

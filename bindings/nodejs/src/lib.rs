@@ -168,6 +168,8 @@ pub struct ClientConfig {
     pub use_monolithic_push: Option<bool>,
     /// Extra root certificates to trust (for self-signed certificates)
     pub extra_root_certificates: Option<Vec<Certificate>>,
+    /// Exclusive root certificates -- disables system roots and only uses these
+    pub tls_certs_only: Option<Vec<Certificate>>,
     /// Maximum number of concurrent uploads during push (default: 16)
     pub max_concurrent_upload: Option<u32>,
     /// Maximum number of concurrent downloads during pull (default: 16)
@@ -214,6 +216,10 @@ impl ClientConfig {
 
         if let Some(certs) = &self.extra_root_certificates {
             config.extra_root_certificates = certs.iter().map(|c| c.to_native()).collect();
+        }
+
+        if let Some(certs) = &self.tls_certs_only {
+            config.tls_certs_only = certs.iter().map(|c| c.to_native()).collect();
         }
 
         if let Some(max) = self.max_concurrent_upload {
@@ -686,6 +692,30 @@ pub struct PullImageManifestResult {
     pub digest: String,
 }
 
+/// Result from pull_image_manifest_and_list_digest.
+#[napi(object)]
+pub struct PullImageManifestAndListDigestResult {
+    /// The pulled image manifest
+    pub manifest: ImageManifest,
+    /// The digest of the manifest
+    pub digest: String,
+    /// The digest of the parent manifest list/image index, if the manifest was resolved from one
+    pub list_digest: Option<String>,
+}
+
+/// Result from pull_manifest_and_config_and_list_digest.
+#[napi(object)]
+pub struct PullManifestAndConfigAndListDigestResult {
+    /// The pulled image manifest
+    pub manifest: ImageManifest,
+    /// The digest of the manifest
+    pub digest: String,
+    /// The config JSON as a string
+    pub config: String,
+    /// The digest of the parent manifest list/image index, if the manifest was resolved from one
+    pub list_digest: Option<String>,
+}
+
 // ============================================================================
 // Main Client - Mirrors the native Client
 // ============================================================================
@@ -1053,6 +1083,91 @@ impl OciClient {
             .fetch_manifest_digest(&reference, &native_auth)
             .await
             .map_err(|e| oci_error("Fetch manifest digest failed", e))
+    }
+
+    /// List available repositories in the registry.
+    /// Implements the OCI Distribution Spec catalog endpoint (`/v2/_catalog`).
+    /// Supports pagination via `n` (page size) and `last` (last repo from previous page).
+    #[napi]
+    pub async fn catalog(
+        &self,
+        image: String,
+        auth: RegistryAuth,
+        n: Option<u32>,
+        last: Option<String>,
+    ) -> Result<Vec<String>> {
+        let client = self.client()?;
+        let reference = Reference::from_str(&image)
+            .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
+        let native_auth = auth.to_native()?;
+
+        let catalog = client
+            .catalog(
+                &reference,
+                &native_auth,
+                n.map(|v| v as usize),
+                last.as_deref(),
+            )
+            .await
+            .map_err(|e| oci_error("Catalog listing failed", e))?;
+
+        Ok(catalog.repositories)
+    }
+
+    /// Pull an image manifest and the parent manifest list digest from the registry.
+    ///
+    /// Like `pullImageManifest`, but also returns the digest of the parent
+    /// manifest list/image index when the resolved manifest came from one.
+    /// This is needed for signature verification on multi-arch images.
+    #[napi]
+    pub async fn pull_image_manifest_and_list_digest(
+        &self,
+        image: String,
+        auth: RegistryAuth,
+    ) -> Result<PullImageManifestAndListDigestResult> {
+        let client = self.client()?;
+        let reference = Reference::from_str(&image)
+            .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
+        let native_auth = auth.to_native()?;
+
+        let (manifest, digest, list_digest) = client
+            .pull_image_manifest_and_list_digest(&reference, &native_auth)
+            .await
+            .map_err(|e| oci_error("Pull image manifest and list digest failed", e))?;
+
+        Ok(PullImageManifestAndListDigestResult {
+            manifest: manifest.into(),
+            digest,
+            list_digest,
+        })
+    }
+
+    /// Pull a manifest, its config, and the parent manifest list digest from the registry.
+    ///
+    /// Returns the image manifest, its digest, the config JSON as a string,
+    /// and the parent manifest list/image index digest when applicable.
+    #[napi]
+    pub async fn pull_manifest_and_config_and_list_digest(
+        &self,
+        image: String,
+        auth: RegistryAuth,
+    ) -> Result<PullManifestAndConfigAndListDigestResult> {
+        let client = self.client()?;
+        let reference = Reference::from_str(&image)
+            .map_err(|e| Error::from_reason(format!("Invalid image reference: {}", e)))?;
+        let native_auth = auth.to_native()?;
+
+        let (manifest, digest, config, list_digest) = client
+            .pull_manifest_and_config_and_list_digest(&reference, &native_auth)
+            .await
+            .map_err(|e| oci_error("Pull manifest and config and list digest failed", e))?;
+
+        Ok(PullManifestAndConfigAndListDigestResult {
+            manifest: manifest.into(),
+            digest,
+            config,
+            list_digest,
+        })
     }
 }
 

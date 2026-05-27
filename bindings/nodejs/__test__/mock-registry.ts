@@ -181,6 +181,12 @@ export class MockRegistry {
         return
       }
 
+      // /v2/_catalog
+      if (url.startsWith('/v2/_catalog')) {
+        this.serveCatalog(req, res, url)
+        return
+      }
+
       res.writeHead(404)
       res.end()
     })
@@ -243,6 +249,27 @@ export class MockRegistry {
       res.writeHead(200, { [DIGEST_HEADER]: digest })
       res.end(content)
     }
+  }
+
+  // --- Catalog endpoint ---
+
+  private serveCatalog(_req: http.IncomingMessage, res: http.ServerResponse, url: string) {
+    const allRepos = ['test', 'test-multiarch', 'library/alpine', 'library/nginx']
+    const params = new URL(url, 'http://localhost').searchParams
+    const n = params.get('n') ? parseInt(params.get('n')!, 10) : undefined
+    const last = params.get('last')
+
+    let repos = allRepos
+    if (last) {
+      const idx = repos.indexOf(last)
+      repos = idx >= 0 ? repos.slice(idx + 1) : repos
+    }
+    if (n !== undefined) {
+      repos = repos.slice(0, n)
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ repositories: repos }))
   }
 
   // --- Multi-arch routes (/v2/test-multiarch/...) ---
