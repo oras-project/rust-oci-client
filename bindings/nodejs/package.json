@@ -1,6 +1,6 @@
 {
   "name": "@oras-project/oci-client",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "description": "Node.js bindings for rust-oci-client - OCI Distribution client",
   "main": "index.js",
   "types": "index.d.ts",
