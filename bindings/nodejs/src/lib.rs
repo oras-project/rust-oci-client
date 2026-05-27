@@ -399,6 +399,8 @@ pub struct Descriptor {
     pub urls: Option<Vec<String>>,
     /// Optional annotations for this descriptor
     pub annotations: Option<BTreeMap<String, String>>,
+    /// Optional artifact type when the descriptor points to an artifact
+    pub artifact_type: Option<String>,
 }
 
 impl From<OciDescriptor> for Descriptor {
@@ -409,6 +411,7 @@ impl From<OciDescriptor> for Descriptor {
             size: d.size,
             urls: d.urls,
             annotations: d.annotations,
+            artifact_type: d.artifact_type,
         }
     }
 }
@@ -421,6 +424,7 @@ impl From<Descriptor> for OciDescriptor {
             size: d.size,
             urls: d.urls,
             annotations: d.annotations,
+            artifact_type: d.artifact_type,
         }
     }
 }
@@ -481,6 +485,8 @@ pub struct ManifestEntry {
     pub platform: Option<PlatformSpec>,
     /// Annotations
     pub annotations: Option<BTreeMap<String, String>>,
+    /// Optional artifact type for referrers
+    pub artifact_type: Option<String>,
 }
 
 impl From<ImageIndexEntry> for ManifestEntry {
@@ -491,6 +497,7 @@ impl From<ImageIndexEntry> for ManifestEntry {
             size: e.size,
             platform: e.platform.map(|p| p.into()),
             annotations: e.annotations,
+            artifact_type: e.artifact_type,
         }
     }
 }
@@ -503,6 +510,7 @@ impl From<ManifestEntry> for ImageIndexEntry {
             size: e.size,
             platform: e.platform.map(|p| p.into()),
             annotations: e.annotations,
+            artifact_type: e.artifact_type,
         }
     }
 }
