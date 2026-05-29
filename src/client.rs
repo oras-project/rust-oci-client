@@ -1986,28 +1986,39 @@ impl Client {
         )
     }
 
-    /// Convert a Reference to a v2 manifest URL.
+    /// Convert a Reference to a v2 referrers URL.
     fn to_v2_referrers_url(
         &self,
         reference: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<String> {
+        let digest = reference.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
         let registry = reference.resolve_registry();
-        Ok(format!(
-            "{scheme}://{registry}/v2/{repository}/referrers/{reference}{at}",
+        let base = format!(
+            "{scheme}://{registry}",
             scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            reference = if let Some(digest) = reference.digest() {
-                digest
-            } else {
-                return Err(OciDistributionError::GenericError(Some(
-                    "Getting referrers for a tag is not supported".into(),
-                )));
-            },
-            at = artifact_type
-                .map(|at| format!("?artifactType={at}"))
-                .unwrap_or_default(),
-        ))
+        );
+        let mut url =
+            Url::parse(&base).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                OciDistributionError::GenericError(Some(
+                    "cannot build referrers URL: base URL is cannot-be-a-base".into(),
+                ))
+            })?
+            .push("v2")
+            .extend(reference.repository().split('/'))
+            .push("referrers")
+            .push(digest);
+        if let Some(at) = artifact_type {
+            url.query_pairs_mut().append_pair("artifactType", at);
+        }
+        Ok(url.into())
     }
 }
 
@@ -2690,6 +2701,26 @@ mod test {
         assert_eq!(
             c.to_catalog_url(&image),
             "https://docker.mirror.io/v2/_catalog"
+        );
+    }
+
+    #[test]
+    fn test_to_v2_referrers_url() {
+        let image = Reference::try_from(HELLO_IMAGE_DIGEST).expect("failed to parse reference");
+        let c = Client::default();
+
+        // No filter: no query string.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, None).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"
+        );
+
+        // With filter: the artifactType value is percent-encoded. The `+` in `+json`
+        // media types must become `%2B`, otherwise standard query-string decoding turns
+        // it into a space and the registry filter matches nothing.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, Some("application/spdx+json")).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?artifactType=application%2Fspdx%2Bjson"
         );
     }
 
