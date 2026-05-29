@@ -2005,7 +2005,15 @@ impl Client {
                 )));
             },
             at = artifact_type
-                .map(|at| format!("?artifactType={at}"))
+                .map(|at| {
+                    format!(
+                        "?artifactType={}",
+                        percent_encoding::utf8_percent_encode(
+                            at,
+                            percent_encoding::NON_ALPHANUMERIC
+                        )
+                    )
+                })
                 .unwrap_or_default(),
         ))
     }
@@ -2690,6 +2698,26 @@ mod test {
         assert_eq!(
             c.to_catalog_url(&image),
             "https://docker.mirror.io/v2/_catalog"
+        );
+    }
+
+    #[test]
+    fn test_to_v2_referrers_url() {
+        let image = Reference::try_from(HELLO_IMAGE_DIGEST).expect("failed to parse reference");
+        let c = Client::default();
+
+        // No filter: no query string.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, None).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"
+        );
+
+        // With filter: the artifactType value is percent-encoded. The `+` in `+json`
+        // media types must become `%2B`, otherwise standard query-string decoding turns
+        // it into a space and the registry filter matches nothing.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, Some("application/spdx+json")).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?artifactType=application%2Fspdx%2Bjson"
         );
     }
 
