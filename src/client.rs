@@ -1986,36 +1986,39 @@ impl Client {
         )
     }
 
-    /// Convert a Reference to a v2 manifest URL.
+    /// Convert a Reference to a v2 referrers URL.
     fn to_v2_referrers_url(
         &self,
         reference: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<String> {
+        let digest = reference.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
         let registry = reference.resolve_registry();
-        Ok(format!(
-            "{scheme}://{registry}/v2/{repository}/referrers/{reference}{at}",
+        let base = format!(
+            "{scheme}://{registry}",
             scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            reference = if let Some(digest) = reference.digest() {
-                digest
-            } else {
-                return Err(OciDistributionError::GenericError(Some(
-                    "Getting referrers for a tag is not supported".into(),
-                )));
-            },
-            at = artifact_type
-                .map(|at| {
-                    format!(
-                        "?artifactType={}",
-                        percent_encoding::utf8_percent_encode(
-                            at,
-                            percent_encoding::NON_ALPHANUMERIC
-                        )
-                    )
-                })
-                .unwrap_or_default(),
-        ))
+        );
+        let mut url =
+            Url::parse(&base).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                OciDistributionError::GenericError(Some(
+                    "cannot build referrers URL: base URL is cannot-be-a-base".into(),
+                ))
+            })?
+            .push("v2")
+            .extend(reference.repository().split('/'))
+            .push("referrers")
+            .push(digest);
+        if let Some(at) = artifact_type {
+            url.query_pairs_mut().append_pair("artifactType", at);
+        }
+        Ok(url.into())
     }
 }
 

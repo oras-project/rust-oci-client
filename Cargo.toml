@@ -43,7 +43,6 @@ jsonwebtoken = { version = "10.3", default-features = false }
 lazy_static = "1.4"
 oci-spec = "0.9"
 olpc-cjson = "0.1"
-percent-encoding = "2.3"
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = [
   "json",
