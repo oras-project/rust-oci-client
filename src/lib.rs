@@ -11,7 +11,7 @@ pub(crate) mod digest;
 pub mod errors;
 pub mod manifest;
 pub mod secrets;
-mod token_cache;
+pub mod token_cache;
 
 #[doc(inline)]
 pub use client::Client;
