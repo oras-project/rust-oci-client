@@ -1,6 +1,7 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa side channel attack, no fix exists yet" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is no longer maintained. This is a dependency of oci-spec crate" },
 ]
 
 [licenses]
