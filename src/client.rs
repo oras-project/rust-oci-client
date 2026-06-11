@@ -805,7 +805,7 @@ impl Client {
         match auth_res.status() {
             reqwest::StatusCode::OK => {
                 let text = auth_res.text().await?;
-                debug!("Received response from auth request: {}", text);
+                debug!("Received response from auth request");
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
                 debug!("Successfully authorized for image '{:?}'", image);

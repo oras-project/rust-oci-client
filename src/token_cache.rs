@@ -178,7 +178,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
                         .expect("Time went backwards")
                         .as_secs();
                     let expiration = epoch + default_expiration_secs as u64;
-                    debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
+                    debug!("Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
                     expiration
                 }
             };
