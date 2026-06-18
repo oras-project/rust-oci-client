@@ -277,7 +277,8 @@ pub struct Client {
     config: Arc<ClientConfig>,
     // Registry -> RegistryAuth
     auth_store: Arc<RwLock<HashMap<String, RegistryAuth>>>,
-    tokens: TokenCache,
+    /// Token cache for the client
+    pub tokens: TokenCache,
     client: reqwest::Client,
     push_chunk_size: usize,
 }
