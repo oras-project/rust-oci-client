@@ -672,6 +672,24 @@ impl Client {
             .await
     }
 
+    /// Pushes a blob to the registry as a series of chunks from an input stream as monolithic
+    ///
+    /// Returns the pullable location of the blob
+    pub async fn push_blob_stream_monolithically<T: Stream<Item = Result<bytes::Bytes>> + Send + 'static>(
+        &self,
+        image: &Reference,
+        blob_data_stream: T,
+        blob_digest: &str,
+        size: usize,
+    ) -> Result<String> {
+        if self.config.use_monolithic_push {
+            let location = self.begin_push_monolithical_session(image).await?;
+            self.push_stream_monolithically(&location, image, blob_data_stream, size, blob_digest).await
+        } else {
+            self.push_blob_stream(image, blob_data_stream, blob_digest).await
+        }
+    }
+
     /// Pushes a blob to the registry as a series of chunks from an input stream
     ///
     /// Returns the pullable location of the blob
@@ -1497,6 +1515,43 @@ impl Client {
             .header("Content-Length", 0)
             .send()
             .await?;
+        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await
+    }
+
+    /// Pushes a layer to a registry as a monolithical blob.
+    ///
+    /// Returns the URL location for the next layer
+    async fn push_stream_monolithically(
+        &self,
+        location: &str,
+        image: &Reference,
+        layer: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+        size: usize,
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut url = Url::parse(location).unwrap();
+        url.query_pairs_mut().append_pair("digest", blob_digest);
+        let url = url.to_string();
+
+        debug!(size, location = ?url, "Pushing monolithically");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Length",
+            format!("{}", size).parse().unwrap(),
+        );
+        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
+            .into_request_builder()
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(layer))
+            .send()
+            .await?;
+
+        // Returns location
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
             .await
     }
