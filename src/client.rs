@@ -1259,7 +1259,13 @@ impl Client {
         let layer_digest = layer.as_layer_descriptor().digest.to_string();
         let mut layer_digester = Digester::new(&layer_digest)?;
 
-        let mut stream = response.error_for_status()?.bytes_stream();
+        let status = response.status();
+        let url = response.url().to_string();
+        if !status.is_success() {
+            let body = response.bytes().await?;
+            return validate_registry_response(status, &body, &url);
+        }
+        let mut stream = response.bytes_stream();
 
         let mut out = pin!(out);
 
@@ -1338,6 +1344,7 @@ impl Client {
             layer,
             true,
         )
+        .await
     }
 
     /// Stream a single layer from an OCI registry starting with a byte offset. This can be used to
@@ -1362,17 +1369,17 @@ impl Client {
 
         let status = response.status();
         match status {
-            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(
-                response, &layer, true,
-            )?)),
-            StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(stream_from_response(
-                response, &layer, false,
-            )?)),
-            _ => Err(OciDistributionError::ServerError {
-                code: status.as_u16(),
-                url: response.url().to_string(),
-                message: response.text().await?,
-            }),
+            StatusCode::OK => Ok(BlobResponse::Full(
+                stream_from_response(response, &layer, true).await?,
+            )),
+            StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(
+                stream_from_response(response, &layer, false).await?,
+            )),
+            _ => {
+                let url = response.url().to_string();
+                let body = response.bytes().await?;
+                Err(validate_registry_response(status, &body, &url).expect_err("validate_registry_response should return an error for non-success status codes"))
+            }
         }
     }
 
@@ -2075,17 +2082,22 @@ fn empty_image_index() -> OciImageIndex {
 }
 
 /// Converts a response into a stream
-fn stream_from_response(
+async fn stream_from_response(
     response: Response,
     layer: impl AsLayerDescriptor,
     verify: bool,
 ) -> Result<SizedStream> {
+    let status = response.status();
+    let url = response.url().to_string();
     let content_length = response.content_length();
     let headers = response.headers().clone();
-    let stream = response
-        .error_for_status()?
-        .bytes_stream()
-        .map_err(std::io::Error::other);
+    if !status.is_success() {
+        let body = response.bytes().await?;
+        return Err(validate_registry_response(status, &body, &url).expect_err(
+            "validate_registry_response should return an error for non-success status codes",
+        ));
+    }
+    let stream = response.bytes_stream().map_err(std::io::Error::other);
 
     let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
     let layer_digester = Digester::new(&expected_layer_digest)?;
