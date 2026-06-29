@@ -589,15 +589,27 @@ impl Client {
             None => OciImageManifest::build(layers, &config, None),
         };
 
-        // Upload layers
-        stream::iter(layers)
-            .map(|layer| {
+        // Upload layers.
+        //
+        // Reuse the per-layer digests already computed while building (or
+        // supplied with) the manifest, rather than hashing every layer a
+        // second time here. For large layers this avoids a full redundant
+        // SHA-256 pass over the data. When `build` produced the manifest its
+        // `layers` are in the same order as `layers`; if a caller supplied a
+        // manifest whose layer count does not match, fall back to hashing each
+        // layer so behaviour is unchanged.
+        let layer_digests: Vec<String> = if manifest.layers.len() == layers.len() {
+            manifest.layers.iter().map(|d| d.digest.clone()).collect()
+        } else {
+            layers.iter().map(|l| l.sha256_digest()).collect()
+        };
+        stream::iter(layers.iter().zip(layer_digests))
+            .map(|(layer, digest)| {
                 // This avoids moving `self` which is &Self
                 // into the async block. We only want to capture
                 // as &Self
                 let this = &self;
                 async move {
-                    let digest = layer.sha256_digest();
                     this.push_blob(image_ref, layer.data.clone(), &digest)
                         .await?;
                     Result::Ok(())
