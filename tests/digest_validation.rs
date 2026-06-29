@@ -9,8 +9,11 @@ use axum::{
 };
 use oci_client::{
     client::{linux_amd64_resolver, ClientConfig, ClientProtocol},
+    errors::{OciDistributionError, OciErrorCode},
+    manifest::OciDescriptor,
     Client, Reference,
 };
+use rstest::rstest;
 use sha2::{Digest, Sha256, Sha512};
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -19,6 +22,8 @@ const DIGEST_HEADER: &str = "Docker-Content-Digest";
 static MANIFEST: &[u8] = include_bytes!("./fixtures/manifest.json");
 static BLOB: &[u8] = include_bytes!("./fixtures/blob.tar.gz");
 static CONFIG: &[u8] = include_bytes!("./fixtures/config.json");
+static BLOB_UNKNOWN_BODY: &[u8] =
+    br#"{"errors":[{"code":"BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
 
 lazy_static::lazy_static! {
     static ref MANIFEST_DIGEST: String = digest(MANIFEST);
@@ -66,7 +71,7 @@ async fn manifest_handler(
 async fn blob_handler(
     State(state): State<ServerConfig>,
     Path(digest): Path<String>,
-) -> Result<(HeaderMap, &'static [u8]), StatusCode> {
+) -> Result<(HeaderMap, &'static [u8]), (StatusCode, &'static [u8])> {
     let (content, resp_digest) = match digest.as_str() {
         d if d == CONFIG_DIGEST.as_str() => (
             CONFIG,
@@ -92,7 +97,7 @@ async fn blob_handler(
                 BLOB_DIGEST.as_str()
             },
         ),
-        _ => return Err(StatusCode::NOT_FOUND),
+        _ => return Err((StatusCode::NOT_FOUND, BLOB_UNKNOWN_BODY)),
     };
 
     let mut headers = HeaderMap::new();
@@ -414,4 +419,117 @@ async fn test_empty_digest_header() {
         .pull_manifest(&reference, auth)
         .await
         .expect("Expected empty digest header to be treated as missing");
+}
+
+// Regression test for https://github.com/oras-project/rust-oci-client/issues/64:
+// pulling a blob that the registry doesn't have (404 with a BLOB_UNKNOWN envelope) must return an
+// error and must not write the error body into the caller's output buffer.
+#[tokio::test]
+async fn test_pull_blob_not_found() {
+    let server = BadServer::new(ServerConfig {
+        bad_manifest: false,
+        bad_config: false,
+        bad_blob: false,
+        blob_sha512: false,
+        empty_digest: false,
+    })
+    .await;
+
+    let client = Client::new(ClientConfig {
+        protocol: ClientProtocol::Http,
+        platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        ..Default::default()
+    });
+
+    let reference = Reference::try_from(format!(
+        "{}/busybox@{}",
+        server.server,
+        MANIFEST_DIGEST.as_str()
+    ))
+    .expect("failed to parse reference");
+
+    // A layer digest the mock registry doesn't know about, so the blob handler returns 404.
+    let bad_layer = OciDescriptor {
+        digest: "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .to_string(),
+        ..Default::default()
+    };
+
+    // pull_blob must return an error and must not leak the error body into the output buffer.
+    let mut buf: Vec<u8> = Vec::new();
+    let err = client
+        .pull_blob(&reference, &bad_layer, &mut buf)
+        .await
+        .expect_err("Expected an error pulling a missing blob");
+    assert!(
+        matches!(&err, OciDistributionError::RegistryError { envelope, .. }
+            if envelope.errors.iter().any(|e| e.code == OciErrorCode::BlobUnknown)),
+        "Expected a BlobUnknown registry error, got: {err}"
+    );
+    assert!(
+        buf.is_empty(),
+        "Expected no body to be written for a missing blob, got {} bytes",
+        buf.len()
+    );
+}
+
+enum StreamVariant {
+    Stream,
+    Partial,
+}
+
+// Regression test for https://github.com/oras-project/rust-oci-client/issues/64 (streaming path):
+// pulling a blob that the registry doesn't have (404 with a BLOB_UNKNOWN envelope) must return a
+// BlobUnknown registry error for both streaming variants.
+#[rstest]
+#[case::stream(StreamVariant::Stream)]
+#[case::partial(StreamVariant::Partial)]
+#[tokio::test]
+async fn test_pull_blob_stream_not_found(#[case] variant: StreamVariant) {
+    let server = BadServer::new(ServerConfig {
+        bad_manifest: false,
+        bad_config: false,
+        bad_blob: false,
+        blob_sha512: false,
+        empty_digest: false,
+    })
+    .await;
+
+    let client = Client::new(ClientConfig {
+        protocol: ClientProtocol::Http,
+        platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        ..Default::default()
+    });
+
+    let reference = Reference::try_from(format!(
+        "{}/busybox@{}",
+        server.server,
+        MANIFEST_DIGEST.as_str()
+    ))
+    .expect("failed to parse reference");
+
+    // A layer digest the mock registry doesn't know about, so the blob handler returns 404.
+    let bad_layer = OciDescriptor {
+        digest: "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .to_string(),
+        ..Default::default()
+    };
+
+    let err = match variant {
+        StreamVariant::Stream => client
+            .pull_blob_stream(&reference, &bad_layer)
+            .await
+            .err()
+            .expect("Expected an error streaming a missing blob"),
+        StreamVariant::Partial => client
+            .pull_blob_stream_partial(&reference, &bad_layer, 0, None)
+            .await
+            .err()
+            .expect("Expected an error partially streaming a missing blob"),
+    };
+    assert!(
+        matches!(&err, OciDistributionError::RegistryError { envelope, .. }
+            if envelope.errors.iter().any(|e| e.code == OciErrorCode::BlobUnknown)),
+        "Expected a BlobUnknown registry error, got: {err}"
+    );
 }
