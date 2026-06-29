@@ -17,7 +17,9 @@
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
       "aarch64-apple-darwin",
-      "aarch64-unknown-linux-musl"
+      "aarch64-unknown-linux-musl",
+      "s390x-unknown-linux-gnu",
+      "powerpc64le-unknown-linux-gnu"
     ]
   },
   "engines": {

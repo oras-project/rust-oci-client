@@ -66,6 +66,12 @@ jobs:
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
             build: yarn napi build --platform --release --target aarch64-unknown-linux-musl -x --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: s390x-unknown-linux-gnu
+            build: yarn napi build --platform --release --target s390x-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: powerpc64le-unknown-linux-gnu
+            build: yarn napi build --platform --release --target powerpc64le-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
@@ -244,6 +250,7 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
+          - powerpc64le-unknown-linux-gnu
         node: ['22', '24']
 
     steps:
@@ -258,15 +265,15 @@ jobs:
         run: corepack enable
 
       - name: Set up QEMU
-        if: contains(matrix.target, 'aarch64')
+        if: contains(matrix.target, 'aarch64') || contains(matrix.target, 'powerpc64le')
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # ratchet:docker/setup-qemu-action@v4
         with:
-          platforms: arm64
+          platforms: ${{ contains(matrix.target, 'aarch64') && 'arm64' || 'ppc64le' }}
 
       - name: Install dependencies
         working-directory: bindings/nodejs
         run: |
-          yarn config set --json supportedArchitectures.cpu '["current", "arm64", "x64"]'
+          yarn config set --json supportedArchitectures.cpu '["current", "arm64", "x64", "ppc64"]'
           yarn config set --json supportedArchitectures.libc '["current", "musl", "gnu"]'
           yarn install
 
@@ -282,15 +289,149 @@ jobs:
           name: bindings-js
           path: bindings/nodejs
 
+      - name: Pre-compile TypeScript tests on host
+        working-directory: bindings/nodejs
+        run: npx tsc -p __test__/tsconfig.json --outDir __test__
+
       - name: Test bindings in container
         uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # ratchet:addnab/docker-run-action@v3
         with:
           image: node:${{ matrix.node }}${{ contains(matrix.target, 'musl') && '-alpine' || '-slim' }}
           options: >-
-            ${{ contains(matrix.target, 'aarch64') && '--platform linux/arm64' || '' }}
+            ${{ contains(matrix.target, 'aarch64') && '--platform linux/arm64' || contains(matrix.target, 'powerpc64le') && '--platform linux/ppc64le' || '' }}
             -v ${{ github.workspace }}:/build -w /build/bindings/nodejs
             -e REQUIRE_PUSH_TESTS=false
-          run: corepack enable && yarn test
+          run: corepack enable && yarn ava --config ava-precompiled.config.mjs
+
+  # This job tests the s390x native binding inside a QEMU system VM.
+  # Why full VM? Docker has no linux/s390x platform support on GitHub runners.
+  # Why pre-compiled tests? The TypeScript compiler (@oxc-node/core) is a native
+  #   x86_64 binary that cannot run on s390x.
+  # Why V8 interpreter-only flags? All JS JIT compilers (Sparkplug, Maglev,
+  #   TurboFan) generate code that crashes under QEMU TCG s390x emulation.
+  #   WebAssembly (Liftoff) is left enabled so Node's built-in fetch works.
+  test-linux-system-emulation:
+    name: Test - s390x-unknown-linux-gnu - node@22 (direct QEMU boot)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Install QEMU system emulator for s390x
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qqy --no-install-recommends qemu-system-s390x
+
+      - name: Cache s390x boot assets
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5
+        id: cache-s390x-assets
+        with:
+          path: /tmp/ubuntu-s390x-assets
+          key: s390x-assets-noble-24.04-node-22.16.0-v1
+
+      - name: Download s390x boot assets
+        if: steps.cache-s390x-assets.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ubuntu-s390x-assets
+          BASE_URL="https://cloud-images.ubuntu.com/releases/noble/release/unpacked"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/vmlinuz "$BASE_URL/ubuntu-24.04-server-cloudimg-s390x-vmlinuz-generic"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/initrd.img "$BASE_URL/ubuntu-24.04-server-cloudimg-s390x-initrd-generic"
+          ROOT_URL="https://cloud-images.ubuntu.com/releases/noble/release"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/root.tar.xz "$ROOT_URL/ubuntu-24.04-server-cloudimg-s390x-root.tar.xz"
+          NODE_VERSION=22.16.0
+          NODE_SHA256=b3603dcbea7b1ef87cfd3bf986ff9697609359356d82334de6217838d3cce640
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-s390x.tar.xz"
+          echo "${NODE_SHA256}  /tmp/ubuntu-s390x-assets/node.tar.xz" | sha256sum -c -
+
+      - name: Setup node on host (for yarn install)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies on host
+        working-directory: bindings/nodejs
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["current", "s390x"]'
+          yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-s390x-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Pre-compile TypeScript tests on host
+        working-directory: bindings/nodejs
+        run: npx tsc -p __test__/tsconfig.json --outDir __test__
+
+      - name: Build s390x rootfs image
+        run: |
+          sudo mkdir -p /tmp/rootfs
+          sudo tar xf /tmp/ubuntu-s390x-assets/root.tar.xz -C /tmp/rootfs
+          sudo tar -xJf /tmp/ubuntu-s390x-assets/node.tar.xz -C /tmp/rootfs/usr/local --strip-components=1
+          sudo mkdir -p /tmp/rootfs/tmp/nodejs-test
+          sudo cp -a bindings/nodejs/. /tmp/rootfs/tmp/nodejs-test/
+          sudo mkdir -p /tmp/rootfs/tests/fixtures
+          sudo cp -a tests/fixtures/. /tmp/rootfs/tests/fixtures/
+
+          # VM init script (PID 1): mounts, runs tests, signals result, powers off
+          sudo tee /tmp/rootfs/run-test.sh > /dev/null << 'INITSCRIPT'
+          #!/bin/bash
+          set -o pipefail
+          export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          ip link set lo up 2>/dev/null || true
+          echo "=== s390x test runner ==="
+          echo "Node: $(node --version)"
+          cd /tmp/nodejs-test || exit 1
+          CI=true REQUIRE_PUSH_TESTS=false \
+            node --no-turbofan --no-maglev --no-sparkplug \
+            ./node_modules/.bin/ava --config ava-precompiled.config.mjs 2>&1 | tee /tmp/test-output.txt
+          TEST_EXIT=$?
+          if [ "$TEST_EXIT" -eq 0 ]; then echo "TEST_RESULT_CODE=0"
+          else dmesg; echo "TEST_RESULT_CODE=1"; fi
+          sync; sleep 1; echo o > /proc/sysrq-trigger; sleep infinity
+          INITSCRIPT
+          sudo chmod +x /tmp/rootfs/run-test.sh
+
+          truncate -s 4G /tmp/rootfs.img
+          sudo mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs /tmp/rootfs.img
+
+      - name: Run tests in s390x VM (direct QEMU boot)
+        run: |
+          timeout 600 qemu-system-s390x \
+            -M s390-ccw-virtio \
+            -m 1024 \
+            -nographic \
+            -kernel /tmp/ubuntu-s390x-assets/vmlinuz \
+            -initrd /tmp/ubuntu-s390x-assets/initrd.img \
+            -drive file=/tmp/rootfs.img,if=none,id=dr1,format=raw \
+            -device virtio-blk-ccw,drive=dr1,bootindex=1 \
+            -append "root=/dev/vda rw init=/run-test.sh console=ttysclp0 quiet loglevel=0" \
+            | tee /tmp/vm-output.log || true
+
+          # Check test result from serial output
+          if grep -q "TEST_RESULT_CODE=0" /tmp/vm-output.log; then
+            echo "Tests passed!"
+          else
+            echo "Tests failed or VM did not complete successfully"
+            echo "--- Last 50 lines of VM output ---"
+            tail -50 /tmp/vm-output.log
+            exit 1
+          fi
 
   test-zot-integration:
     name: Integration Tests (Zot Registry)
