@@ -695,15 +695,39 @@ impl Client {
             .await
     }
 
-    /// Pushes a blob to the registry as a series of chunks from an input stream
+    /// Pushes a blob to the registry from an input stream.
     ///
-    /// Returns the pullable location of the blob
-    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>>>(
+    /// If `use_monolithic_push` is set in the client config, a single PUT is used (monolithic
+    /// push). In that case `size` must be `Some`, as it is required to set `Content-Length` on the
+    /// request. If `size` is `None` and `use_monolithic_push` is true, an error is returned.
+    ///
+    /// If `use_monolithic_push` is false the blob is sent as a series of chunked PATCH requests
+    /// and `size` is ignored.
+    ///
+    /// Note: unlike [`push_blob`], there is no automatic fallback to monolithic push on a
+    /// `SpecViolationError` from the chunked path, because a stream cannot be replayed after
+    /// it has been consumed.
+    ///
+    /// Returns the pullable location of the blob.
+    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>> + Send + 'static>(
         &self,
         image: &Reference,
         blob_data_stream: T,
         blob_digest: &str,
+        size: Option<usize>,
     ) -> Result<String> {
+        if self.config.use_monolithic_push {
+            let size = size.ok_or_else(|| {
+                OciDistributionError::GenericError(Some(
+                    "size must be provided when use_monolithic_push is enabled".to_string(),
+                ))
+            })?;
+            let location = self.begin_push_monolithical_session(image).await?;
+            return self
+                .push_stream_monolithically(&location, image, blob_data_stream, size, blob_digest)
+                .await;
+        }
+
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut range_start = 0;
 
@@ -1520,6 +1544,48 @@ impl Client {
             .header("Content-Length", 0)
             .send()
             .await?;
+        self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await
+    }
+
+    /// Pushes a layer to a registry as a monolithical blob.
+    ///
+    /// Returns the URL location for the next layer
+    async fn push_stream_monolithically(
+        &self,
+        location: &str,
+        image: &Reference,
+        layer: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+        size: usize,
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut url =
+            Url::parse(location).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        url.query_pairs_mut().append_pair("digest", blob_digest);
+        let url = url.to_string();
+
+        debug!(size, location = ?url, "Pushing monolithically");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Length",
+            format!("{}", size)
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| {
+                    OciDistributionError::GenericError(Some(e.to_string()))
+                })?,
+        );
+        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
+            .into_request_builder()
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(layer))
+            .send()
+            .await?;
+
+        // Returns location
         self.extract_location_header(image, res, &reqwest::StatusCode::CREATED)
             .await
     }
@@ -3984,9 +4050,12 @@ mod test {
             .expect("failed to check blob existence"));
     }
 
+    #[rstest]
+    #[case::chunked(false)]
+    #[case::monolithic(true)]
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_push_stream() {
+    async fn test_push_stream(#[case] use_monolithic_push: bool) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -3999,30 +4068,34 @@ mod test {
 
         let mut client = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            use_monolithic_push,
             ..Default::default()
         });
         client.push_chunk_size = 253;
 
-        // hash for a byte array counting 16 times from 0 to 255 ([0, 1. 2...., 255] * 16)
+        // hash for a byte array counting 16 times from 0 to 255 ([0, 1, 2, ..., 255] * 16)
         let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
-        let data_stream = |repeat| {
-            futures_util::stream::repeat(Bytes::from_iter(0..=255))
-                .take(repeat)
+        let repeat = 16usize;
+        let chunk_size = 256usize; // Bytes::from_iter(0u8..=255)
+        let data_stream = |n| {
+            futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
+                .take(n)
                 .map(Ok)
         };
+        let size = Some(repeat * chunk_size);
 
         let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
             .expect("failed to parse reference");
 
         // Sanity check: verify that the server rejects the push if the blob has a mismatched digest
         client
-            .push_blob_stream(&reference, data_stream(1), data_hash)
+            .push_blob_stream(&reference, data_stream(1), data_hash, None)
             .await
             .expect_err("expected push to fail with mismatched digest");
 
         // Now push the stream with the correct digest
         client
-            .push_blob_stream(&reference, data_stream(16), data_hash)
+            .push_blob_stream(&reference, data_stream(repeat), data_hash, size)
             .await
             .expect("failed to push stream");
 
@@ -4030,6 +4103,39 @@ mod test {
             .blob_exists(&reference, data_hash)
             .await
             .expect("failed to check blob existence"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream_monolithic_requires_size() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            use_monolithic_push: true,
+            ..Default::default()
+        });
+
+        let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
+        let data_stream = futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
+            .take(16)
+            .map(Ok);
+
+        let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
+            .expect("failed to parse reference");
+
+        client
+            .push_blob_stream(&reference, data_stream, data_hash, None)
+            .await
+            .expect_err("expected error when use_monolithic_push is true but size is None");
     }
 
     /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
