@@ -9,10 +9,12 @@
  */
 
 import * as http from 'http'
+import * as https from 'https'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import { fileURLToPath } from 'url'
+import selfsigned from 'selfsigned'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -126,14 +128,52 @@ const MULTIARCH_MANIFESTS = new Map<string, Buffer>([
 
 const DIGEST_HEADER = 'Docker-Content-Digest'
 
+// ---------------------------------------------------------------------------
+// TLS: dynamically generated self-signed cert (via `selfsigned` package).
+// Generated fresh at test startup — no static certs that can expire.
+// ---------------------------------------------------------------------------
+
+interface TlsCerts {
+  cert: string
+  key: string
+  caCert: Buffer
+}
+
+let _tlsCerts: TlsCerts | null = null
+
+async function generateTlsCerts(): Promise<TlsCerts> {
+  if (_tlsCerts) return _tlsCerts
+  const notAfterDate = new Date()
+  notAfterDate.setDate(notAfterDate.getDate() + 30)
+  const pems = await selfsigned.generate(
+    [{ name: 'commonName', value: 'Mock Test CA' }],
+    {
+      notAfterDate,
+      keySize: 2048,
+      extensions: [
+        { name: 'subjectAltName', altNames: [{ type: 7, ip: '127.0.0.1' }, { type: 2, value: 'localhost' }] },
+        { name: 'extKeyUsage', serverAuth: true },
+        { name: 'basicConstraints', cA: true },
+      ],
+    },
+  )
+  _tlsCerts = { cert: pems.cert, key: pems.private, caCert: Buffer.from(pems.cert) }
+  return _tlsCerts
+}
+
+export { generateTlsCerts }
+
+// ---------------------------------------------------------------------------
+
 export interface MockConfig {
   badManifest?: boolean
   badConfig?: boolean
   badBlob?: boolean
+  tls?: boolean
 }
 
 export class MockRegistry {
-  private server: http.Server | null = null
+  private server: http.Server | https.Server | null = null
   private _port = 0
 
   constructor(private config: MockConfig = {}) {}
@@ -146,7 +186,7 @@ export class MockRegistry {
   }
 
   async start(): Promise<void> {
-    this.server = http.createServer((req, res) => {
+    const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       const url = req.url || ''
 
       // /v2/ - API version check
@@ -189,7 +229,14 @@ export class MockRegistry {
 
       res.writeHead(404)
       res.end()
-    })
+    }
+
+    if (this.config.tls) {
+      const tls = await generateTlsCerts()
+      this.server = https.createServer({ key: tls.key, cert: tls.cert }, handler)
+    } else {
+      this.server = http.createServer(handler)
+    }
 
     return new Promise((resolve) => {
       this.server!.listen(0, '127.0.0.1', () => {

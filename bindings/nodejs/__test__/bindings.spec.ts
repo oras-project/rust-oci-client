@@ -45,7 +45,7 @@ import {
   type PullManifestAndConfigAndListDigestResult,
 } from '../index.js'
 import {
-  MockRegistry,
+  MockRegistry, generateTlsCerts,
   MANIFEST_DIGEST, CONFIG_DIGEST, BLOB_DIGEST,
   AMD64_MANIFEST_DIGEST, ARM64_MANIFEST_DIGEST, IMAGE_INDEX_DIGEST,
 } from './mock-registry.js'
@@ -703,6 +703,76 @@ test.serial('multiarch pull - should pull full image with platform filter (linux
   const configJson = JSON.parse(imageData.config.data.toString('utf-8'))
   t.is(configJson.architecture, 'amd64')
   t.is(configJson.os, 'linux')
+})
+
+// =============================================================================
+// TLS Mock Registry Tests
+// =============================================================================
+
+let tlsRegistry: MockRegistry
+let TLS_REGISTRY: string
+let TLS_CA_CERT: Buffer
+
+test.before(async () => {
+  tlsRegistry = new MockRegistry({ tls: true })
+  await tlsRegistry.start()
+  TLS_REGISTRY = tlsRegistry.address
+  const tlsCerts = await generateTlsCerts()
+  TLS_CA_CERT = tlsCerts.caCert
+  console.log(`🔒 TLS mock registry started on ${TLS_REGISTRY}`)
+})
+
+test.after(async () => {
+  await tlsRegistry.stop()
+})
+
+test.serial('TLS - should connect with extraRootCertificates', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Https,
+    extraRootCertificates: [{
+      encoding: CertificateEncoding.Pem,
+      data: TLS_CA_CERT,
+    }],
+  })
+  const result = await client.pullManifest(`${TLS_REGISTRY}/test:latest`, anonymousAuth())
+  t.truthy(result.manifest)
+  t.is(result.digest, MANIFEST_DIGEST)
+  client.close()
+})
+
+test.serial('TLS - should connect with acceptInvalidCertificates', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Https,
+    acceptInvalidCertificates: true,
+  })
+  const result = await client.pullManifest(`${TLS_REGISTRY}/test:latest`, anonymousAuth())
+  t.truthy(result.manifest)
+  t.is(result.digest, MANIFEST_DIGEST)
+  client.close()
+})
+
+test.serial('TLS - should fail without CA cert (TLS is enforced)', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Https,
+  })
+  await t.throwsAsync(
+    () => client.pullManifest(`${TLS_REGISTRY}/test:latest`, anonymousAuth()),
+  )
+  client.close()
+})
+
+test.serial('TLS - should connect with tlsCertsOnly', async (t) => {
+  const client = OciClient.withConfig({
+    protocol: ClientProtocol.Https,
+    tlsCertsOnly: [{
+      encoding: CertificateEncoding.Pem,
+      data: TLS_CA_CERT,
+    }],
+  })
+  const result = await client.pullManifest(`${TLS_REGISTRY}/test:latest`, anonymousAuth())
+  t.truthy(result.manifest)
+  t.is(result.digest, MANIFEST_DIGEST)
+  client.close()
 })
 
 // =============================================================================

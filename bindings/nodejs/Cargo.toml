@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [features]
 default = ["native-tls"]
 native-tls = ["oci-client/native-tls"]
+rustls-tls = ["oci-client/rustls-tls"]
 # Vendored OpenSSL for cross-compiled Linux targets where system OpenSSL isn't available
 native-tls-vendored = ["oci-client/native-tls", "openssl/vendored"]
 
