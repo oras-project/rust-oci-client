@@ -167,8 +167,20 @@ List tags for a repository. Supports pagination via `n` (page size) and `last` (
 #### `fetchManifestDigest(image, auth)`
 Fetch a manifest's digest without downloading the full manifest content. Returns the digest string.
 
+#### `catalog(image, auth, n?, last?)`
+List available repositories in the registry (OCI Distribution Spec `/v2/_catalog`). Supports pagination via `n` (page size) and `last` (last repo from previous page). Returns `string[]`.
+
+#### `pullImageManifestAndListDigest(image, auth)`
+Like `pullImageManifest`, but also returns the digest of the parent manifest list/image index when the resolved manifest came from one. Returns `{ manifest, digest, listDigest }`.
+
+#### `pullManifestAndConfigAndListDigest(image, auth)`
+Pull a manifest, its config JSON, and the parent manifest list digest. Returns `{ manifest, digest, config, listDigest }`.
+
 #### `storeAuth(registry, auth)`
 Pre-authenticate with a registry. Useful for storing credentials before performing multiple operations.
+
+#### `close()`
+Explicitly release the underlying connection pool. Idempotent — returns `true` on first call, `false` on subsequent calls. After `close()`, all method calls will throw `"Client is closed"`.
 
 ### Types
 
@@ -202,6 +214,8 @@ yarn lint
 - Linux ARM64 (glibc)
 - Linux x64 (musl/Alpine)
 - Linux ARM64 (musl/Alpine)
+- Linux s390x (glibc)
+- Linux ppc64le (glibc)
 
 ## Contributing
 
