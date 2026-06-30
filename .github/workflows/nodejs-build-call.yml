@@ -1,0 +1,475 @@
+name: Node.js Bindings Build and Test Call
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  DEBUG: napi:*
+  APP_NAME: oci-client
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+  CARGO_INCREMENTAL: '1'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Oxlint
+        working-directory: bindings/nodejs
+        run: yarn lint
+
+  build:
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          # All targets use native-tls (platform TLS: Security.framework on macOS,
+          # OpenSSL on Linux, Schannel on Windows). This avoids aws-lc-sys
+          # cross-compilation issues and ensures consistent TLS behavior.
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: yarn napi build --platform --release --target x86_64-apple-darwin --no-default-features --features native-tls && yarn fix-const-enums
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: yarn napi build --platform --release --target aarch64-apple-darwin --no-default-features --features native-tls && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: yarn napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: yarn napi build --platform --release --target x86_64-pc-windows-msvc --no-default-features --features native-tls && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: yarn napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          # Cross-compiled Linux targets use vendored OpenSSL (compiled from source, since cross-toolchain sysroots don't ship it)
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: yarn napi build --platform --release --target x86_64-unknown-linux-musl -x --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: yarn napi build --platform --release --target aarch64-unknown-linux-musl -x --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: s390x-unknown-linux-gnu
+            build: yarn napi build --platform --release --target s390x-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+          - host: ubuntu-latest
+            target: powerpc64le-unknown-linux-gnu
+            build: yarn napi build --platform --release --target powerpc64le-unknown-linux-gnu --use-napi-cross --no-default-features --features native-tls-vendored && yarn fix-const-enums
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.napi-rs
+            .cargo-cache
+            target/
+          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock', 'bindings/nodejs/yarn.lock') }}
+          restore-keys: |
+            ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # ratchet:mlugg/setup-zig@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@85b24a67ef0c632dfefad70b9d5ce8fddb040754 # ratchet:taiki-e/install-action@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Build
+        working-directory: bindings/nodejs
+        run: ${{ matrix.settings.build }}
+        shell: bash
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: bindings/nodejs/${{ env.APP_NAME }}.*.node
+          if-no-files-found: error
+
+      - name: Upload generated JS/TS bindings
+        if: matrix.settings.target == 'aarch64-apple-darwin'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: bindings-js
+          path: |
+            bindings/nodejs/index.js
+            bindings/nodejs/index.d.ts
+          if-no-files-found: error
+
+  test-macOS-windows-binding:
+    name: Test - ${{ matrix.settings.target }} - node@${{ matrix.node }}
+    needs: build
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            architecture: x64
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            architecture: x64
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.settings.architecture }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Test bindings
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          # Skip Zot registry tests - no container runtime available on macOS/Windows CI
+          REQUIRE_PUSH_TESTS: 'false'
+
+  test-linux-x64-binding:
+    name: Test - x86_64-unknown-linux-gnu - node@${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Test bindings
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          REQUIRE_PUSH_TESTS: 'false'
+
+  test-linux-binding:
+    name: Test - ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - powerpc64le-unknown-linux-gnu
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set up QEMU
+        if: contains(matrix.target, 'aarch64') || contains(matrix.target, 'powerpc64le')
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # ratchet:docker/setup-qemu-action@v4
+        with:
+          platforms: ${{ contains(matrix.target, 'aarch64') && 'arm64' || 'ppc64le' }}
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["current", "arm64", "x64", "ppc64"]'
+          yarn config set --json supportedArchitectures.libc '["current", "musl", "gnu"]'
+          yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-${{ matrix.target }}
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Pre-compile TypeScript tests on host
+        working-directory: bindings/nodejs
+        run: npx tsc -p __test__/tsconfig.json --outDir __test__
+
+      - name: Test bindings in container
+        uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # ratchet:addnab/docker-run-action@v3
+        with:
+          image: node:${{ matrix.node }}${{ contains(matrix.target, 'musl') && '-alpine' || '-slim' }}
+          options: >-
+            ${{ contains(matrix.target, 'aarch64') && '--platform linux/arm64' || contains(matrix.target, 'powerpc64le') && '--platform linux/ppc64le' || '' }}
+            -v ${{ github.workspace }}:/build -w /build/bindings/nodejs
+            -e REQUIRE_PUSH_TESTS=false
+          run: corepack enable && yarn ava --config ava-precompiled.config.mjs
+
+  # This job tests the s390x native binding inside a QEMU system VM.
+  # Why full VM? Docker has no linux/s390x platform support on GitHub runners.
+  # Why pre-compiled tests? The TypeScript compiler (@oxc-node/core) is a native
+  #   x86_64 binary that cannot run on s390x.
+  # Why V8 interpreter-only flags? All JS JIT compilers (Sparkplug, Maglev,
+  #   TurboFan) generate code that crashes under QEMU TCG s390x emulation.
+  #   WebAssembly (Liftoff) is left enabled so Node's built-in fetch works.
+  test-linux-system-emulation:
+    name: Test - s390x-unknown-linux-gnu - node@22 (direct QEMU boot)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Install QEMU system emulator for s390x
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qqy --no-install-recommends qemu-system-s390x
+
+      - name: Cache s390x boot assets
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5
+        id: cache-s390x-assets
+        with:
+          path: /tmp/ubuntu-s390x-assets
+          key: s390x-assets-noble-24.04-node-22.16.0-v1
+
+      - name: Download s390x boot assets
+        if: steps.cache-s390x-assets.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ubuntu-s390x-assets
+          BASE_URL="https://cloud-images.ubuntu.com/releases/noble/release/unpacked"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/vmlinuz "$BASE_URL/ubuntu-24.04-server-cloudimg-s390x-vmlinuz-generic"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/initrd.img "$BASE_URL/ubuntu-24.04-server-cloudimg-s390x-initrd-generic"
+          ROOT_URL="https://cloud-images.ubuntu.com/releases/noble/release"
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/root.tar.xz "$ROOT_URL/ubuntu-24.04-server-cloudimg-s390x-root.tar.xz"
+          NODE_VERSION=22.16.0
+          NODE_SHA256=b3603dcbea7b1ef87cfd3bf986ff9697609359356d82334de6217838d3cce640
+          curl -fsSL -o /tmp/ubuntu-s390x-assets/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-s390x.tar.xz"
+          echo "${NODE_SHA256}  /tmp/ubuntu-s390x-assets/node.tar.xz" | sha256sum -c -
+
+      - name: Setup node on host (for yarn install)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies on host
+        working-directory: bindings/nodejs
+        run: |
+          yarn config set --json supportedArchitectures.cpu '["current", "s390x"]'
+          yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-s390x-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Pre-compile TypeScript tests on host
+        working-directory: bindings/nodejs
+        run: npx tsc -p __test__/tsconfig.json --outDir __test__
+
+      - name: Build s390x rootfs image
+        run: |
+          sudo mkdir -p /tmp/rootfs
+          sudo tar xf /tmp/ubuntu-s390x-assets/root.tar.xz -C /tmp/rootfs
+          sudo tar -xJf /tmp/ubuntu-s390x-assets/node.tar.xz -C /tmp/rootfs/usr/local --strip-components=1
+          sudo mkdir -p /tmp/rootfs/tmp/nodejs-test
+          sudo cp -a bindings/nodejs/. /tmp/rootfs/tmp/nodejs-test/
+          sudo mkdir -p /tmp/rootfs/tests/fixtures
+          sudo cp -a tests/fixtures/. /tmp/rootfs/tests/fixtures/
+
+          # VM init script (PID 1): mounts, runs tests, signals result, powers off
+          sudo tee /tmp/rootfs/run-test.sh > /dev/null << 'INITSCRIPT'
+          #!/bin/bash
+          set -o pipefail
+          export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sys /sys 2>/dev/null || true
+          mount -t devtmpfs dev /dev 2>/dev/null || true
+          ip link set lo up 2>/dev/null || true
+          echo "=== s390x test runner ==="
+          echo "Node: $(node --version)"
+          cd /tmp/nodejs-test || exit 1
+          CI=true REQUIRE_PUSH_TESTS=false \
+            node --no-turbofan --no-maglev --no-sparkplug \
+            ./node_modules/.bin/ava --config ava-precompiled.config.mjs 2>&1 | tee /tmp/test-output.txt
+          TEST_EXIT=$?
+          if [ "$TEST_EXIT" -eq 0 ]; then echo "TEST_RESULT_CODE=0"
+          else dmesg; echo "TEST_RESULT_CODE=1"; fi
+          sync; sleep 1; echo o > /proc/sysrq-trigger; sleep infinity
+          INITSCRIPT
+          sudo chmod +x /tmp/rootfs/run-test.sh
+
+          truncate -s 4G /tmp/rootfs.img
+          sudo mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs /tmp/rootfs.img
+
+      - name: Run tests in s390x VM (direct QEMU boot)
+        run: |
+          timeout 600 qemu-system-s390x \
+            -M s390-ccw-virtio \
+            -m 1024 \
+            -nographic \
+            -kernel /tmp/ubuntu-s390x-assets/vmlinuz \
+            -initrd /tmp/ubuntu-s390x-assets/initrd.img \
+            -drive file=/tmp/rootfs.img,if=none,id=dr1,format=raw \
+            -device virtio-blk-ccw,drive=dr1,bootindex=1 \
+            -append "root=/dev/vda rw init=/run-test.sh console=ttysclp0 quiet loglevel=0" \
+            | tee /tmp/vm-output.log || true
+
+          # Check test result from serial output
+          if grep -q "TEST_RESULT_CODE=0" /tmp/vm-output.log; then
+            echo "Tests passed!"
+          else
+            echo "Tests failed or VM did not complete successfully"
+            echo "--- Last 50 lines of VM output ---"
+            tail -50 /tmp/vm-output.log
+            exit 1
+          fi
+
+  test-zot-integration:
+    name: Integration Tests (Zot Registry)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: bindings/nodejs
+        run: yarn install
+
+      - name: Download native binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: bindings/nodejs
+
+      - name: Download generated JS/TS bindings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: bindings/nodejs
+
+      - name: Run integration tests with Zot registry
+        working-directory: bindings/nodejs
+        run: yarn test
+        env:
+          # Require push tests - Docker is available on ubuntu-latest
+          REQUIRE_PUSH_TESTS: 'true'
+          # Use Docker (pre-installed on GitHub Actions Ubuntu runners)
+          CONTAINER_RUNTIME: docker

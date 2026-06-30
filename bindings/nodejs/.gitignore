@@ -1,0 +1,32 @@
+# Generated NAPI bindings
+*.node
+index.js
+index.d.ts
+
+# Rust build artifacts
+target/
+
+# Node.js dependencies
+node_modules/
+
+# npm package directories for distribution
+npm/
+
+# Build artifacts
+*.d.ts.map
+*.js.map
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Yarn
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+
+# Cargo lock (library crate)
+Cargo.lock
