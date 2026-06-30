@@ -746,6 +746,46 @@ impl Client {
             .await
     }
 
+    /// Pushes a blob to the registry from an input stream using chunked transfer, computing
+    /// the SHA256 digest on-the-fly.
+    ///
+    /// Unlike [`push_blob_stream`], the caller does not need to know the digest upfront.
+    /// The digest is computed incrementally as each chunk is sent, then supplied to the
+    /// registry in the final commit request.
+    ///
+    /// Monolithic push is not supported by this method; the blob is always sent as a series
+    /// of chunked PATCH requests regardless of the `use_monolithic_push` setting.
+    ///
+    /// Returns the pullable location of the blob.
+    pub async fn push_blob_stream_chunked<
+        T: Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+    >(
+        &self,
+        image: &Reference,
+        blob_data_stream: T,
+    ) -> Result<String> {
+        let mut location = self.begin_push_chunked_session(image).await?;
+        let mut range_start = 0;
+
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        let mut blob_data_stream = pin!(blob_data_stream);
+
+        while let Some(blob_data) = blob_data_stream.next().await {
+            let mut blob_data = blob_data?;
+            while !blob_data.is_empty() {
+                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+                hasher.update(&chunk);
+                (location, range_start) = self
+                    .push_chunk(&location, image, chunk, range_start)
+                    .await?;
+            }
+        }
+        let blob_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+        self.end_push_chunked_session(&location, image, &blob_digest)
+            .await
+    }
+
     /// Perform an OAuth v2 auth request if necessary.
     ///
     /// This performs authorization and then stores the token internally to be used
@@ -4148,6 +4188,47 @@ mod test {
             .push_blob_stream(&reference, data_stream, data_hash, None)
             .await
             .expect_err("expected error when use_monolithic_push is true but size is None");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream_chunked_without_digest() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            use_monolithic_push: true,
+            ..Default::default()
+        });
+        client.push_chunk_size = 253;
+
+        let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
+        let repeat = 16usize;
+        let data_stream = futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
+            .take(repeat)
+            .map(Ok);
+
+        let reference =
+            Reference::try_from(format!("localhost:{server_port}/test-push-stream-chunked"))
+                .expect("failed to parse reference");
+
+        client
+            .push_blob_stream_chunked(&reference, data_stream)
+            .await
+            .expect("failed to push stream with chunked-only API");
+
+        assert!(client
+            .blob_exists(&reference, data_hash)
+            .await
+            .expect("failed to check blob existence"));
     }
 
     /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
