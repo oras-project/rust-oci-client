@@ -1,5 +1,5 @@
 // Tests for validating digests of different types and for malicious servers
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::LazyLock};
 
 use axum::{
     extract::{Path, State},
@@ -25,14 +25,11 @@ static CONFIG: &[u8] = include_bytes!("./fixtures/config.json");
 static BLOB_UNKNOWN_BODY: &[u8] =
     br#"{"errors":[{"code":"BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
 
-lazy_static::lazy_static! {
-    static ref MANIFEST_DIGEST: String = digest(MANIFEST);
-    static ref MANIFEST_DIGEST_SHA512: String = digest_sha512(MANIFEST);
-    static ref BLOB_DIGEST: String = digest(BLOB);
-    static ref BLOB_DIGEST_SHA512: String = digest_sha512(BLOB);
-    static ref CONFIG_DIGEST: String = digest(CONFIG);
-    static ref CONFIG_DIGEST_SHA512: String = digest_sha512(CONFIG);
-}
+static MANIFEST_DIGEST: LazyLock<String> = LazyLock::new(|| digest(MANIFEST));
+static MANIFEST_DIGEST_SHA512: LazyLock<String> = LazyLock::new(|| digest_sha512(MANIFEST));
+static BLOB_DIGEST: LazyLock<String> = LazyLock::new(|| digest(BLOB));
+static BLOB_DIGEST_SHA512: LazyLock<String> = LazyLock::new(|| digest_sha512(BLOB));
+static CONFIG_DIGEST: LazyLock<String> = LazyLock::new(|| digest(CONFIG));
 
 fn digest(data: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(data)))
