@@ -33,6 +33,9 @@ mod test_helpers {
 
     pub(crate) fn jsonwebtoken_install_default_crypto_provider() {
         PROVIDER_INIT.get_or_init(|| {
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+            let _ = jsonwebtoken_openssl::install_default();
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
             let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
         });
     }
