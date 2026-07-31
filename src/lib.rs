@@ -31,9 +31,9 @@ mod test_helpers {
 
     static PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 
-    pub(crate) fn jsonwebtoken_install_default_crypto_provider() {
+    pub(crate) fn install_default_rustls_crypto_provider() {
         PROVIDER_INIT.get_or_init(|| {
-            let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 }
