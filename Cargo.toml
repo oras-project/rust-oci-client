@@ -26,20 +26,21 @@ maintenance = { status = "actively-developed" }
 
 [features]
 default = ["rustls-tls", "test-registry"]
-native-tls = ["reqwest/native-tls", "jsonwebtoken/rust_crypto"]
-rustls-tls = ["reqwest/rustls", "jsonwebtoken/aws_lc_rs"]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls"]
+rustls-tls-no-provider = ["reqwest/rustls-no-provider"]
 hickory-dns = ["reqwest/hickory-dns"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
 
 [dependencies]
+base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
 http = "1.3"
 http-auth = { version = "0.1", default-features = false }
-jsonwebtoken = { version = "10.3", default-features = false }
 oci-spec = "0.10"
 olpc-cjson = "0.1"
 regex = "1.11"
@@ -62,9 +63,9 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 rstest = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 docker_credential = "1.3"
 hmac = "0.13"
-jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
 itertools = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.21"

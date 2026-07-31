@@ -1,5 +1,6 @@
 //! Token cache for OCI registry authentication
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -176,57 +177,64 @@ impl TokenCache {
 }
 
 fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
-    match jsonwebtoken::dangerous::insecure_decode::<BearerTokenClaims>(token_str) {
-        Ok(token) => {
-            let token_exp = match token.claims.exp {
-                Some(exp) => exp,
-                None => {
-                    // the token doesn't have a claim that states a
-                    // value for the expiration. We assume it has a 60
-                    // seconds validity as indicated here:
-                    // https://docs.docker.com/reference/api/registry/auth/#token-response-fields
-                    // > (Optional) The duration in seconds since the token was issued
-                    // > that it will remain valid. When omitted, this defaults to 60 seconds.
-                    // > For compatibility with older clients, a token should never be returned
-                    // > with less than 60 seconds to live.
-                    let now = SystemTime::now();
-                    let epoch = now
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_secs();
-                    let expiration = epoch + default_expiration_secs as u64;
-                    debug!("Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
-                    expiration
-                }
-            };
+    let mut parts = token_str.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        // The token is not a JWT (e.g., an opaque token issued by registries
+        // like GHCR). Use the default expiration as a best-effort assumption,
+        // mirroring the behaviour for JWT tokens that carry no `exp` claim.
+        debug!(
+            "Bearer token is not a JWT, assuming a {} seconds validity",
+            default_expiration_secs
+        );
+        return Some(default_expiration(default_expiration_secs));
+    };
 
-            Some(token_exp)
+    // Registry tokens are opaque credentials. We only inspect the untrusted payload
+    // to choose a cache eviction time; signature verification is neither required nor
+    // useful here because the registry that issued the token also controls its lifetime.
+    let payload = match URL_SAFE_NO_PAD.decode(payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(?error, "Invalid bearer token payload encoding");
+            return None;
         }
-        Err(error) if error.kind() == &jsonwebtoken::errors::ErrorKind::InvalidToken => {
-            // The token is not a JWT (e.g., an opaque token issued by registries
-            // like GHCR). Use the default expiration as a best-effort assumption,
-            // mirroring the behaviour for JWT tokens that carry no `exp` claim.
-            let epoch = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs();
+    };
+    let claims: BearerTokenClaims = match serde_json::from_slice(&payload) {
+        Ok(claims) => claims,
+        Err(error) => {
+            warn!(?error, "Invalid bearer token payload");
+            return None;
+        }
+    };
+
+    Some(match claims.exp {
+        Some(exp) => exp,
+        None => {
+            // The token doesn't have a claim that states a value for the expiration.
+            // The registry auth specification defaults such tokens to 60 seconds:
+            // https://distribution.github.io/distribution/spec/auth/token/
             debug!(
-                "Bearer token is not a JWT, assuming a {} seconds validity",
+                "Cannot extract expiration from token's claims, assuming a {} seconds validity",
                 default_expiration_secs
             );
-            Some(epoch + default_expiration_secs as u64)
+            default_expiration(default_expiration_secs)
         }
-        Err(error) => {
-            warn!(?error, "Invalid bearer token");
-            None
-        }
-    }
+    })
+}
+
+fn default_expiration(default_expiration_secs: usize) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs()
+        + default_expiration_secs as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{EncodingKey, Header};
     use oci_spec::distribution::Reference;
     use serde::Serialize;
 
@@ -244,26 +252,20 @@ mod tests {
     }
 
     fn make_jwt_with_exp(exp: u64) -> String {
-        jsonwebtoken::encode(
-            &Header::default(),
-            &ClaimsWithExp { exp },
-            &EncodingKey::from_secret(b"secret"),
-        )
-        .expect("failed to encode JWT with exp")
+        make_jwt(&ClaimsWithExp { exp })
     }
 
     fn make_jwt_without_exp() -> String {
-        jsonwebtoken::encode(
-            &Header::default(),
-            &ClaimsWithoutExp { sub: "test" },
-            &EncodingKey::from_secret(b"secret"),
-        )
-        .expect("failed to encode JWT without exp")
+        make_jwt(&ClaimsWithoutExp { sub: "test" })
+    }
+
+    fn make_jwt(claims: &impl Serialize) -> String {
+        let payload = serde_json::to_vec(claims).expect("failed to serialize JWT claims");
+        format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(payload))
     }
 
     #[test]
     fn jwt_with_exp_uses_claims_expiration() {
-        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_with_exp(9999999999);
         let exp = parse_expiration_from_jwt(&token, 60)
             .expect("should return Some for valid JWT with exp");
@@ -272,7 +274,6 @@ mod tests {
 
     #[test]
     fn jwt_without_exp_uses_default_expiration() {
-        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
         let token = make_jwt_without_exp();
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
