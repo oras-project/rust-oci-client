@@ -28,6 +28,10 @@ maintenance = { status = "actively-developed" }
 default = ["rustls-tls", "test-registry"]
 native-tls = ["reqwest/native-tls", "jsonwebtoken/rust_crypto"]
 rustls-tls = ["reqwest/rustls", "jsonwebtoken/aws_lc_rs"]
+# Like `rustls-tls` but without a bundled crypto provider: the consumer
+# installs their own rustls `CryptoProvider` (e.g. ring) and avoids the
+# aws-lc-rs C/cmake build. Mirrors reqwest's own `rustls-no-provider`.
+rustls-tls-no-provider = ["reqwest/rustls-no-provider", "jsonwebtoken/rust_crypto"]
 hickory-dns = ["reqwest/hickory-dns"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
