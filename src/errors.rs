@@ -207,6 +207,12 @@ pub enum OciErrorCode {
     Unsupported,
     /// Too many requests from client
     Toomanyrequests,
+    /// An error code not defined by the OCI spec
+    ///
+    /// Some registries return their own error codes. The original code is kept
+    /// so that the rest of the error envelope can still be parsed.
+    #[serde(untagged)]
+    Other(String),
 }
 
 #[cfg(test)]
@@ -237,6 +243,22 @@ mod test {
         assert_eq!(OciErrorCode::Toomanyrequests, e.code);
         assert_eq!("pull request limit exceeded", e.message);
         assert_ne!(serde_json::value::Value::Null, e.detail);
+    }
+
+    const EXAMPLE_ERROR_UNKNOWN_CODE: &str = r#"
+      {"errors":[{"code":"ARTIFACT_LOCKED","message":"artifact is locked"}]}
+      "#;
+    #[test]
+    fn test_deserialize_unknown_code() {
+        let envelope: OciEnvelope =
+            serde_json::from_str(EXAMPLE_ERROR_UNKNOWN_CODE).expect("parse example error");
+        let e = &envelope.errors[0];
+        assert_eq!(OciErrorCode::Other("ARTIFACT_LOCKED".to_string()), e.code);
+        assert_eq!("artifact is locked", e.message);
+        assert_eq!(
+            r#"{"code":"ARTIFACT_LOCKED","message":"artifact is locked","detail":null}"#,
+            serde_json::to_string(e).expect("serialize error")
+        );
     }
 
     const EXAMPLE_ERROR_MISSING_MESSAGE: &str = r#"
