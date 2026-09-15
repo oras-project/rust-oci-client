@@ -295,8 +295,6 @@ pub struct Client {
 
 impl Default for Client {
     fn default() -> Self {
-        #[cfg(test)]
-        crate::test_helpers::install_default_rustls_crypto_provider();
         Self {
             config: Arc::default(),
             auth_store: Arc::default(),
@@ -319,8 +317,6 @@ impl TryFrom<ClientConfig> for Client {
     type Error = OciDistributionError;
 
     fn try_from(config: ClientConfig) -> std::result::Result<Self, Self::Error> {
-        #[cfg(test)]
-        crate::test_helpers::install_default_rustls_crypto_provider();
         #[allow(unused_mut)]
         let mut client_builder = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
@@ -2721,7 +2717,6 @@ mod test {
 
     #[tokio::test]
     async fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
-        crate::test_helpers::install_default_rustls_crypto_provider();
         let _ = tracing_subscriber::fmt::try_init();
         let client = Client::default();
         // The token cache only reads the JWT payload; it never verifies signatures.

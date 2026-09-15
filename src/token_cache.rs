@@ -119,7 +119,7 @@ impl TokenCache {
         let expiration = match token {
             RegistryTokenType::Basic(_, _) => u64::MAX,
             RegistryTokenType::Bearer(ref t) => {
-                match parse_expiration_from_jwt(t.token(), self.default_expiration_secs) {
+                match bearer_token_cache_expiration(t.token(), self.default_expiration_secs) {
                     Some(value) => value,
                     None => return,
                 }
@@ -176,7 +176,23 @@ impl TokenCache {
     }
 }
 
-fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
+/// The longest time we keep a bearer token in the cache, even when its claimed
+/// expiration is further in the future.
+const MAX_TOKEN_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Picks a cache eviction time for a bearer token.
+///
+/// This function reads the unverified `exp` claim from the token payload. It
+/// does not check the token signature, and it must not be used to decide
+/// whether the token is valid. The registry that issued the token is the
+/// only party that can make that decision; this cache only avoids
+/// requesting a new token before the old one expires.
+///
+/// A bearer token can be a JWT (a signed token with three base64 parts) or
+/// an opaque string, as GHCR issues. This function returns `None` only when
+/// the token looks like a JWT but its payload is not valid base64 or valid
+/// JSON, because we then cannot tell how long the token lasts.
+fn bearer_token_cache_expiration(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
     let mut parts = token_str.split('.');
     let (Some(_header), Some(payload), Some(_signature), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -209,7 +225,7 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
         }
     };
 
-    Some(match claims.exp {
+    let exp = match claims.exp {
         Some(exp) => exp,
         None => {
             // The token doesn't have a claim that states a value for the expiration.
@@ -221,7 +237,13 @@ fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) ->
             );
             default_expiration(default_expiration_secs)
         }
-    })
+    };
+
+    // Cap the cache TTL so that a token with a far-future or malicious `exp`
+    // claim cannot pin a stale token in the cache indefinitely. The registry
+    // still rejects an expired or revoked token on the next real request.
+    let max_exp = default_expiration(MAX_TOKEN_CACHE_TTL_SECS as usize);
+    Some(exp.min(max_exp))
 }
 
 fn default_expiration(default_expiration_secs: usize) -> u64 {
@@ -236,6 +258,7 @@ fn default_expiration(default_expiration_secs: usize) -> u64 {
 mod tests {
     use super::*;
     use oci_spec::distribution::Reference;
+    use rstest::rstest;
     use serde::Serialize;
 
     // An opaque token as issued by registries like GHCR — not a JWT.
@@ -264,45 +287,68 @@ mod tests {
         format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(payload))
     }
 
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[test]
-    fn jwt_with_exp_uses_claims_expiration() {
-        let token = make_jwt_with_exp(9999999999);
-        let exp = parse_expiration_from_jwt(&token, 60)
+    fn jwt_with_near_exp_uses_claims_expiration() {
+        let exp = now_secs() + 3600;
+        let token = make_jwt_with_exp(exp);
+        let cached_exp = bearer_token_cache_expiration(&token, 60)
             .expect("should return Some for valid JWT with exp");
-        assert_eq!(exp, 9999999999);
+        assert_eq!(cached_exp, exp);
     }
 
     #[test]
-    fn jwt_without_exp_uses_default_expiration() {
-        let token = make_jwt_without_exp();
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let exp =
-            parse_expiration_from_jwt(&token, 60).expect("should return Some for JWT without exp");
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    fn jwt_with_far_future_exp_is_capped() {
+        // A claimed expiration far in the future (year 2286) must not pin the
+        // cached token for that long. We cap the cache TTL instead.
+        let token = make_jwt_with_exp(9999999999);
+        let before = now_secs();
+        let cached_exp = bearer_token_cache_expiration(&token, 60)
+            .expect("should return Some for valid JWT with exp");
+        let after = now_secs();
+        assert!(cached_exp < 9999999999);
+        assert!(cached_exp >= before + MAX_TOKEN_CACHE_TTL_SECS);
+        assert!(cached_exp <= after + MAX_TOKEN_CACHE_TTL_SECS);
+    }
+
+    /// Tokens whose `exp` claim cannot be read fall back to the default
+    /// expiration: a JWT with no `exp` claim, an opaque token (as GHCR
+    /// issues), and a JWE-style token (5 dot-separated parts, which is not a
+    /// JWT we can read a claim from).
+    #[rstest]
+    #[case::jwt_without_exp(make_jwt_without_exp())]
+    #[case::opaque_token(OPAQUE_TOKEN.to_string())]
+    #[case::five_part_jwe("a.b.c.d.e".to_string())]
+    fn token_without_readable_exp_uses_default_expiration(#[case] token: String) {
+        let before = now_secs();
+        let exp = bearer_token_cache_expiration(&token, 60)
+            .expect("should return Some with default expiration");
+        let after = now_secs();
         assert!(exp >= before + 60);
         assert!(exp <= after + 60);
     }
 
-    #[test]
-    fn opaque_token_uses_default_expiration() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let exp = parse_expiration_from_jwt(OPAQUE_TOKEN, 60)
-            .expect("opaque token should return Some with default expiration");
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(exp >= before + 60);
-        assert!(exp <= after + 60);
+    /// A token that looks like a JWT (three dot-separated parts) but whose
+    /// payload cannot be read as a bearer token's claims returns `None`, so
+    /// the caller does not cache it.
+    #[rstest]
+    #[case::invalid_base64("not-valid-base64!!!".to_string())]
+    #[case::empty_segment("".to_string())]
+    // `URL_SAFE_NO_PAD` rejects a payload that carries `=` padding.
+    #[case::padded_base64("eyJzdWIiOiJ0ZXN0In0=".to_string())]
+    #[case::not_json(URL_SAFE_NO_PAD.encode(b"not json"))]
+    #[case::exp_as_string(URL_SAFE_NO_PAD.encode(br#"{"exp":"9999999999"}"#))]
+    #[case::exp_negative(URL_SAFE_NO_PAD.encode(br#"{"exp":-1}"#))]
+    #[case::exp_float(URL_SAFE_NO_PAD.encode(br#"{"exp":1.5}"#))]
+    fn malformed_jwt_payload_returns_none(#[case] payload: String) {
+        let token = format!("e30.{payload}.signature");
+        assert!(bearer_token_cache_expiration(&token, 60).is_none());
     }
 
     #[tokio::test]
