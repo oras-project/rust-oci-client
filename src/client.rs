@@ -2147,15 +2147,13 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
                 }),
             }
         }
-        s => {
-            let text = std::str::from_utf8(body)?;
-
-            Err(OciDistributionError::ServerError {
-                code: s.as_u16(),
-                url: url.to_string(),
-                message: text.to_string(),
-            })
-        }
+        // Catch-all for any remaining status: mostly 5xx, but also 1xx, 3xx and non-standard codes.
+        // Use a lossy conversion so a non UTF-8 body doesn't hide the status code
+        s => Err(OciDistributionError::ServerError {
+            code: s.as_u16(),
+            url: url.to_string(),
+            message: String::from_utf8_lossy(body).to_string(),
+        }),
     }
 }
 
@@ -2603,7 +2601,45 @@ mod test {
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
 
+    use crate::errors::OciErrorCode;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
+
+    #[test]
+    fn test_validate_registry_response_server_error_non_utf8_body() {
+        let err = validate_registry_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &[0xff, 0xfe, b'o', b'k'],
+            "https://example.com",
+        )
+        .expect_err("5xx should be an error");
+        match err {
+            OciDistributionError::ServerError { code, message, .. } => {
+                assert_eq!(502, code);
+                assert_eq!("\u{fffd}\u{fffd}ok", message);
+            }
+            e => panic!("expected ServerError, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_registry_response_unknown_error_code() {
+        let err = validate_registry_response(
+            reqwest::StatusCode::CONFLICT,
+            br#"{"errors":[{"code":"ARTIFACT_LOCKED","message":"artifact is locked"}]}"#,
+            "https://example.com",
+        )
+        .expect_err("4xx should be an error");
+        match err {
+            OciDistributionError::RegistryError { envelope, .. } => {
+                assert_eq!(
+                    OciErrorCode::Other("ARTIFACT_LOCKED".to_string()),
+                    envelope.errors[0].code
+                );
+                assert_eq!("artifact is locked", envelope.errors[0].message);
+            }
+            e => panic!("expected RegistryError, got {e:?}"),
+        }
+    }
 
     #[cfg(feature = "test-registry")]
     use testcontainers::{
