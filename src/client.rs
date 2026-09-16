@@ -2092,6 +2092,10 @@ impl Client {
     ///
     /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
     /// Returns a properly formatted absolute URL
+    ///
+    /// An absolute location pointing at a different host is returned as is and
+    /// will be followed, but requests to it are never authenticated (see
+    /// [`RequestBuilderWrapper::apply_auth`]).
     fn location_header_to_url(
         &self,
         image: &Reference,
@@ -2332,15 +2336,19 @@ impl<'a> RequestBuilderWrapper<'a> {
 
 // Composable functions applicable to a `RequestBuilderWrapper`
 impl<'a> RequestBuilderWrapper<'a> {
+    /// Returns a clone of the inner `RequestBuilder`.
+    ///
+    /// Cloning fails if the request has a streaming body, which is never the
+    /// case here since bodies are attached after the wrapper is consumed.
+    fn cloned_request_builder(&self) -> Result<RequestBuilder> {
+        self.request_builder.try_clone().ok_or_else(|| {
+            OciDistributionError::GenericError(Some("could not clone request builder".to_string()))
+        })
+    }
+
     fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper<'_>> {
         let request_builder = self
-            .request_builder
-            .try_clone()
-            .ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "could not clone request builder".to_string(),
-                ))
-            })?
+            .cloned_request_builder()?
             .header("Accept", Vec::from(accept).join(", "));
 
         Ok(RequestBuilderWrapper {
@@ -2349,19 +2357,74 @@ impl<'a> RequestBuilderWrapper<'a> {
         })
     }
 
+    /// Returns whether the request being built is addressed to the registry the
+    /// credentials of `image` belong to.
+    ///
+    /// The upload `Location` returned by a registry may be absolute and point at
+    /// another host (e.g. a signed URL of a cloud storage provider), which the
+    /// distribution specification permits. Sending the `Authorization` header
+    /// there is what it does not permit: clients "MUST NOT forward Authorization
+    /// headers across host boundaries unless explicitly configured to do so".
+    /// See also CVE-2020-15157.
+    ///
+    /// A same-host location that drops back from https to http is treated the
+    /// same way, since the credentials would otherwise go out in the clear.
+    fn targets_credential_registry(&self, image: &Reference) -> Result<bool> {
+        let request = self.cloned_request_builder()?.build()?;
+        let target = request.url();
+
+        let registry = image.resolve_registry();
+        let registry_url = Url::parse(&format!(
+            "{scheme}://{registry}",
+            scheme = self.client.config.protocol.scheme_for(registry)
+        ))
+        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+
+        if target.host_str() != registry_url.host_str() {
+            return Ok(false);
+        }
+        if target.port_or_known_default() != registry_url.port_or_known_default() {
+            return Ok(false);
+        }
+        // The registry is reached over https, the credentials must not go out
+        // in the clear.
+        if registry_url.scheme() == "https" && target.scheme() != "https" {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     /// Updates request as necessary for authentication.
     ///
     /// If the struct has Some(bearer), this will insert the bearer token in an
     /// Authorization header. It will also set the Accept header, which must
     /// be set on all OCI Registry requests. If the struct has HTTP Basic Auth
     /// credentials, these will be configured.
+    ///
+    /// Requests addressed to a host other than the registry the credentials
+    /// belong to are left unauthenticated, see
+    /// [`Self::targets_credential_registry`].
     async fn apply_auth(
         &self,
         image: &Reference,
         op: RegistryOperation,
     ) -> Result<RequestBuilderWrapper<'_>> {
-        let mut headers = HeaderMap::new();
+        // NOTE: we must not authenticate requests addressed outside of the
+        // registry, as those can be abused to leak credentials or tokens.
+        // Please refer to CVE-2020-15157 for more information.
+        if !self.targets_credential_registry(image)? {
+            debug!(
+                registry = image.resolve_registry(),
+                "Not authenticating a request addressed outside of the registry"
+            );
+            return Ok(RequestBuilderWrapper {
+                client: self.client,
+                request_builder: self.cloned_request_builder()?,
+            });
+        }
 
+        let mut headers = HeaderMap::new();
         if let Some(token) = self.client.get_auth_token(image, op).await {
             match token {
                 RegistryTokenType::Bearer(token) => {
@@ -2373,13 +2436,7 @@ impl<'a> RequestBuilderWrapper<'a> {
                     return Ok(RequestBuilderWrapper {
                         client: self.client,
                         request_builder: self
-                            .request_builder
-                            .try_clone()
-                            .ok_or_else(|| {
-                                OciDistributionError::GenericError(Some(
-                                    "could not clone request builder".to_string(),
-                                ))
-                            })?
+                            .cloned_request_builder()?
                             .headers(headers)
                             .basic_auth(username.to_string(), Some(password.to_string())),
                     });
@@ -2388,15 +2445,7 @@ impl<'a> RequestBuilderWrapper<'a> {
         }
         Ok(RequestBuilderWrapper {
             client: self.client,
-            request_builder: self
-                .request_builder
-                .try_clone()
-                .ok_or_else(|| {
-                    OciDistributionError::GenericError(Some(
-                        "could not clone request builder".to_string(),
-                    ))
-                })?
-                .headers(headers),
+            request_builder: self.cloned_request_builder()?.headers(headers),
         })
     }
 }
@@ -2828,7 +2877,7 @@ mod test {
 
         assert_eq!(
             RequestBuilderWrapper::from_client(&client, |client| client
-                .get("https://example.com/some/module.wasm"))
+                .get("https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"))
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
@@ -2840,7 +2889,137 @@ mod test {
             format!("Bearer {}", &token)
         );
 
+        // The token must not be sent to a host other than the registry it
+        // belongs to.
+        assert!(!RequestBuilderWrapper::from_client(&client, |client| client
+            .get("https://example.com/some/module.wasm"))
+        .apply_auth(
+            &Reference::try_from(HELLO_IMAGE_TAG)?,
+            RegistryOperation::Pull
+        )
+        .await?
+        .into_request_builder()
+        .build()?
+        .headers()
+        .contains_key("Authorization"));
+
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_apply_auth_basic_not_forwarded_cross_host() -> anyhow::Result<()> {
+        let client = Client::default();
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+        client
+            .store_auth(
+                image.resolve_registry(),
+                RegistryAuth::Basic("user".to_string(), "pass".to_string()),
+            )
+            .await;
+        client
+            .tokens
+            .insert(
+                &image,
+                RegistryOperation::Push,
+                RegistryTokenType::Basic("user".to_string(), "pass".to_string()),
+            )
+            .await;
+
+        assert!(RequestBuilderWrapper::from_client(&client, |client| client
+            .patch("https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc"))
+        .apply_auth(&image, RegistryOperation::Push)
+        .await?
+        .into_request_builder()
+        .build()?
+        .headers()
+        .contains_key("Authorization"));
+
+        assert!(!RequestBuilderWrapper::from_client(&client, |client| client
+            .patch("https://elsewhere.example.com/upload/abc"))
+        .apply_auth(&image, RegistryOperation::Push)
+        .await?
+        .into_request_builder()
+        .build()?
+        .headers()
+        .contains_key("Authorization"));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::registry("https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc", true)]
+    #[case::explicit_default_port(
+        "https://webassembly.azurecr.io:443/v2/hello-wasm/blobs/uploads/abc",
+        true
+    )]
+    #[case::another_port(
+        "https://webassembly.azurecr.io:8443/v2/hello-wasm/blobs/uploads/abc",
+        false
+    )]
+    #[case::another_host("https://elsewhere.example.com/v2/hello-wasm/blobs/uploads/abc", false)]
+    #[case::subdomain(
+        "https://evil.webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        false
+    )]
+    #[case::downgraded_to_http(
+        "http://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        false
+    )]
+    fn test_targets_credential_registry(#[case] location: &str, #[case] expected: bool) {
+        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let client = Client::default();
+        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+
+        assert_eq!(
+            request
+                .targets_credential_registry(&image)
+                .expect("failed to compare the location with the registry"),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::mirror("https://docker.mirror.io/v2/hello-wasm/blobs/uploads/abc", true)]
+    #[case::upstream_registry(
+        "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+        false
+    )]
+    fn test_targets_credential_registry_with_mirror(
+        #[case] location: &str,
+        #[case] expected: bool,
+    ) {
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        let client = Client::default();
+        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+
+        assert_eq!(
+            request
+                .targets_credential_registry(&image)
+                .expect("failed to compare the location with the registry"),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::http_registry("http://localhost:5000/v2/hello-wasm/blobs/uploads/abc", true)]
+    #[case::upgraded_to_https("https://localhost:5000/v2/hello-wasm/blobs/uploads/abc", true)]
+    #[case::another_port("http://localhost:5001/v2/hello-wasm/blobs/uploads/abc", false)]
+    fn test_targets_credential_registry_plain_http(#[case] location: &str, #[case] expected: bool) {
+        let image =
+            Reference::try_from("localhost:5000/hello-wasm:v1").expect("failed to parse reference");
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        });
+        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+
+        assert_eq!(
+            request
+                .targets_credential_registry(&image)
+                .expect("failed to compare the location with the registry"),
+            expected
+        );
     }
 
     #[test]
