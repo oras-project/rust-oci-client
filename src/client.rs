@@ -16,6 +16,7 @@ use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Digest as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -76,6 +77,17 @@ pub struct PushResponse {
     pub config_url: String,
     /// Pullable url for the manifest
     pub manifest_url: String,
+}
+
+/// The data returned by [`Client::push_blob_stream_chunked`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushBlobStreamChunkedResponse {
+    /// Pullable url for the uploaded blob.
+    pub blob_url: String,
+    /// Computed digest of the uploaded blob.
+    pub blob_digest: String,
+    /// Total uploaded blob size in bytes.
+    pub size: u64,
 }
 
 /// The data returned by a successful tags/list Request
@@ -714,7 +726,7 @@ impl Client {
         image: &Reference,
         blob_data_stream: T,
         blob_digest: &str,
-        size: Option<usize>,
+        size: Option<u64>,
     ) -> Result<String> {
         if self.config.use_monolithic_push {
             let size = size.ok_or_else(|| {
@@ -728,22 +740,61 @@ impl Client {
                 .await;
         }
 
-        let mut location = self.begin_push_chunked_session(image).await?;
-        let mut range_start = 0;
-
-        let mut blob_data_stream = pin!(blob_data_stream);
-
-        while let Some(blob_data) = blob_data_stream.next().await {
-            let mut blob_data = blob_data?;
-            while !blob_data.is_empty() {
-                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
-                (location, range_start) = self
-                    .push_chunk(&location, image, chunk, range_start)
-                    .await?;
-            }
-        }
+        let location = self.begin_push_chunked_session(image).await?;
+        let (location, _size) = self
+            .push_stream_chunks(location, image, blob_data_stream, |_| {})
+            .await?;
         self.end_push_chunked_session(&location, image, blob_digest)
             .await
+    }
+
+    /// Pushes a blob to the registry from an input stream using chunked transfer, computing
+    /// the SHA256 digest on-the-fly.
+    ///
+    /// Unlike [`push_blob_stream`], the caller does not need to know the digest upfront.
+    /// The digest is computed incrementally as each chunk is sent, then supplied to the
+    /// registry in the final commit request.
+    ///
+    /// Monolithic push is not supported by this method; the blob is always sent as a series
+    /// of chunked PATCH requests regardless of the `use_monolithic_push` setting.
+    ///
+    /// Returns the pullable location of the blob, the computed digest, and the blob size.
+    pub async fn push_blob_stream_chunked<
+        T: Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+    >(
+        &self,
+        image: &Reference,
+        blob_data_stream: T,
+    ) -> Result<PushBlobStreamChunkedResponse> {
+        if self.config.use_monolithic_push {
+            debug!(
+                "use_monolithic_push is enabled, but push_blob_stream_chunked always uses chunked PATCH requests; ignoring"
+            );
+        }
+
+        let location = self.begin_push_chunked_session(image).await?;
+
+        let mut digester = Digester::Sha256(sha2::Sha256::new());
+        let (location, size) = self
+            .push_stream_chunks(location, image, blob_data_stream, |chunk| {
+                digester.update(chunk)
+            })
+            .await?;
+
+        if size == 0 {
+            return Err(OciDistributionError::PushNoDataError);
+        }
+
+        let blob_digest = digester.finalize();
+        let location = self
+            .end_push_chunked_session(&location, image, &blob_digest)
+            .await?;
+
+        Ok(PushBlobStreamChunkedResponse {
+            blob_url: location,
+            blob_digest,
+            size,
+        })
     }
 
     /// Perform an OAuth v2 auth request if necessary.
@@ -1563,7 +1614,7 @@ impl Client {
         location: &str,
         image: &Reference,
         layer: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
-        size: usize,
+        size: u64,
         blob_digest: &str,
     ) -> Result<String> {
         let mut url =
@@ -1690,6 +1741,41 @@ impl Client {
                 .await?,
             end_range_inclusive + 1,
         ))
+    }
+
+    /// Sends `stream` to an already-open chunked upload session as a series of PATCH requests.
+    ///
+    /// `on_chunk` is invoked with each chunk right before it is sent, allowing callers to
+    /// incrementally compute a digest or otherwise observe the data without buffering it.
+    ///
+    /// Returns the upload location to use for the final commit request, alongside the total
+    /// number of bytes sent.
+    async fn push_stream_chunks(
+        &self,
+        location: String,
+        image: &Reference,
+        blob_data_stream: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+        mut on_chunk: impl FnMut(&bytes::Bytes),
+    ) -> Result<(String, u64)> {
+        let mut location = location;
+        let mut range_start = 0;
+        let mut size = 0u64;
+
+        let mut blob_data_stream = pin!(blob_data_stream);
+
+        while let Some(blob_data) = blob_data_stream.next().await {
+            let mut blob_data = blob_data?;
+            while !blob_data.is_empty() {
+                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+                size += chunk.len() as u64;
+                on_chunk(&chunk);
+                (location, range_start) = self
+                    .push_chunk(&location, image, chunk, range_start)
+                    .await?;
+            }
+        }
+
+        Ok((location, size))
     }
 
     /// Mounts a blob to the provided reference, from the given source
@@ -2596,7 +2682,6 @@ mod test {
 
     use bytes::Bytes;
     use rstest::rstest;
-    use sha2::Digest as _;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
@@ -4124,7 +4209,7 @@ mod test {
                 .take(n)
                 .map(Ok)
         };
-        let size = Some(repeat * chunk_size);
+        let size = Some((repeat * chunk_size) as u64);
 
         let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
             .expect("failed to parse reference");
@@ -4178,6 +4263,85 @@ mod test {
             .push_blob_stream(&reference, data_stream, data_hash, None)
             .await
             .expect_err("expected error when use_monolithic_push is true but size is None");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream_chunked_without_digest() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            use_monolithic_push: true,
+            ..Default::default()
+        });
+        client.push_chunk_size = 253;
+
+        // hash for a byte array counting 16 times from 0 to 255 ([0, 1, 2, ..., 255] * 16)
+        let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
+        let repeat = 16usize;
+        let data_stream = futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
+            .take(repeat)
+            .map(Ok);
+
+        let reference =
+            Reference::try_from(format!("localhost:{server_port}/test-push-stream-chunked"))
+                .expect("failed to parse reference");
+
+        let response = client
+            .push_blob_stream_chunked(&reference, data_stream)
+            .await
+            .expect("failed to push stream with chunked-only API");
+
+        assert_eq!(response.blob_digest, data_hash);
+        assert_eq!(response.size, (repeat * 256) as u64);
+        assert!(response.blob_url.ends_with(data_hash));
+
+        assert!(client
+            .blob_exists(&reference, data_hash)
+            .await
+            .expect("failed to check blob existence"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream_chunked_empty_stream() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+
+        let data_stream = futures_util::stream::empty::<crate::errors::Result<Bytes>>();
+
+        let reference = Reference::try_from(format!(
+            "localhost:{server_port}/test-push-stream-chunked-empty"
+        ))
+        .expect("failed to parse reference");
+
+        let err = client
+            .push_blob_stream_chunked(&reference, data_stream)
+            .await
+            .expect_err("expected error when pushing an empty stream");
+
+        assert!(matches!(err, OciDistributionError::PushNoDataError));
     }
 
     /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
