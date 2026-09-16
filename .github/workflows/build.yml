@@ -5,13 +5,19 @@ on:
       - main
   pull_request: {}
 
+permissions: {}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
         with:
           name: just
@@ -24,6 +30,8 @@ jobs:
 
   windows-build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     defaults:
       run:
         # For some reason, running with the default powershell doesn't work with the `Build` step,
@@ -31,6 +39,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
         with:
           name: just
@@ -44,6 +54,8 @@ jobs:
   cargo-deny:
     name: Run cargo deny
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         checks:
@@ -51,6 +63,8 @@ jobs:
           - bans licenses sources
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.0.3
         with:
           command: check ${{ matrix.checks }}
