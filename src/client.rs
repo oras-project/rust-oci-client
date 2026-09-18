@@ -2725,13 +2725,10 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 mod test {
     use super::*;
     use std::convert::TryFrom;
-    use std::fs;
-    use std::path;
     use std::result::Result;
 
     use bytes::Bytes;
     use rstest::rstest;
-    use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
 
@@ -2777,9 +2774,8 @@ mod test {
 
     #[cfg(feature = "test-registry")]
     use testcontainers::{
-        core::{Mount, WaitFor},
-        runners::AsyncRunner,
-        ContainerRequest, GenericImage, ImageExt,
+        core::WaitFor, runners::AsyncRunner, ContainerRequest, CopyTargetOptions, GenericImage,
+        ImageExt,
     };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
@@ -3836,13 +3832,16 @@ mod test {
     }
 
     #[cfg(feature = "test-registry")]
-    fn registry_image_basic_auth(auth_path: &str) -> ContainerRequest<GenericImage> {
+    fn registry_image_basic_auth() -> ContainerRequest<GenericImage> {
         GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
-            .with_mount(Mount::bind_mount(auth_path, "/auth"))
+            .with_copy_to(
+                CopyTargetOptions::new("/auth/htpasswd").with_mode(0o644),
+                HTPASSWD.as_bytes().to_vec(),
+            )
     }
 
     #[tokio::test]
@@ -3945,16 +3944,7 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_basic_auth() {
-        let auth_dir = TempDir::new().expect("cannot create tmp directory");
-        let htpasswd_path = path::Path::join(auth_dir.path(), "htpasswd");
-        fs::write(htpasswd_path, HTPASSWD).expect("cannot write htpasswd file");
-
-        let image = registry_image_basic_auth(
-            auth_dir
-                .path()
-                .to_str()
-                .expect("cannot convert htpasswd_path to string"),
-        );
+        let image = registry_image_basic_auth();
         let test_container = image.start().await.expect("cannot registry container");
 
         let auth =
