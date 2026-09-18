@@ -18,11 +18,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
+      # Tool version comes from the manifests bundled in the pinned
+      # install-action commit, so dependabot bumps of install-action also
+      # advance it.
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
-          name: just
-          url: https://github.com/casey/just/releases/download/0.10.2/just-0.10.2-x86_64-unknown-linux-musl.tar.gz
-          pathInArchive: just
+          tool: just
       - name: Build
         run: |
           just build
@@ -41,11 +42,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: engineerd/configurator@dc6b312d89ab097f73f3ebbf507a69dd7399c5d0 #v0.0.10
+      # Tool version comes from the manifests bundled in the pinned
+      # install-action commit, so dependabot bumps of install-action also
+      # advance it.
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
-          name: just
-          url: "https://github.com/casey/just/releases/download/0.10.2/just-0.10.2-x86_64-pc-windows-msvc.zip"
-          pathInArchive: just.exe
+          tool: just
       - name: Build
         run: |
           just --justfile justfile-windows build
@@ -65,6 +67,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # Tool version comes from the manifests bundled in the pinned
+      # install-action commit, so dependabot bumps of install-action also
+      # advance it.
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
-          command: check ${{ matrix.checks }}
+          tool: cargo-deny
+      - env:
+          CHECKS: ${{ matrix.checks }}
+        run: cargo deny --all-features check $CHECKS
