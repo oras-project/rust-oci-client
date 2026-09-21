@@ -17,10 +17,12 @@ use tracing::{debug, trace, warn};
 
 pub use crate::client::{
     current_platform_resolver, linux_amd64_resolver, windows_amd64_resolver, Certificate,
-    CertificateEncoding, ClientConfig, ClientProtocol, DEFAULT_MAX_CONCURRENT_DOWNLOAD,
-    DEFAULT_MAX_CONCURRENT_UPLOAD, DEFAULT_TOKEN_EXPIRATION_SECS,
+    CertificateEncoding, ClientConfig, ClientProtocol,
 };
 pub use crate::types::*;
+pub use crate::{
+    DEFAULT_MAX_CONCURRENT_DOWNLOAD, DEFAULT_MAX_CONCURRENT_UPLOAD, DEFAULT_TOKEN_EXPIRATION_SECS,
+};
 
 #[cfg(any(
     feature = "native-tls",
@@ -28,10 +30,7 @@ pub use crate::types::*;
     feature = "rustls-tls-no-provider"
 ))]
 use crate::client::convert_certificates;
-use crate::client::{
-    validate_registry_response, BearerChallenge, MIME_TYPES_DISTRIBUTION_MANIFEST,
-    PUSH_CHUNK_MAX_SIZE,
-};
+use crate::client::{validate_registry_response, BearerChallenge};
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
 use crate::errors::*;
 use crate::manifest::{
@@ -43,6 +42,7 @@ use crate::secrets::*;
 use crate::sha256_digest;
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, SyncTokenCache};
 use crate::Reference;
+use crate::{MIME_TYPES_DISTRIBUTION_MANIFEST, PUSH_CHUNK_MAX_SIZE};
 
 /// The OCI client connects to an OCI registry and fetches OCI images.
 ///
@@ -226,7 +226,7 @@ impl Client {
         last: Option<&str>,
     ) -> Result<TagResponse> {
         let op = RegistryOperation::Pull;
-        let url = self.to_list_tags_url(image);
+        let url = self.config.to_list_tags_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth);
 
@@ -521,7 +521,7 @@ impl Client {
     ) -> Result<String> {
         self.store_auth_if_needed(image.resolve_registry(), auth);
 
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -696,7 +696,7 @@ impl Client {
         image: &Reference,
         accepted_media_types: &[&str],
     ) -> Result<(Vec<u8>, String)> {
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -872,7 +872,7 @@ impl Client {
         length: Option<u64>,
     ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
-        let url = self.to_v2_blob_url(image, layer.digest);
+        let url = self.config.to_v2_blob_url(image, layer.digest);
 
         let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -927,7 +927,7 @@ impl Client {
     ///
     /// Returns URL with session UUID
     fn begin_push_monolithical_session(&mut self, image: &Reference) -> Result<String> {
-        let url = &self.to_v2_blob_upload_url(image);
+        let url = &self.config.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)?
@@ -947,7 +947,7 @@ impl Client {
     ///
     /// Returns URL with session UUID
     fn begin_push_chunked_session(&mut self, image: &Reference) -> Result<String> {
-        let url = &self.to_v2_blob_upload_url(image);
+        let url = &self.config.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)?
@@ -1073,7 +1073,7 @@ impl Client {
         source: &Reference,
         digest: &str,
     ) -> Result<()> {
-        let base_url = self.to_v2_blob_upload_url(image);
+        let base_url = self.config.to_v2_blob_upload_url(image);
         let url = Url::parse_with_params(
             &base_url,
             &[("mount", digest), ("from", source.repository())],
@@ -1122,7 +1122,7 @@ impl Client {
         body: Vec<u8>,
         content_type: HeaderValue,
     ) -> Result<ManifestPushResponse> {
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!(?url, ?content_type, "push manifest");
 
         let mut headers = HeaderMap::new();
@@ -1199,7 +1199,7 @@ impl Client {
         image: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<OciImageIndex> {
-        let url = self.to_v2_referrers_url(image, artifact_type)?;
+        let url = self.config.to_v2_referrers_url(image, artifact_type)?;
         debug!("Pulling referrers from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -1231,7 +1231,7 @@ impl Client {
             debug!(location=?location_header, "Location header");
             match location_header {
                 None => Err(OciDistributionError::RegistryNoLocationError),
-                Some(lh) => self.location_header_to_url(image, lh),
+                Some(lh) => self.config.location_header_to_url(image, lh),
             }
         } else if res.status().is_success() && expected_status.is_success() {
             Err(OciDistributionError::SpecViolationError(format!(
@@ -1245,102 +1245,6 @@ impl Client {
             let message = res.text()?;
             Err(OciDistributionError::ServerError { url, code, message })
         }
-    }
-
-    /// Helper function to convert location header to URL
-    ///
-    /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
-    /// Returns a properly formatted absolute URL
-    fn location_header_to_url(
-        &self,
-        image: &Reference,
-        location_header: &reqwest::header::HeaderValue,
-    ) -> Result<String> {
-        let lh = location_header.to_str()?;
-        if lh.starts_with("/") {
-            let registry = image.resolve_registry();
-            Ok(format!(
-                "{scheme}://{registry}{lh}",
-                scheme = self.config.protocol.scheme_for(registry)
-            ))
-        } else {
-            Ok(lh.to_string())
-        }
-    }
-
-    /// Convert a Reference to a v2 manifest URL.
-    fn to_v2_manifest_url(&self, reference: &Reference) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/manifests/{reference}{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            reference = if let Some(digest) = reference.digest() {
-                digest
-            } else {
-                reference.tag().unwrap_or("latest")
-            },
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Convert a Reference to a v2 blob (layer) URL.
-    fn to_v2_blob_url(&self, reference: &Reference, digest: &str) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/blobs/{digest}{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Convert a Reference to a v2 blob upload URL.
-    fn to_v2_blob_upload_url(&self, reference: &Reference) -> String {
-        self.to_v2_blob_url(reference, "uploads/")
-    }
-
-    fn to_list_tags_url(&self, reference: &Reference) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/tags/list{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Convert a Reference to a v2 manifest URL.
-    fn to_v2_referrers_url(
-        &self,
-        reference: &Reference,
-        artifact_type: Option<&str>,
-    ) -> Result<String> {
-        let registry = reference.resolve_registry();
-        Ok(format!(
-            "{scheme}://{registry}/v2/{repository}/referrers/{reference}{at}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            reference = if let Some(digest) = reference.digest() {
-                digest
-            } else {
-                return Err(OciDistributionError::GenericError(Some(
-                    "Getting referrers for a tag is not supported".into(),
-                )));
-            },
-            at = artifact_type
-                .map(|at| format!("?artifactType={at}"))
-                .unwrap_or_default(),
-        ))
     }
 }
 
@@ -1563,7 +1467,7 @@ mod test {
     #[test]
     fn test_to_v2_blob_url() {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         assert_eq!(
             c.to_v2_blob_url(&image, "sha256:deadbeef"),
@@ -1585,7 +1489,7 @@ mod test {
     )]
     fn test_to_v2_manifest(image: &str, expected_uri: &str, expected_mirror_uri: &str) {
         let mut reference = Reference::try_from(image).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
         assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
 
         reference.set_mirror_registry("docker.mirror.io".to_owned());
@@ -1595,7 +1499,7 @@ mod test {
     #[test]
     fn test_to_v2_blob_upload_url() {
         let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_v2_blob_upload_url(&image);
+        let blob_url = ClientConfig::default().to_v2_blob_upload_url(&image);
 
         assert_eq!(
             blob_url,
@@ -1606,7 +1510,7 @@ mod test {
     #[test]
     fn test_to_list_tags_url() {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         assert_eq!(
             c.to_list_tags_url(&image),
@@ -1622,10 +1526,10 @@ mod test {
 
     #[test]
     fn manifest_url_generation_respects_http_protocol() {
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -1636,10 +1540,10 @@ mod test {
 
     #[test]
     fn blob_url_generation_respects_http_protocol() {
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -1652,10 +1556,10 @@ mod test {
     fn manifest_url_generation_uses_https_if_not_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -1668,10 +1572,10 @@ mod test {
     fn manifest_url_generation_uses_http_if_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("oci.registry.local/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -1684,10 +1588,10 @@ mod test {
     fn blob_url_generation_uses_https_if_not_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -1700,10 +1604,10 @@ mod test {
     fn blob_url_generation_uses_http_if_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("oci.registry.local/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
