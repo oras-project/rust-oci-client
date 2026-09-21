@@ -1236,22 +1236,35 @@ impl<'a> RequestBuilderWrapper<'a> {
 }
 
 // Composable functions applicable to a `RequestBuilderWrapper`
-impl<'a> RequestBuilderWrapper<'a> {
+impl RequestBuilderWrapper<'_> {
+    /// Returns a clone of the inner `RequestBuilder`.
+    ///
+    /// Cloning fails if the request has a streaming body, which is never the
+    /// case here since bodies are attached after the wrapper is consumed.
+    fn cloned_request_builder(&self) -> Result<RequestBuilder> {
+        self.request_builder.try_clone().ok_or_else(|| {
+            OciDistributionError::GenericError(Some("could not clone request builder".to_string()))
+        })
+    }
+
     fn apply_accept(&mut self, accept: &[&str]) -> Result<RequestBuilderWrapper<'_>> {
         let request_builder = self
-            .request_builder
-            .try_clone()
-            .ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "could not clone request builder".to_string(),
-                ))
-            })?
+            .cloned_request_builder()?
             .header("Accept", Vec::from(accept).join(", "));
 
         Ok(RequestBuilderWrapper {
             client: self.client,
             request_builder,
         })
+    }
+
+    /// Returns whether the request being built is addressed to the registry the
+    /// credentials of `image` belong to. See [`ClientConfig::targets_credential_registry`].
+    fn targets_credential_registry(&self, image: &Reference) -> Result<bool> {
+        let request = self.cloned_request_builder()?.build()?;
+        self.client
+            .config
+            .targets_credential_registry(request.url(), image)
     }
 
     /// Updates request as necessary for authentication.
@@ -1265,8 +1278,22 @@ impl<'a> RequestBuilderWrapper<'a> {
         image: &Reference,
         op: RegistryOperation,
     ) -> Result<RequestBuilderWrapper<'_>> {
-        let mut headers = HeaderMap::new();
+        // NOTE: we must not authenticate requests addressed outside of the
+        // registry, as those can be abused to leak credentials or tokens.
+        // Please refer to CVE-2020-15157 for more information.
+        if !self.targets_credential_registry(image)? {
+            debug!(
+                registry = image.resolve_registry(),
+                "Not authenticating a request addressed outside of the registry"
+            );
+            let request_builder = self.cloned_request_builder()?;
+            return Ok(RequestBuilderWrapper {
+                client: self.client,
+                request_builder,
+            });
+        }
 
+        let mut headers = HeaderMap::new();
         if let Some(token) = self.client.get_auth_token(image, op) {
             match token {
                 RegistryTokenType::Bearer(token) => {
@@ -1275,33 +1302,21 @@ impl<'a> RequestBuilderWrapper<'a> {
                 }
                 RegistryTokenType::Basic(username, password) => {
                     debug!("Using HTTP basic authentication.");
+                    let request_builder = self
+                        .cloned_request_builder()?
+                        .headers(headers)
+                        .basic_auth(username.to_string(), Some(password.to_string()));
                     return Ok(RequestBuilderWrapper {
                         client: self.client,
-                        request_builder: self
-                            .request_builder
-                            .try_clone()
-                            .ok_or_else(|| {
-                                OciDistributionError::GenericError(Some(
-                                    "could not clone request builder".to_string(),
-                                ))
-                            })?
-                            .headers(headers)
-                            .basic_auth(username.to_string(), Some(password.to_string())),
+                        request_builder,
                     });
                 }
             }
         }
+        let request_builder = self.cloned_request_builder()?.headers(headers);
         Ok(RequestBuilderWrapper {
             client: self.client,
-            request_builder: self
-                .request_builder
-                .try_clone()
-                .ok_or_else(|| {
-                    OciDistributionError::GenericError(Some(
-                        "could not clone request builder".to_string(),
-                    ))
-                })?
-                .headers(headers),
+            request_builder,
         })
     }
 }
@@ -1407,7 +1422,7 @@ mod test {
         );
         assert_eq!(
             RequestBuilderWrapper::from_client(&mut client, |client| client
-                .get("https://example.com/some/module.wasm"))
+                .get("https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"))
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
@@ -1415,7 +1430,22 @@ mod test {
             .into_request_builder()
             .build()?
             .headers()["Authorization"],
-            format!("Bearer {}", token)
+            format!("Bearer {token}")
+        );
+
+        // The token must not be sent to a host other than the registry it
+        // belongs to.
+        assert!(
+            !RequestBuilderWrapper::from_client(&mut client, |client| client
+                .get("https://example.com/some/module.wasm"))
+            .apply_auth(
+                &Reference::try_from(HELLO_IMAGE_TAG)?,
+                RegistryOperation::Pull
+            )?
+            .into_request_builder()
+            .build()?
+            .headers()
+            .contains_key("Authorization")
         );
 
         Ok(())

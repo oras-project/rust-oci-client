@@ -2017,28 +2017,9 @@ impl<'a> RequestBuilderWrapper<'a> {
     /// same way, since the credentials would otherwise go out in the clear.
     fn targets_credential_registry(&self, image: &Reference) -> Result<bool> {
         let request = self.cloned_request_builder()?.build()?;
-        let target = request.url();
-
-        let registry = image.resolve_registry();
-        let registry_url = Url::parse(&format!(
-            "{scheme}://{registry}",
-            scheme = self.client.config.protocol.scheme_for(registry)
-        ))
-        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
-
-        if target.host_str() != registry_url.host_str() {
-            return Ok(false);
-        }
-        if target.port_or_known_default() != registry_url.port_or_known_default() {
-            return Ok(false);
-        }
-        // The registry is reached over https, the credentials must not go out
-        // in the clear.
-        if registry_url.scheme() == "https" && target.scheme() != "https" {
-            return Ok(false);
-        }
-
-        Ok(true)
+        self.client
+            .config
+            .targets_credential_registry(request.url(), image)
     }
 
     /// Updates request as necessary for authentication.
@@ -2239,6 +2220,45 @@ impl Default for ClientConfig {
 
 // URL construction helpers shared by the asynchronous and blocking clients.
 impl ClientConfig {
+    /// Returns whether a request to `target` is addressed to the registry the
+    /// credentials of `image` belong to.
+    ///
+    /// The upload `Location` returned by a registry may be absolute and point at
+    /// another host (e.g. a signed URL of a cloud storage provider), which the
+    /// distribution specification permits. Sending the `Authorization` header
+    /// there is what it does not permit: clients "MUST NOT forward Authorization
+    /// headers across host boundaries unless explicitly configured to do so".
+    /// See also CVE-2020-15157.
+    ///
+    /// A same-host location that drops back from https to http is treated the
+    /// same way, since the credentials would otherwise go out in the clear.
+    pub(crate) fn targets_credential_registry(
+        &self,
+        target: &Url,
+        image: &Reference,
+    ) -> Result<bool> {
+        let registry = image.resolve_registry();
+        let registry_url = Url::parse(&format!(
+            "{scheme}://{registry}",
+            scheme = self.protocol.scheme_for(registry)
+        ))
+        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+
+        if target.host_str() != registry_url.host_str() {
+            return Ok(false);
+        }
+        if target.port_or_known_default() != registry_url.port_or_known_default() {
+            return Ok(false);
+        }
+        // The registry is reached over https, the credentials must not go out
+        // in the clear.
+        if registry_url.scheme() == "https" && target.scheme() != "https" {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     /// Helper function to convert location header to URL
     ///
     /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
