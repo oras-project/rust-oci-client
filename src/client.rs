@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::Digest as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use tracing::{debug, trace, warn};
 
 pub use crate::blob::*;
@@ -35,6 +36,7 @@ use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::transport::{self, Transport};
 use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -302,16 +304,20 @@ pub struct Client {
     /// Token cache for the client
     pub tokens: TokenCache,
     client: reqwest::Client,
+    /// Transport the requests are sent through. It wraps `client`.
+    transport: Transport,
     push_chunk_size: usize,
 }
 
 impl Default for Client {
     fn default() -> Self {
+        let client = reqwest::Client::default();
         Self {
             config: Arc::default(),
             auth_store: Arc::default(),
             tokens: TokenCache::new(DEFAULT_TOKEN_EXPIRATION_SECS),
-            client: reqwest::Client::default(),
+            transport: transport::from_reqwest(client.clone()),
+            client,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         }
     }
@@ -380,10 +386,12 @@ impl TryFrom<ClientConfig> for Client {
         }
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
+        let client = client_builder.build()?;
         Ok(Self {
             config: Arc::new(config),
             tokens: TokenCache::new(default_token_expiration_secs),
-            client: client_builder.build()?,
+            transport: transport::from_reqwest(client.clone()),
+            client,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             ..Default::default()
         })
@@ -408,6 +416,18 @@ impl Client {
     /// Create a new client with the supplied config
     pub fn from_source(config_source: &impl ClientConfigSource) -> Self {
         Self::new(config_source.client_config())
+    }
+
+    /// Sends a request through the transport.
+    async fn send(
+        &self,
+        request: http::Request<transport::Body>,
+    ) -> Result<http::Response<transport::Body>> {
+        self.transport
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(transport::into_oci_error)
     }
 
     async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
@@ -935,17 +955,16 @@ impl Client {
 
         let url = self.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
-        let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
+        let request = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder()
-            .send()
-            .await?;
+            .into_http_request()?;
+        let res = self.send(request).await?;
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
             let status = res.status();
-            let body = res.bytes().await?;
+            let body = transport::collect(res.into_body()).await?;
             validate_registry_response(status, &body, &url)?;
 
             // If the reference has a digest and the digest header has a matching algorithm, compare
@@ -967,17 +986,16 @@ impl Client {
             Ok(digest)
         } else {
             debug!("GET image manifest from {}", url);
-            let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+            let request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
                 .apply_auth(image, RegistryOperation::Pull)
                 .await?
-                .into_request_builder()
-                .send()
-                .await?;
+                .into_http_request()?;
+            let res = self.send(request).await?;
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
-            let body = res.bytes().await?;
+            let body = transport::collect(res.into_body()).await?;
             validate_registry_response(status, &body, &url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
@@ -2331,6 +2349,16 @@ impl<'a> RequestBuilderWrapper<'a> {
     // Produces a final `RequestBuilder` out of this `RequestBuilderWrapper`
     fn into_request_builder(self) -> RequestBuilder {
         self.request_builder
+    }
+
+    /// Produces an `http::Request` to send through [`Client::send`].
+    ///
+    /// The request is still built with `reqwest`, so that authentication and
+    /// headers are applied exactly as for the requests sent with
+    /// [`Self::into_request_builder`].
+    fn into_http_request(self) -> Result<http::Request<transport::Body>> {
+        let request = http::Request::<reqwest::Body>::try_from(self.request_builder.build()?)?;
+        Ok(request.map(transport::from_reqwest_body))
     }
 }
 
