@@ -26,17 +26,3 @@ impl fmt::Debug for RegistryAuth {
         }
     }
 }
-
-pub(crate) trait Authenticable {
-    fn apply_authentication(self, auth: &RegistryAuth) -> Self;
-}
-
-impl Authenticable for reqwest::RequestBuilder {
-    fn apply_authentication(self, auth: &RegistryAuth) -> Self {
-        match auth {
-            RegistryAuth::Anonymous => self,
-            RegistryAuth::Basic(username, password) => self.basic_auth(username, Some(password)),
-            RegistryAuth::Bearer(token) => self.bearer_auth(token),
-        }
-    }
-}

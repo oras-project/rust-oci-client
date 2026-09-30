@@ -37,6 +37,14 @@ pub enum OciDistributionError {
     #[error(transparent)]
     /// Transparent wrapper around `serde_json::error::Error`
     JsonError(#[from] serde_json::error::Error),
+    /// Browser Fetch concealed a manual redirect response.
+    #[error(
+        "browser Fetch concealed the redirect response for {url}; its status and Location header are not observable"
+    )]
+    BrowserRedirectNotObservable {
+        /// URL whose redirect response could not be inspected.
+        url: String,
+    },
     /// Manifest is not valid UTF-8
     #[error("Manifest is not valid UTF-8")]
     ManifestEncodingError(#[from] std::str::Utf8Error),
@@ -72,6 +80,17 @@ pub enum OciDistributionError {
     /// Transparent wrapper around `reqwest::Error`
     #[error(transparent)]
     RequestError(#[from] reqwest::Error),
+    /// The HTTP redirect limit was exceeded.
+    #[error("too many redirects (limit {limit}) while requesting {url}")]
+    RedirectLimitExceeded {
+        /// The last URL requested before the limit was exceeded.
+        url: String,
+        /// Maximum number of redirects followed.
+        limit: usize,
+    },
+    /// An error returned by a caller-provided HTTP transport
+    #[error("HTTP transport error: {0}")]
+    TransportError(#[source] crate::transport::BoxError),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {
