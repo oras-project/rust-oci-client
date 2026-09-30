@@ -37,8 +37,10 @@ pub(crate) async fn push_wasm(
     let response = client
         .push(reference, &layers, config, auth, Some(image_manifest))
         .await
-        .map(|push_response| push_response.manifest_url)
         .expect("Cannot push Wasm module");
 
-    println!("Wasm module successfully pushed {response:?}");
+    println!(
+        "Wasm module successfully pushed {} (digest {})",
+        response.manifest_url, response.manifest_digest
+    );
 }
