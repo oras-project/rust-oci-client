@@ -694,13 +694,12 @@ impl Client {
         blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
-        let mut location = self.begin_push_chunked_session(image).await?;
+        let (mut location, chunk_size) = self.begin_push_chunked_session(image).await?;
         let mut start: usize = 0;
 
         let mut blob_data: bytes::Bytes = blob_data.into();
         while !blob_data.is_empty() {
-            let chunk_size = self.push_chunk_size.min(blob_data.len());
-            let chunk = blob_data.split_to(chunk_size);
+            let chunk = blob_data.split_to(chunk_size.min(blob_data.len()));
             (location, start) = self.push_chunk(&location, image, chunk, start).await?;
         }
         self.end_push_chunked_session(&location, image, blob_digest)
@@ -740,9 +739,9 @@ impl Client {
                 .await;
         }
 
-        let location = self.begin_push_chunked_session(image).await?;
+        let (location, chunk_size) = self.begin_push_chunked_session(image).await?;
         let (location, _size) = self
-            .push_stream_chunks(location, image, blob_data_stream, |_| {})
+            .push_stream_chunks(location, image, blob_data_stream, chunk_size, |_| {})
             .await?;
         self.end_push_chunked_session(&location, image, blob_digest)
             .await
@@ -772,11 +771,11 @@ impl Client {
             );
         }
 
-        let location = self.begin_push_chunked_session(image).await?;
+        let (location, chunk_size) = self.begin_push_chunked_session(image).await?;
 
         let mut digester = Digester::Sha256(sha2::Sha256::new());
         let (location, size) = self
-            .push_stream_chunks(location, image, blob_data_stream, |chunk| {
+            .push_stream_chunks(location, image, blob_data_stream, chunk_size, |chunk| {
                 digester.update(chunk)
             })
             .await?;
@@ -1568,7 +1567,7 @@ impl Client {
     /// Begins a session to push an image to registry as a series of chunks
     ///
     /// Returns URL with session UUID
-    async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
+    async fn begin_push_chunked_session(&self, image: &Reference) -> Result<(String, usize)> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
@@ -1579,9 +1578,13 @@ impl Client {
             .send()
             .await?;
 
+        let headers = res.headers().clone();
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
-        self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
-            .await
+        let location = self
+            .extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
+            .await?;
+        let chunk_size = upload_chunk_size(&headers, self.push_chunk_size)?;
+        Ok((location, chunk_size))
     }
 
     /// Closes the chunked push session
@@ -1755,6 +1758,7 @@ impl Client {
         location: String,
         image: &Reference,
         blob_data_stream: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+        chunk_size: usize,
         mut on_chunk: impl FnMut(&bytes::Bytes),
     ) -> Result<(String, u64)> {
         let mut location = location;
@@ -1762,17 +1766,37 @@ impl Client {
         let mut size = 0u64;
 
         let mut blob_data_stream = pin!(blob_data_stream);
+        let mut pending = bytes::BytesMut::new();
 
         while let Some(blob_data) = blob_data_stream.next().await {
             let mut blob_data = blob_data?;
             while !blob_data.is_empty() {
-                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+                let chunk = if pending.is_empty() && blob_data.len() >= chunk_size {
+                    // Preserve the zero-copy path when the input already contains a full chunk.
+                    blob_data.split_to(chunk_size)
+                } else {
+                    let needed = chunk_size - pending.len();
+                    pending.extend_from_slice(&blob_data.split_to(needed.min(blob_data.len())));
+                    if pending.len() < chunk_size {
+                        continue;
+                    }
+                    pending.split().freeze()
+                };
                 size += chunk.len() as u64;
                 on_chunk(&chunk);
                 (location, range_start) = self
                     .push_chunk(&location, image, chunk, range_start)
                     .await?;
             }
+        }
+        // Only the final upload chunk may be shorter than the advertised minimum.
+        if !pending.is_empty() {
+            let chunk = pending.freeze();
+            size += chunk.len() as u64;
+            on_chunk(&chunk);
+            (location, _) = self
+                .push_chunk(&location, image, chunk, range_start)
+                .await?;
         }
 
         Ok((location, size))
@@ -2206,6 +2230,26 @@ impl Client {
         }
         Ok(url.into())
     }
+}
+
+// Keep the registry's minimum local to this upload session: a Client can be
+// shared between registries with different requirements.
+fn upload_chunk_size(headers: &HeaderMap, default: usize) -> Result<usize> {
+    let Some(value) = headers.get("OCI-Chunk-Min-Length") else {
+        return Ok(default);
+    };
+    let minimum = value
+        .to_str()
+        .ok()
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|minimum| *minimum > 0 && *minimum <= isize::MAX as usize)
+        .ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "invalid OCI-Chunk-Min-Length header".to_owned(),
+            ))
+        })?;
+    Ok(default.max(minimum))
 }
 
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
@@ -3867,7 +3911,7 @@ mod test {
             .await
             .expect("result from auth request");
 
-        let location = c
+        let (location, _) = c
             .begin_push_chunked_session(&image)
             .await
             .expect("failed to begin push session");
