@@ -46,6 +46,10 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
 
+// Bound the amount of input a registry can require us to coalesce in memory.
+// This is a client resource limit, not a limit imposed by the OCI specification.
+const MAX_UPLOAD_CHUNK_MINIMUM: usize = 64 * 1024 * 1024;
+
 /// Default value for `ClientConfig::max_concurrent_upload`
 pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
 
@@ -643,7 +647,9 @@ impl Client {
         })
     }
 
-    /// Pushes a blob to the registry
+    /// Pushes a blob to the registry.
+    ///
+    /// Chunked uploads reject a registry's minimum chunk length above 64 MiB.
     pub async fn push_blob(
         &self,
         image_ref: &Reference,
@@ -694,7 +700,8 @@ impl Client {
         blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
-        let (mut location, chunk_size) = self.begin_push_chunked_session(image).await?;
+        let (mut location, minimum) = self.begin_push_chunked_session(image).await?;
+        let chunk_size = self.push_chunk_size.max(minimum);
         let mut start: usize = 0;
 
         let mut blob_data: bytes::Bytes = blob_data.into();
@@ -714,6 +721,7 @@ impl Client {
     ///
     /// If `use_monolithic_push` is false the blob is sent as a series of chunked PATCH requests
     /// and `size` is ignored.
+    /// A registry's minimum chunk length above 64 MiB is rejected before polling the stream.
     ///
     /// Note: unlike [`push_blob`], there is no automatic fallback to monolithic push on a
     /// `SpecViolationError` from the chunked path, because a stream cannot be replayed after
@@ -739,9 +747,9 @@ impl Client {
                 .await;
         }
 
-        let (location, chunk_size) = self.begin_push_chunked_session(image).await?;
+        let (location, minimum) = self.begin_push_chunked_session(image).await?;
         let (location, _size) = self
-            .push_stream_chunks(location, image, blob_data_stream, chunk_size, |_| {})
+            .push_stream_chunks(location, image, blob_data_stream, minimum, |_| {})
             .await?;
         self.end_push_chunked_session(&location, image, blob_digest)
             .await
@@ -753,6 +761,7 @@ impl Client {
     /// Unlike [`push_blob_stream`], the caller does not need to know the digest upfront.
     /// The digest is computed incrementally as each chunk is sent, then supplied to the
     /// registry in the final commit request.
+    /// A registry's minimum chunk length above 64 MiB is rejected before polling the stream.
     ///
     /// Monolithic push is not supported by this method; the blob is always sent as a series
     /// of chunked PATCH requests regardless of the `use_monolithic_push` setting.
@@ -771,11 +780,11 @@ impl Client {
             );
         }
 
-        let (location, chunk_size) = self.begin_push_chunked_session(image).await?;
+        let (location, minimum) = self.begin_push_chunked_session(image).await?;
 
         let mut digester = Digester::Sha256(sha2::Sha256::new());
         let (location, size) = self
-            .push_stream_chunks(location, image, blob_data_stream, chunk_size, |chunk| {
+            .push_stream_chunks(location, image, blob_data_stream, minimum, |chunk| {
                 digester.update(chunk)
             })
             .await?;
@@ -1566,7 +1575,7 @@ impl Client {
 
     /// Begins a session to push an image to registry as a series of chunks
     ///
-    /// Returns URL with session UUID
+    /// Returns the upload URL and the registry's minimum chunk length (zero if absent).
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<(String, usize)> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
@@ -1578,13 +1587,13 @@ impl Client {
             .send()
             .await?;
 
-        let headers = res.headers().clone();
+        let minimum = upload_chunk_minimum(res.headers());
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
         let location = self
             .extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
             .await?;
-        let chunk_size = upload_chunk_size(&headers, self.push_chunk_size)?;
-        Ok((location, chunk_size))
+        // Preserve status and Location errors before reporting an invalid minimum.
+        Ok((location, minimum?))
     }
 
     /// Closes the chunked push session
@@ -1749,7 +1758,8 @@ impl Client {
     /// Sends `stream` to an already-open chunked upload session as a series of PATCH requests.
     ///
     /// `on_chunk` is invoked with each chunk right before it is sent, allowing callers to
-    /// incrementally compute a digest or otherwise observe the data without buffering it.
+    /// incrementally compute a digest. Input fragments are buffered only when shorter than
+    /// the registry's minimum; without a minimum the original stream boundaries are retained.
     ///
     /// Returns the upload location to use for the final commit request, alongside the total
     /// number of bytes sent.
@@ -1758,7 +1768,7 @@ impl Client {
         location: String,
         image: &Reference,
         blob_data_stream: impl Stream<Item = Result<bytes::Bytes>> + Send + 'static,
-        chunk_size: usize,
+        minimum: usize,
         mut on_chunk: impl FnMut(&bytes::Bytes),
     ) -> Result<(String, u64)> {
         let mut location = location;
@@ -1767,17 +1777,18 @@ impl Client {
 
         let mut blob_data_stream = pin!(blob_data_stream);
         let mut pending = bytes::BytesMut::new();
+        let chunk_size = self.push_chunk_size.max(minimum);
 
         while let Some(blob_data) = blob_data_stream.next().await {
             let mut blob_data = blob_data?;
             while !blob_data.is_empty() {
-                let chunk = if pending.is_empty() && blob_data.len() >= chunk_size {
-                    // Preserve the zero-copy path when the input already contains a full chunk.
-                    blob_data.split_to(chunk_size)
+                let chunk = if pending.is_empty() && blob_data.len() >= minimum {
+                    // Eligible input fragments retain the original zero-copy path.
+                    blob_data.split_to(chunk_size.min(blob_data.len()))
                 } else {
-                    let needed = chunk_size - pending.len();
+                    let needed = minimum - pending.len();
                     pending.extend_from_slice(&blob_data.split_to(needed.min(blob_data.len())));
-                    if pending.len() < chunk_size {
+                    if pending.len() < minimum {
                         continue;
                     }
                     pending.split().freeze()
@@ -2234,22 +2245,26 @@ impl Client {
 
 // Keep the registry's minimum local to this upload session: a Client can be
 // shared between registries with different requirements.
-fn upload_chunk_size(headers: &HeaderMap, default: usize) -> Result<usize> {
+fn upload_chunk_minimum(headers: &HeaderMap) -> Result<usize> {
     let Some(value) = headers.get("OCI-Chunk-Min-Length") else {
-        return Ok(default);
+        return Ok(0);
     };
     let minimum = value
         .to_str()
         .ok()
         .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|minimum| *minimum > 0 && *minimum <= isize::MAX as usize)
         .ok_or_else(|| {
             OciDistributionError::GenericError(Some(
                 "invalid OCI-Chunk-Min-Length header".to_owned(),
             ))
         })?;
-    Ok(default.max(minimum))
+    if minimum > MAX_UPLOAD_CHUNK_MINIMUM {
+        return Err(OciDistributionError::GenericError(Some(
+            "OCI-Chunk-Min-Length exceeds the supported maximum of 64 MiB".to_owned(),
+        )));
+    }
+    Ok(minimum)
 }
 
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
