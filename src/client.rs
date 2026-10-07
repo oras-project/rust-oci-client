@@ -1,7 +1,6 @@
 //! OCI distribution client for fetching oci images from an OCI compliant remote store
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::hash::Hash;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,19 +14,19 @@ use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Serialize;
 use sha2::Digest as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 pub use crate::blob::*;
-use crate::config::ConfigFile;
+pub use crate::types::*;
+
 use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
 use crate::errors::*;
 use crate::manifest::{
-    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
-    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+    ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest, Versioned,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
 };
@@ -37,248 +36,10 @@ use crate::sha256_digest;
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use crate::Reference;
 
-const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
-    IMAGE_MANIFEST_MEDIA_TYPE,
-    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
-    OCI_IMAGE_MEDIA_TYPE,
-    OCI_IMAGE_INDEX_MEDIA_TYPE,
-];
-
-const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
-
-/// Default value for `ClientConfig::max_concurrent_upload`
-pub const DEFAULT_MAX_CONCURRENT_UPLOAD: usize = 16;
-
-/// Default value for `ClientConfig::max_concurrent_download`
-pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
-
-/// Default value for `ClientConfig:default_token_expiration_secs`
-pub const DEFAULT_TOKEN_EXPIRATION_SECS: usize = 60;
-
-static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-/// The data for an image or module.
-#[derive(Clone)]
-pub struct ImageData {
-    /// The layers of the image or module.
-    pub layers: Vec<ImageLayer>,
-    /// The digest of the image or module.
-    pub digest: Option<String>,
-    /// The Configuration object of the image or module.
-    pub config: Config,
-    /// The manifest of the image or module.
-    pub manifest: Option<OciImageManifest>,
-}
-
-/// The data returned by an OCI registry after a successful push
-/// operation is completed
-pub struct PushResponse {
-    /// Pullable url for the config
-    pub config_url: String,
-    /// Pullable url for the manifest
-    pub manifest_url: String,
-}
-
-/// The data returned by [`Client::push_blob_stream_chunked`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushBlobStreamChunkedResponse {
-    /// Pullable url for the uploaded blob.
-    pub blob_url: String,
-    /// Computed digest of the uploaded blob.
-    pub blob_digest: String,
-    /// Total uploaded blob size in bytes.
-    pub size: u64,
-}
-
-/// The data returned by a successful tags/list Request
-#[derive(Deserialize, Debug)]
-pub struct TagResponse {
-    /// Repository Name
-    pub name: String,
-    /// List of existing Tags
-    #[serde(deserialize_with = "null_as_default")]
-    pub tags: Vec<String>,
-}
-
-/// Helper to deserialize an empty value from a JSON `null`.
-fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    let res = <Option<T>>::deserialize(d)?.unwrap_or_default();
-    Ok(res)
-}
-
-/// The data returned by a successful catalog request.
-#[derive(Deserialize, Debug)]
-pub struct CatalogResponse {
-    /// List of available repositories in the registry.
-    pub repositories: Vec<String>,
-}
-
-/// Layer descriptor required to pull a layer
-pub struct LayerDescriptor<'a> {
-    /// The digest of the layer
-    pub digest: &'a str,
-    /// Optional list of additional URIs to pull the layer from
-    pub urls: &'a Option<Vec<String>>,
-}
-
-/// A trait for converting any type into a [`LayerDescriptor`]
-pub trait AsLayerDescriptor {
-    /// Convert the type to a LayerDescriptor reference
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
-}
-
-impl<T: AsLayerDescriptor> AsLayerDescriptor for &T {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        (*self).as_layer_descriptor()
-    }
-}
-
-impl AsLayerDescriptor for &str {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: self,
-            urls: &None,
-        }
-    }
-}
-
-impl AsLayerDescriptor for &OciDescriptor {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: &self.digest,
-            urls: &self.urls,
-        }
-    }
-}
-
-impl AsLayerDescriptor for &LayerDescriptor<'_> {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: self.digest,
-            urls: self.urls,
-        }
-    }
-}
-
-/// The data and media type for an image layer
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ImageLayer {
-    /// The data of this layer
-    pub data: bytes::Bytes,
-    /// The media type of this layer
-    pub media_type: String,
-    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
-    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<BTreeMap<String, String>>,
-}
-
-impl ImageLayer {
-    /// Constructs a new ImageLayer struct with provided data and media type
-    pub fn new(
-        data: impl Into<bytes::Bytes>,
-        media_type: String,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        ImageLayer {
-            data: data.into(),
-            media_type,
-            annotations,
-        }
-    }
-
-    /// Constructs a new ImageLayer struct with provided data and
-    /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
-    }
-    /// Constructs a new ImageLayer struct with provided data and
-    /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
-    }
-
-    /// Helper function to compute the sha256 digest of an image layer
-    pub fn sha256_digest(&self) -> String {
-        sha256_digest(&self.data)
-    }
-}
-
-/// The data and media type for a configuration object
-#[derive(Clone)]
-pub struct Config {
-    /// The data of this config object
-    pub data: bytes::Bytes,
-    /// The media type of this object
-    pub media_type: String,
-    /// This OPTIONAL property contains arbitrary metadata for this descriptor.
-    /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules)
-    pub annotations: Option<BTreeMap<String, String>>,
-}
-
-impl Config {
-    /// Constructs a new Config struct with provided data and media type
-    pub fn new(
-        data: impl Into<bytes::Bytes>,
-        media_type: String,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Config {
-            data: data.into(),
-            media_type,
-            annotations,
-        }
-    }
-
-    /// Constructs a new Config struct with provided data and
-    /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(
-        data: impl Into<bytes::Bytes>,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Self {
-        Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
-    }
-
-    /// Construct a new Config struct with provided [`ConfigFile`] and
-    /// media type `application/vnd.oci.image.config.v1+json`
-    pub fn oci_v1_from_config_file(
-        config_file: ConfigFile,
-        annotations: Option<BTreeMap<String, String>>,
-    ) -> Result<Self> {
-        let data = serde_json::to_vec(&config_file)?;
-        Ok(Self::new(
-            data,
-            IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            annotations,
-        ))
-    }
-
-    /// Helper function to compute the sha256 digest of this config object
-    pub fn sha256_digest(&self) -> String {
-        sha256_digest(&self.data)
-    }
-}
-
-impl TryFrom<Config> for ConfigFile {
-    type Error = crate::errors::OciDistributionError;
-
-    fn try_from(config: Config) -> Result<Self> {
-        let config = String::from_utf8(config.data.into())
-            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
-        let config_file: ConfigFile = serde_json::from_str(&config)
-            .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
-        Ok(config_file)
-    }
-}
+pub use crate::{
+    DEFAULT_MAX_CONCURRENT_DOWNLOAD, DEFAULT_MAX_CONCURRENT_UPLOAD, DEFAULT_TOKEN_EXPIRATION_SECS,
+};
+use crate::{DEFAULT_USER_AGENT, MIME_TYPES_DISTRIBUTION_MANIFEST, PUSH_CHUNK_MAX_SIZE};
 
 /// The OCI client connects to an OCI registry and fetches OCI images.
 ///
@@ -465,7 +226,7 @@ impl Client {
         last: Option<&str>,
     ) -> Result<TagResponse> {
         let op = RegistryOperation::Pull;
-        let url = self.to_list_tags_url(image);
+        let url = self.config.to_list_tags_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
@@ -550,7 +311,7 @@ impl Client {
 
     /// Checks if a blob exists in the remote registry
     pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
-        let url = self.to_v2_blob_url(image, digest);
+        let url = self.config.to_v2_blob_url(image, digest);
         let request = RequestBuilderWrapper {
             client: self,
             request_builder: self.client.head(&url),
@@ -933,7 +694,7 @@ impl Client {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1161,7 +922,7 @@ impl Client {
         image: &Reference,
         accepted_media_types: &[&str],
     ) -> Result<(bytes::Bytes, String)> {
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -1490,7 +1251,7 @@ impl Client {
         length: Option<u64>,
     ) -> Result<Response> {
         let layer = layer.as_layer_descriptor();
-        let url = self.to_v2_blob_url(image, layer.digest);
+        let url = self.config.to_v2_blob_url(image, layer.digest);
 
         let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -1546,7 +1307,7 @@ impl Client {
     ///
     /// Returns URL with session UUID
     async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
-        let url = &self.to_v2_blob_upload_url(image);
+        let url = &self.config.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
@@ -1569,7 +1330,7 @@ impl Client {
     ///
     /// Returns URL with session UUID
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
-        let url = &self.to_v2_blob_upload_url(image);
+        let url = &self.config.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
             .apply_auth(image, RegistryOperation::Push)
@@ -1785,7 +1546,7 @@ impl Client {
         source: &Reference,
         digest: &str,
     ) -> Result<()> {
-        let base_url = self.to_v2_blob_upload_url(image);
+        let base_url = self.config.to_v2_blob_upload_url(image);
         let url = Url::parse_with_params(
             &base_url,
             &[("mount", digest), ("from", source.repository())],
@@ -1832,7 +1593,7 @@ impl Client {
         body: impl Into<bytes::Bytes>,
         content_type: HeaderValue,
     ) -> Result<String> {
-        let url = self.to_v2_manifest_url(image);
+        let url = self.config.to_v2_manifest_url(image);
         debug!(?url, ?content_type, "push manifest");
 
         let mut headers = HeaderMap::new();
@@ -1905,7 +1666,7 @@ impl Client {
         image: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<OciImageIndex> {
-        let url = self.to_v2_referrers_url(image, artifact_type)?;
+        let url = self.config.to_v2_referrers_url(image, artifact_type)?;
         debug!("Pulling referrers from {}", url);
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
@@ -2024,7 +1785,7 @@ impl Client {
         last: Option<&str>,
     ) -> Result<CatalogResponse> {
         let op = RegistryOperation::Pull;
-        let url = self.to_catalog_url(image);
+        let url = self.config.to_catalog_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
@@ -2072,7 +1833,7 @@ impl Client {
             debug!(location=?location_header, "Location header");
             match location_header {
                 None => Err(OciDistributionError::RegistryNoLocationError),
-                Some(lh) => self.location_header_to_url(image, lh),
+                Some(lh) => self.config.location_header_to_url(image, lh),
             }
         } else if res.status().is_success() && expected_status.is_success() {
             Err(OciDistributionError::SpecViolationError(format!(
@@ -2087,131 +1848,16 @@ impl Client {
             Err(OciDistributionError::ServerError { url, code, message })
         }
     }
-
-    /// Helper function to convert location header to URL
-    ///
-    /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
-    /// Returns a properly formatted absolute URL
-    ///
-    /// An absolute location pointing at a different host is returned as is and
-    /// will be followed, but requests to it are never authenticated (see
-    /// [`RequestBuilderWrapper::apply_auth`]).
-    fn location_header_to_url(
-        &self,
-        image: &Reference,
-        location_header: &reqwest::header::HeaderValue,
-    ) -> Result<String> {
-        let lh = location_header.to_str()?;
-        if lh.starts_with("/") {
-            let registry = image.resolve_registry();
-            Ok(format!(
-                "{scheme}://{registry}{lh}",
-                scheme = self.config.protocol.scheme_for(registry)
-            ))
-        } else {
-            Ok(lh.to_string())
-        }
-    }
-
-    /// Convert a Reference to a v2 manifest URL.
-    fn to_v2_manifest_url(&self, reference: &Reference) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/manifests/{reference}{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            reference = if let Some(digest) = reference.digest() {
-                digest
-            } else {
-                reference.tag().unwrap_or("latest")
-            },
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Convert a Reference to a v2 blob (layer) URL.
-    fn to_v2_blob_url(&self, reference: &Reference, digest: &str) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/blobs/{digest}{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Convert a Reference to a v2 blob upload URL.
-    fn to_v2_blob_upload_url(&self, reference: &Reference) -> String {
-        self.to_v2_blob_url(reference, "uploads/")
-    }
-
-    fn to_list_tags_url(&self, reference: &Reference) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/{repository}/tags/list{ns}",
-            scheme = self.config.protocol.scheme_for(registry),
-            repository = reference.repository(),
-            ns = reference
-                .namespace()
-                .map(|ns| format!("?ns={ns}"))
-                .unwrap_or_default(),
-        )
-    }
-
-    fn to_catalog_url(&self, reference: &Reference) -> String {
-        let registry = reference.resolve_registry();
-        format!(
-            "{scheme}://{registry}/v2/_catalog",
-            scheme = self.config.protocol.scheme_for(registry),
-        )
-    }
-
-    /// Convert a Reference to a v2 referrers URL.
-    fn to_v2_referrers_url(
-        &self,
-        reference: &Reference,
-        artifact_type: Option<&str>,
-    ) -> Result<String> {
-        let digest = reference.digest().ok_or_else(|| {
-            OciDistributionError::GenericError(Some(
-                "Getting referrers for a tag is not supported".into(),
-            ))
-        })?;
-
-        let registry = reference.resolve_registry();
-        let base = format!(
-            "{scheme}://{registry}",
-            scheme = self.config.protocol.scheme_for(registry),
-        );
-        let mut url =
-            Url::parse(&base).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
-        url.path_segments_mut()
-            .map_err(|_| {
-                OciDistributionError::GenericError(Some(
-                    "cannot build referrers URL: base URL is cannot-be-a-base".into(),
-                ))
-            })?
-            .push("v2")
-            .extend(reference.repository().split('/'))
-            .push("referrers")
-            .push(digest);
-        if let Some(at) = artifact_type {
-            url.query_pairs_mut().append_pair("artifactType", at);
-        }
-        Ok(url.into())
-    }
 }
 
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
 /// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &str) -> Result<()> {
+pub(crate) fn validate_registry_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    url: &str,
+) -> Result<()> {
     match status {
         reqwest::StatusCode::OK => Ok(()),
         reqwest::StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
@@ -2371,28 +2017,9 @@ impl<'a> RequestBuilderWrapper<'a> {
     /// same way, since the credentials would otherwise go out in the clear.
     fn targets_credential_registry(&self, image: &Reference) -> Result<bool> {
         let request = self.cloned_request_builder()?.build()?;
-        let target = request.url();
-
-        let registry = image.resolve_registry();
-        let registry_url = Url::parse(&format!(
-            "{scheme}://{registry}",
-            scheme = self.client.config.protocol.scheme_for(registry)
-        ))
-        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
-
-        if target.host_str() != registry_url.host_str() {
-            return Ok(false);
-        }
-        if target.port_or_known_default() != registry_url.port_or_known_default() {
-            return Ok(false);
-        }
-        // The registry is reached over https, the credentials must not go out
-        // in the clear.
-        if registry_url.scheme() == "https" && target.scheme() != "https" {
-            return Ok(false);
-        }
-
-        Ok(true)
+        self.client
+            .config
+            .targets_credential_registry(request.url(), image)
     }
 
     /// Updates request as necessary for authentication.
@@ -2480,7 +2107,7 @@ impl TryFrom<&Certificate> for reqwest::Certificate {
     }
 }
 
-fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
+pub(crate) fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
     certs.iter().map(reqwest::Certificate::try_from).collect()
 }
 
@@ -2591,6 +2218,167 @@ impl Default for ClientConfig {
     }
 }
 
+// URL construction helpers shared by the asynchronous and blocking clients.
+impl ClientConfig {
+    /// Returns whether a request to `target` is addressed to the registry the
+    /// credentials of `image` belong to.
+    ///
+    /// The upload `Location` returned by a registry may be absolute and point at
+    /// another host (e.g. a signed URL of a cloud storage provider), which the
+    /// distribution specification permits. Sending the `Authorization` header
+    /// there is what it does not permit: clients "MUST NOT forward Authorization
+    /// headers across host boundaries unless explicitly configured to do so".
+    /// See also CVE-2020-15157.
+    ///
+    /// A same-host location that drops back from https to http is treated the
+    /// same way, since the credentials would otherwise go out in the clear.
+    pub(crate) fn targets_credential_registry(
+        &self,
+        target: &Url,
+        image: &Reference,
+    ) -> Result<bool> {
+        let registry = image.resolve_registry();
+        let registry_url = Url::parse(&format!(
+            "{scheme}://{registry}",
+            scheme = self.protocol.scheme_for(registry)
+        ))
+        .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+
+        if target.host_str() != registry_url.host_str() {
+            return Ok(false);
+        }
+        if target.port_or_known_default() != registry_url.port_or_known_default() {
+            return Ok(false);
+        }
+        // The registry is reached over https, the credentials must not go out
+        // in the clear.
+        if registry_url.scheme() == "https" && target.scheme() != "https" {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Helper function to convert location header to URL
+    ///
+    /// Location may be absolute (containing the protocol and/or hostname), or relative (containing just the URL path)
+    /// Returns a properly formatted absolute URL
+    ///
+    /// An absolute location pointing at a different host is returned as is and
+    /// will be followed, but requests to it are never authenticated (see
+    /// `RequestBuilderWrapper::apply_auth`).
+    pub(crate) fn location_header_to_url(
+        &self,
+        image: &Reference,
+        location_header: &reqwest::header::HeaderValue,
+    ) -> Result<String> {
+        let lh = location_header.to_str()?;
+        if lh.starts_with("/") {
+            let registry = image.resolve_registry();
+            Ok(format!(
+                "{scheme}://{registry}{lh}",
+                scheme = self.protocol.scheme_for(registry)
+            ))
+        } else {
+            Ok(lh.to_string())
+        }
+    }
+
+    /// Convert a Reference to a v2 manifest URL.
+    pub(crate) fn to_v2_manifest_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/{repository}/manifests/{reference}{ns}",
+            scheme = self.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            reference = if let Some(digest) = reference.digest() {
+                digest
+            } else {
+                reference.tag().unwrap_or("latest")
+            },
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Convert a Reference to a v2 blob (layer) URL.
+    pub(crate) fn to_v2_blob_url(&self, reference: &Reference, digest: &str) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/{repository}/blobs/{digest}{ns}",
+            scheme = self.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Convert a Reference to a v2 blob upload URL.
+    pub(crate) fn to_v2_blob_upload_url(&self, reference: &Reference) -> String {
+        self.to_v2_blob_url(reference, "uploads/")
+    }
+
+    pub(crate) fn to_list_tags_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/{repository}/tags/list{ns}",
+            scheme = self.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn to_catalog_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/_catalog",
+            scheme = self.protocol.scheme_for(registry),
+        )
+    }
+
+    /// Convert a Reference to a v2 referrers URL.
+    pub(crate) fn to_v2_referrers_url(
+        &self,
+        reference: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<String> {
+        let digest = reference.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
+        let registry = reference.resolve_registry();
+        let base = format!(
+            "{scheme}://{registry}",
+            scheme = self.protocol.scheme_for(registry),
+        );
+        let mut url =
+            Url::parse(&base).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                OciDistributionError::GenericError(Some(
+                    "cannot build referrers URL: base URL is cannot-be-a-base".into(),
+                ))
+            })?
+            .push("v2")
+            .extend(reference.repository().split('/'))
+            .push("referrers")
+            .push(digest);
+        if let Some(at) = artifact_type {
+            url.query_pairs_mut().append_pair("artifactType", at);
+        }
+        Ok(url.into())
+    }
+}
+
 // Be explicit about the traits supported by this type. This is needed to use
 // the Client behind a dynamic reference.
 // Something similar to what is described here: https://users.rust-lang.org/t/how-to-send-function-closure-to-another-thread/43549
@@ -2646,7 +2434,7 @@ pub enum ClientProtocol {
 }
 
 impl ClientProtocol {
-    fn scheme_for(&self, registry: &str) -> &str {
+    pub(crate) fn scheme_for(&self, registry: &str) -> &str {
         match self {
             ClientProtocol::Https => "https",
             ClientProtocol::Http => "http",
@@ -2662,7 +2450,7 @@ impl ClientProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct BearerChallenge {
+pub(crate) struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
 }
@@ -2724,6 +2512,7 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::BTreeMap;
     use std::convert::TryFrom;
     use std::result::Result;
 
@@ -2733,7 +2522,7 @@ mod test {
     use tokio_util::io::StreamReader;
 
     use crate::errors::OciErrorCode;
-    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
+    use crate::manifest::{self, OciDescriptor, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
 
     #[test]
     fn test_validate_registry_response_server_error_non_utf8_body() {
@@ -2801,69 +2590,441 @@ mod test {
     const EMPTY_JSON_DIGEST: &str =
         "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
-    #[test]
-    fn test_apply_accept() -> anyhow::Result<()> {
+    /// Which client implementation a test runs against.
+    ///
+    /// Tests exercising behaviour common to the asynchronous and the blocking
+    /// client are parametrized over this enum, so a single test body covers
+    /// both implementations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClientKind {
+        Async,
+        #[cfg(feature = "blocking")]
+        Blocking,
+    }
+
+    /// The `RequestBuilderWrapper` operation exercised by
+    /// [`TestClient::request_headers`].
+    enum Apply {
+        Accept(&'static [&'static str]),
+        Auth(Reference, RegistryOperation),
+    }
+
+    /// Test-only adapter exposing the API shared by both clients through a
+    /// single asynchronous interface.
+    ///
+    /// `reqwest::blocking` must not be driven from an async context, so calls
+    /// into the blocking client run on the tokio blocking thread pool.
+    enum TestClient {
+        Async(Client),
+        #[cfg(feature = "blocking")]
+        Blocking(Arc<std::sync::Mutex<crate::blocking::Client>>),
+    }
+
+    /// Dispatches a call to the wrapped client. The async arm is awaited in
+    /// place; the blocking arm runs in `spawn_blocking`, so everything it
+    /// captures must be owned.
+    macro_rules! dispatch {
+        ($self:expr, |$c:ident| $async_call:expr, |$b:ident| $blocking_call:expr) => {
+            match $self {
+                TestClient::Async($c) => $async_call.await,
+                #[cfg(feature = "blocking")]
+                TestClient::Blocking(client) => {
+                    let client = Arc::clone(client);
+                    tokio::task::spawn_blocking(move || {
+                        let mut guard = client.lock().expect("blocking client mutex poisoned");
+                        let $b = &mut *guard;
+                        $blocking_call
+                    })
+                    .await
+                    .expect("blocking client task panicked")
+                }
+            }
+        };
+    }
+
+    // Some methods are only exercised by the `test-registry` tests.
+    #[cfg_attr(not(feature = "test-registry"), allow(dead_code))]
+    impl TestClient {
+        async fn new(kind: ClientKind, config: ClientConfig) -> Self {
+            match kind {
+                ClientKind::Async => TestClient::Async(Client::new(config)),
+                #[cfg(feature = "blocking")]
+                ClientKind::Blocking => {
+                    let client =
+                        tokio::task::spawn_blocking(move || crate::blocking::Client::new(config))
+                            .await
+                            .expect("cannot build blocking client");
+                    TestClient::Blocking(Arc::new(std::sync::Mutex::new(client)))
+                }
+            }
+        }
+
+        async fn with_default_config(kind: ClientKind) -> Self {
+            Self::new(kind, ClientConfig::default()).await
+        }
+
+        fn set_push_chunk_size(&mut self, size: usize) {
+            match self {
+                TestClient::Async(c) => c.push_chunk_size = size,
+                #[cfg(feature = "blocking")]
+                TestClient::Blocking(client) => {
+                    client
+                        .lock()
+                        .expect("blocking client mutex poisoned")
+                        .push_chunk_size = size
+                }
+            }
+        }
+
+        async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
+            let registry = registry.to_string();
+            dispatch!(self, |c| c.store_auth(&registry, auth.clone()), |b| b
+                .store_auth(&registry, auth))
+        }
+
+        async fn insert_token(
+            &self,
+            image: &Reference,
+            op: RegistryOperation,
+            token: RegistryTokenType,
+        ) {
+            let image = image.clone();
+            dispatch!(self, |c| c.tokens.insert(&image, op, token.clone()), |b| b
+                .tokens
+                .insert(&image, op, token))
+        }
+
+        async fn cached_token(
+            &self,
+            image: &Reference,
+            op: RegistryOperation,
+        ) -> Option<RegistryTokenType> {
+            let image = image.clone();
+            dispatch!(self, |c| c.tokens.get(&image, op), |b| b
+                .tokens
+                .get(&image, op))
+        }
+
+        async fn auth(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+            op: RegistryOperation,
+        ) -> crate::errors::Result<Option<String>> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(self, |c| c.auth(&image, &auth, op), |b| b
+                .auth(&image, &auth, op))
+        }
+
+        async fn pull_image_manifest(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+        ) -> crate::errors::Result<(OciImageManifest, String)> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(self, |c| c.pull_image_manifest(&image, &auth), |b| b
+                .pull_image_manifest(&image, &auth))
+        }
+
+        /// Pulls an image manifest relying on previously stored credentials
+        /// (`Client::_pull_image_manifest`).
+        async fn pull_image_manifest_stored_auth(
+            &self,
+            image: &Reference,
+        ) -> crate::errors::Result<(OciImageManifest, String)> {
+            let image = image.clone();
+            dispatch!(self, |c| c._pull_image_manifest(&image), |b| b
+                ._pull_image_manifest(&image))
+        }
+
+        async fn pull_manifest_and_config(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+        ) -> crate::errors::Result<(OciImageManifest, String, String)> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(self, |c| c.pull_manifest_and_config(&image, &auth), |b| b
+                .pull_manifest_and_config(&image, &auth))
+        }
+
+        async fn pull_manifest_raw(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+            accepted_media_types: &'static [&'static str],
+        ) -> crate::errors::Result<(Vec<u8>, String)> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(
+                self,
+                |c| async {
+                    c.pull_manifest_raw(&image, &auth, accepted_media_types)
+                        .await
+                        .map(|(body, digest)| (body.to_vec(), digest))
+                },
+                |b| b.pull_manifest_raw(&image, &auth, accepted_media_types)
+            )
+        }
+
+        async fn fetch_manifest_digest(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+        ) -> crate::errors::Result<String> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(self, |c| c.fetch_manifest_digest(&image, &auth), |b| b
+                .fetch_manifest_digest(&image, &auth))
+        }
+
+        async fn pull_blob(
+            &self,
+            image: &Reference,
+            layer: &OciDescriptor,
+        ) -> crate::errors::Result<Vec<u8>> {
+            let (image, layer) = (image.clone(), layer.clone());
+            dispatch!(
+                self,
+                |c| async {
+                    let mut out = Vec::new();
+                    c.pull_blob(&image, &layer, &mut out).await.map(|()| out)
+                },
+                |b| {
+                    let mut out = Vec::new();
+                    b.pull_blob(&image, &layer, &mut out).map(|()| out)
+                }
+            )
+        }
+
+        async fn pull(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+            accepted_media_types: Vec<&'static str>,
+        ) -> crate::errors::Result<ImageData> {
+            let (image, auth) = (image.clone(), auth.clone());
+            dispatch!(
+                self,
+                |c| c.pull(&image, &auth, accepted_media_types.clone()),
+                |b| b.pull(&image, &auth, accepted_media_types)
+            )
+        }
+
+        async fn push(
+            &self,
+            image: &Reference,
+            layers: &[ImageLayer],
+            config: Config,
+            auth: &RegistryAuth,
+            manifest: Option<OciImageManifest>,
+        ) -> crate::errors::Result<PushResponse> {
+            let (image, layers, auth) = (image.clone(), layers.to_vec(), auth.clone());
+            dispatch!(
+                self,
+                |c| c.push(&image, &layers, config.clone(), &auth, manifest.clone()),
+                |b| b.push(&image, &layers, config, &auth, manifest)
+            )
+        }
+
+        async fn push_blob(
+            &self,
+            image: &Reference,
+            data: Vec<u8>,
+            digest: &str,
+        ) -> crate::errors::Result<String> {
+            let (image, digest) = (image.clone(), digest.to_string());
+            dispatch!(self, |c| c.push_blob(&image, data.clone(), &digest), |b| b
+                .push_blob(&image, &data, &digest))
+        }
+
+        async fn push_blob_chunked(
+            &self,
+            image: &Reference,
+            data: Vec<u8>,
+            digest: &str,
+        ) -> crate::errors::Result<String> {
+            let (image, digest) = (image.clone(), digest.to_string());
+            dispatch!(
+                self,
+                |c| c.push_blob_chunked(&image, data.clone(), &digest),
+                |b| b.push_blob_chunked(&image, &data, &digest)
+            )
+        }
+
+        async fn begin_push_chunked_session(
+            &self,
+            image: &Reference,
+        ) -> crate::errors::Result<String> {
+            let image = image.clone();
+            dispatch!(self, |c| c.begin_push_chunked_session(&image), |b| b
+                .begin_push_chunked_session(&image))
+        }
+
+        async fn push_chunk(
+            &self,
+            location: &str,
+            image: &Reference,
+            data: Vec<u8>,
+            start_byte: usize,
+        ) -> crate::errors::Result<(String, usize)> {
+            let (location, image) = (location.to_string(), image.clone());
+            dispatch!(
+                self,
+                |c| c.push_chunk(&location, &image, Bytes::from(data.clone()), start_byte),
+                |b| b.push_chunk(&location, &image, &data, start_byte)
+            )
+        }
+
+        async fn end_push_chunked_session(
+            &self,
+            location: &str,
+            image: &Reference,
+            digest: &str,
+        ) -> crate::errors::Result<String> {
+            let (location, image, digest) =
+                (location.to_string(), image.clone(), digest.to_string());
+            dispatch!(
+                self,
+                |c| c.end_push_chunked_session(&location, &image, &digest),
+                |b| b.end_push_chunked_session(&location, &image, &digest)
+            )
+        }
+
+        async fn mount_blob(
+            &self,
+            image: &Reference,
+            source: &Reference,
+            digest: &str,
+        ) -> crate::errors::Result<()> {
+            let (image, source, digest) = (image.clone(), source.clone(), digest.to_string());
+            dispatch!(self, |c| c.mount_blob(&image, &source, &digest), |b| b
+                .mount_blob(&image, &source, &digest))
+        }
+
+        async fn list_tags(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+            n: Option<usize>,
+            last: Option<&str>,
+        ) -> crate::errors::Result<TagResponse> {
+            let (image, auth, last) = (image.clone(), auth.clone(), last.map(str::to_owned));
+            dispatch!(
+                self,
+                |c| c.list_tags(&image, &auth, n, last.as_deref()),
+                |b| b.list_tags(&image, &auth, n, last.as_deref())
+            )
+        }
+
+        /// Builds a request through the client's `RequestBuilderWrapper`,
+        /// applies `apply` to it and returns the resulting headers.
+        async fn request_headers(
+            &self,
+            method: reqwest::Method,
+            url: &str,
+            apply: Apply,
+        ) -> anyhow::Result<HeaderMap> {
+            match self {
+                TestClient::Async(c) => {
+                    let wrapper = RequestBuilderWrapper::from_client(c, |client| {
+                        client.request(method.clone(), url)
+                    });
+                    let wrapper = match &apply {
+                        Apply::Accept(accept) => wrapper.apply_accept(accept)?,
+                        Apply::Auth(image, op) => wrapper.apply_auth(image, *op).await?,
+                    };
+                    Ok(wrapper.into_request_builder().build()?.headers().clone())
+                }
+                #[cfg(feature = "blocking")]
+                TestClient::Blocking(client) => {
+                    let client = Arc::clone(client);
+                    let url = url.to_string();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<HeaderMap> {
+                        let mut guard = client.lock().expect("blocking client mutex poisoned");
+                        let mut wrapper = crate::blocking::RequestBuilderWrapper::from_client(
+                            &mut guard,
+                            |client| client.request(method.clone(), url.as_str()),
+                        );
+                        let wrapper = match &apply {
+                            Apply::Accept(accept) => wrapper.apply_accept(accept)?,
+                            Apply::Auth(image, op) => wrapper.apply_auth(image, *op)?,
+                        };
+                        Ok(wrapper.into_request_builder().build()?.headers().clone())
+                    })
+                    .await
+                    .expect("blocking client task panicked")
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn test_apply_accept(#[case] kind: ClientKind) -> anyhow::Result<()> {
+        let client = TestClient::with_default_config(kind).await;
+        let url = "https://example.com/some/module.wasm";
+
         assert_eq!(
-            RequestBuilderWrapper::from_client(&Client::default(), |client| client
-                .get("https://example.com/some/module.wasm"))
-            .apply_accept(&["*/*"])?
-            .into_request_builder()
-            .build()?
-            .headers()["Accept"],
+            client
+                .request_headers(reqwest::Method::GET, url, Apply::Accept(&["*/*"]))
+                .await?["Accept"],
             "*/*"
         );
 
         assert_eq!(
-            RequestBuilderWrapper::from_client(&Client::default(), |client| client
-                .get("https://example.com/some/module.wasm"))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .into_request_builder()
-            .build()?
-            .headers()["Accept"],
+            client
+                .request_headers(
+                    reqwest::Method::GET,
+                    url,
+                    Apply::Accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
+                )
+                .await?["Accept"],
             MIME_TYPES_DISTRIBUTION_MANIFEST.join(", ")
         );
 
         Ok(())
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_apply_auth_no_token() -> anyhow::Result<()> {
-        assert!(
-            !RequestBuilderWrapper::from_client(&Client::default(), |client| client
-                .get("https://example.com/some/module.wasm"))
-            .apply_auth(
-                &Reference::try_from(HELLO_IMAGE_TAG)?,
-                RegistryOperation::Pull
+    async fn test_apply_auth_no_token(#[case] kind: ClientKind) -> anyhow::Result<()> {
+        let client = TestClient::with_default_config(kind).await;
+        let headers = client
+            .request_headers(
+                reqwest::Method::GET,
+                "https://example.com/some/module.wasm",
+                Apply::Auth(
+                    Reference::try_from(HELLO_IMAGE_TAG)?,
+                    RegistryOperation::Pull,
+                ),
             )
-            .await?
-            .into_request_builder()
-            .build()?
-            .headers()
-            .contains_key("Authorization")
-        );
+            .await?;
+        assert!(!headers.contains_key("Authorization"));
 
         Ok(())
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
+    async fn test_apply_auth_bearer_token(#[case] kind: ClientKind) -> anyhow::Result<()> {
         let _ = tracing_subscriber::fmt::try_init();
-        let client = Client::default();
+        let client = TestClient::with_default_config(kind).await;
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
         // The token cache only reads the JWT payload; it never verifies signatures.
         let token = "e30.e30.signature".to_string();
 
         // we have to have it in the stored auth so we'll get to the token cache check.
         client
-            .store_auth(
-                Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
-                RegistryAuth::Anonymous,
-            )
+            .store_auth(image.resolve_registry(), RegistryAuth::Anonymous)
             .await;
 
         client
-            .tokens
-            .insert(
-                &Reference::try_from(HELLO_IMAGE_TAG)?,
+            .insert_token(
+                &image,
                 RegistryOperation::Pull,
                 RegistryTokenType::Bearer(RegistryToken::Token {
                     token: token.clone(),
@@ -2872,39 +3033,38 @@ mod test {
             .await;
 
         assert_eq!(
-            RequestBuilderWrapper::from_client(&client, |client| client
-                .get("https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"))
-            .apply_auth(
-                &Reference::try_from(HELLO_IMAGE_TAG)?,
-                RegistryOperation::Pull
-            )
-            .await?
-            .into_request_builder()
-            .build()?
-            .headers()["Authorization"],
-            format!("Bearer {}", &token)
+            client
+                .request_headers(
+                    reqwest::Method::GET,
+                    "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef",
+                    Apply::Auth(image.clone(), RegistryOperation::Pull),
+                )
+                .await?["Authorization"],
+            format!("Bearer {token}")
         );
 
         // The token must not be sent to a host other than the registry it
         // belongs to.
-        assert!(!RequestBuilderWrapper::from_client(&client, |client| client
-            .get("https://example.com/some/module.wasm"))
-        .apply_auth(
-            &Reference::try_from(HELLO_IMAGE_TAG)?,
-            RegistryOperation::Pull
-        )
-        .await?
-        .into_request_builder()
-        .build()?
-        .headers()
-        .contains_key("Authorization"));
+        let headers = client
+            .request_headers(
+                reqwest::Method::GET,
+                "https://example.com/some/module.wasm",
+                Apply::Auth(image, RegistryOperation::Pull),
+            )
+            .await?;
+        assert!(!headers.contains_key("Authorization"));
 
         Ok(())
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_apply_auth_basic_not_forwarded_cross_host() -> anyhow::Result<()> {
-        let client = Client::default();
+    async fn test_apply_auth_basic_not_forwarded_cross_host(
+        #[case] kind: ClientKind,
+    ) -> anyhow::Result<()> {
+        let client = TestClient::with_default_config(kind).await;
         let image = Reference::try_from(HELLO_IMAGE_TAG)?;
         client
             .store_auth(
@@ -2913,31 +3073,30 @@ mod test {
             )
             .await;
         client
-            .tokens
-            .insert(
+            .insert_token(
                 &image,
                 RegistryOperation::Push,
                 RegistryTokenType::Basic("user".to_string(), "pass".to_string()),
             )
             .await;
 
-        assert!(RequestBuilderWrapper::from_client(&client, |client| client
-            .patch("https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc"))
-        .apply_auth(&image, RegistryOperation::Push)
-        .await?
-        .into_request_builder()
-        .build()?
-        .headers()
-        .contains_key("Authorization"));
+        let headers = client
+            .request_headers(
+                reqwest::Method::PATCH,
+                "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
+                Apply::Auth(image.clone(), RegistryOperation::Push),
+            )
+            .await?;
+        assert!(headers.contains_key("Authorization"));
 
-        assert!(!RequestBuilderWrapper::from_client(&client, |client| client
-            .patch("https://elsewhere.example.com/upload/abc"))
-        .apply_auth(&image, RegistryOperation::Push)
-        .await?
-        .into_request_builder()
-        .build()?
-        .headers()
-        .contains_key("Authorization"));
+        let headers = client
+            .request_headers(
+                reqwest::Method::PATCH,
+                "https://elsewhere.example.com/upload/abc",
+                Apply::Auth(image, RegistryOperation::Push),
+            )
+            .await?;
+        assert!(!headers.contains_key("Authorization"));
 
         Ok(())
     }
@@ -2963,12 +3122,11 @@ mod test {
     )]
     fn test_targets_credential_registry(#[case] location: &str, #[case] expected: bool) {
         let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let client = Client::default();
-        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+        let location = Url::parse(location).expect("failed to parse location");
 
         assert_eq!(
-            request
-                .targets_credential_registry(&image)
+            ClientConfig::default()
+                .targets_credential_registry(&location, &image)
                 .expect("failed to compare the location with the registry"),
             expected
         );
@@ -2986,12 +3144,11 @@ mod test {
     ) {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
         image.set_mirror_registry("docker.mirror.io".to_owned());
-        let client = Client::default();
-        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+        let location = Url::parse(location).expect("failed to parse location");
 
         assert_eq!(
-            request
-                .targets_credential_registry(&image)
+            ClientConfig::default()
+                .targets_credential_registry(&location, &image)
                 .expect("failed to compare the location with the registry"),
             expected
         );
@@ -3004,15 +3161,15 @@ mod test {
     fn test_targets_credential_registry_plain_http(#[case] location: &str, #[case] expected: bool) {
         let image =
             Reference::try_from("localhost:5000/hello-wasm:v1").expect("failed to parse reference");
-        let client = Client::new(ClientConfig {
+        let config = ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
-        });
-        let request = RequestBuilderWrapper::from_client(&client, |c| c.patch(location));
+        };
+        let location = Url::parse(location).expect("failed to parse location");
 
         assert_eq!(
-            request
-                .targets_credential_registry(&image)
+            config
+                .targets_credential_registry(&location, &image)
                 .expect("failed to compare the location with the registry"),
             expected
         );
@@ -3021,7 +3178,7 @@ mod test {
     #[test]
     fn test_to_v2_blob_url() {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         assert_eq!(
             c.to_v2_blob_url(&image, "sha256:deadbeef"),
@@ -3043,7 +3200,7 @@ mod test {
     )]
     fn test_to_v2_manifest(image: &str, expected_uri: &str, expected_mirror_uri: &str) {
         let mut reference = Reference::try_from(image).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
         assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
 
         reference.set_mirror_registry("docker.mirror.io".to_owned());
@@ -3053,7 +3210,7 @@ mod test {
     #[test]
     fn test_to_v2_blob_upload_url() {
         let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_v2_blob_upload_url(&image);
+        let blob_url = ClientConfig::default().to_v2_blob_upload_url(&image);
 
         assert_eq!(
             blob_url,
@@ -3064,7 +3221,7 @@ mod test {
     #[test]
     fn test_to_list_tags_url() {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         assert_eq!(
             c.to_list_tags_url(&image),
@@ -3081,7 +3238,7 @@ mod test {
     #[test]
     fn test_to_catalog_url() {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         assert_eq!(
             c.to_catalog_url(&image),
@@ -3098,7 +3255,7 @@ mod test {
     #[test]
     fn test_to_v2_referrers_url() {
         let image = Reference::try_from(HELLO_IMAGE_DIGEST).expect("failed to parse reference");
-        let c = Client::default();
+        let c = ClientConfig::default();
 
         // No filter: no query string.
         assert_eq!(
@@ -3117,10 +3274,10 @@ mod test {
 
     #[test]
     fn manifest_url_generation_respects_http_protocol() {
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3131,10 +3288,10 @@ mod test {
 
     #[test]
     fn blob_url_generation_respects_http_protocol() {
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3147,10 +3304,10 @@ mod test {
     fn manifest_url_generation_uses_https_if_not_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3163,10 +3320,10 @@ mod test {
     fn manifest_url_generation_uses_http_if_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("oci.registry.local/hello:v1".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3179,10 +3336,10 @@ mod test {
     fn blob_url_generation_uses_https_if_not_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("webassembly.azurecr.io/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3195,10 +3352,10 @@ mod test {
     fn blob_url_generation_uses_http_if_on_exception_list() {
         let insecure_registries = vec!["localhost".to_owned(), "oci.registry.local".to_owned()];
         let protocol = ClientProtocol::HttpsExcept(insecure_registries);
-        let c = Client::new(ClientConfig {
+        let c = ClientConfig {
             protocol,
             ..Default::default()
-        });
+        };
         let reference = Reference::try_from("oci.registry.local/hello@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned())
             .expect("Could not parse reference");
         assert_eq!(
@@ -3319,12 +3476,15 @@ mod test {
         assert!(token.len() > 64);
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_auth() {
+    async fn test_auth(#[case] kind: ClientKind) {
         let _ = tracing_subscriber::fmt::try_init();
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let c = TestClient::with_default_config(kind).await;
             let token = c
                 .auth(
                     &reference,
@@ -3338,8 +3498,7 @@ mod test {
             check_auth_token(token.unwrap().as_ref());
 
             let tok = c
-                .tokens
-                .get(&reference, RegistryOperation::Pull)
+                .cached_token(&reference, RegistryOperation::Pull)
                 .await
                 .expect("token is available");
             // We test that the token is longer than a minimal hash.
@@ -3352,8 +3511,11 @@ mod test {
     }
 
     #[cfg(feature = "test-registry")]
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_list_tags() {
+    async fn test_list_tags(#[case] kind: ClientKind) {
         let test_container = registry_image_edge()
             .start()
             .await
@@ -3365,10 +3527,14 @@ mod test {
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
-            ..Default::default()
-        });
+        let client = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
         client
@@ -3377,7 +3543,7 @@ mod test {
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = client
-            ._pull_image_manifest(&image)
+            .pull_image_manifest_stored_auth(&image)
             .await
             .expect("failed to pull manifest");
 
@@ -3505,18 +3671,21 @@ mod test {
         assert_ne!(page1.repositories[0], page2.repositories[0]);
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_manifest_private() {
+    async fn test_pull_manifest_private(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             // Currently, pull_manifest does not perform Authz, so this will fail.
-            let c = Client::default();
-            c._pull_image_manifest(&reference)
+            let c = TestClient::with_default_config(kind).await;
+            c.pull_image_manifest_stored_auth(&reference)
                 .await
                 .expect_err("pull manifest should fail");
 
             // But this should pass
-            let c = Client::default();
+            let c = TestClient::with_default_config(kind).await;
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
@@ -3525,7 +3694,7 @@ mod test {
             .await
             .expect("authenticated");
             let (manifest, _) = c
-                ._pull_image_manifest(&reference)
+                .pull_image_manifest_stored_auth(&reference)
                 .await
                 .expect("pull manifest should not fail");
 
@@ -3535,11 +3704,14 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_manifest_public() {
+    async fn test_pull_manifest_public(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let c = TestClient::with_default_config(kind).await;
             let (manifest, _) = c
                 .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
                 .await
@@ -3551,11 +3723,14 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn pull_manifest_and_config_public() {
+    async fn pull_manifest_and_config_public(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let c = TestClient::with_default_config(kind).await;
             let (manifest, _, config) = c
                 .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
                 .await
@@ -3568,9 +3743,12 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_fetch_digest() {
-        let c = Client::default();
+    async fn test_fetch_digest(#[case] kind: ClientKind) {
+        let c = TestClient::with_default_config(kind).await;
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -3580,7 +3758,7 @@ mod test {
 
             // This should pass
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            let c = Client::default();
+            let c = TestClient::with_default_config(kind).await;
             c.auth(
                 &reference,
                 &RegistryAuth::Anonymous,
@@ -3600,9 +3778,12 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_blob() {
-        let c = Client::default();
+    async fn test_pull_blob(#[case] kind: ClientKind) {
+        let c = TestClient::with_default_config(kind).await;
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -3614,24 +3795,30 @@ mod test {
             .await
             .expect("authenticated");
             let (manifest, _) = c
-                ._pull_image_manifest(&reference)
+                .pull_image_manifest_stored_auth(&reference)
                 .await
                 .expect("failed to pull manifest");
 
             // Pull one specific layer
-            let mut file: Vec<u8> = Vec::new();
             let layer0 = &manifest.layers[0];
 
             // This call likes to flake, so we try it at least 5 times
+            let mut file = None;
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
-                    println!("Got error on pull_blob call attempt {i}. Will retry in 1s: {e:?}");
-                    last_error.replace(e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                } else {
-                    last_error = None;
-                    break;
+                match c.pull_blob(&reference, layer0).await {
+                    Ok(data) => {
+                        file = Some(data);
+                        last_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        println!(
+                            "Got error on pull_blob call attempt {i}. Will retry in 1s: {e:?}"
+                        );
+                        last_error.replace(e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
 
@@ -3640,7 +3827,7 @@ mod test {
             }
 
             // The manifest says how many bytes we should expect.
-            assert_eq!(file.len(), layer0.size as usize);
+            assert_eq!(file.expect("layer was pulled").len(), layer0.size as usize);
         }
     }
 
@@ -3749,8 +3936,11 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull() {
+    async fn test_pull(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
 
@@ -3758,7 +3948,8 @@ mod test {
             let mut last_error = None;
             let mut image_data = None;
             for i in 1..6 {
-                match Client::default()
+                match TestClient::with_default_config(kind)
+                    .await
                     .pull(
                         &reference,
                         &RegistryAuth::Anonymous,
@@ -3791,11 +3982,15 @@ mod test {
     }
 
     /// Attempting to pull an image without any layer validation should fail.
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_without_layer_validation() {
+    async fn test_pull_without_layer_validation(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            assert!(Client::default()
+            assert!(TestClient::with_default_config(kind)
+                .await
                 .pull(&reference, &RegistryAuth::Anonymous, vec![],)
                 .await
                 .is_err());
@@ -3803,11 +3998,15 @@ mod test {
     }
 
     /// Attempting to pull an image with the wrong list of layer validations should fail.
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_wrong_layer_validation() {
+    async fn test_pull_wrong_layer_validation(#[case] kind: ClientKind) {
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
-            assert!(Client::default()
+            assert!(TestClient::with_default_config(kind)
+                .await
                 .pull(&reference, &RegistryAuth::Anonymous, vec!["text/plain"],)
                 .await
                 .is_err());
@@ -3844,9 +4043,12 @@ mod test {
             )
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn can_push_chunk() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn can_push_chunk(#[case] kind: ClientKind) {
         let test_container = registry_image()
             .start()
             .await
@@ -3856,10 +4058,14 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
-            protocol: ClientProtocol::Http,
-            ..Default::default()
-        });
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::Http,
+                ..Default::default()
+            },
+        )
+        .await;
         let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
@@ -3872,7 +4078,7 @@ mod test {
             .await
             .expect("failed to begin push session");
 
-        let image_data = Bytes::from(b"iamawebassemblymodule".to_vec());
+        let image_data = b"iamawebassemblymodule".to_vec();
         let (next_location, next_byte) = c
             .push_chunk(&location, &image, image_data.clone(), 0)
             .await
@@ -3890,9 +4096,12 @@ mod test {
         assert_eq!(layer_location, format!("http://localhost:{port}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b"));
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn can_push_multiple_chunks() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn can_push_multiple_chunks(#[case] kind: ClientKind) {
         let test_container = registry_image()
             .start()
             .await
@@ -3902,12 +4111,16 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let mut c = Client::new(ClientConfig {
-            protocol: ClientProtocol::Http,
-            ..Default::default()
-        });
+        let mut c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::Http,
+                ..Default::default()
+            },
+        )
+        .await;
         // set a super small chunk size - done to force multiple pushes
-        c.push_chunk_size = 3;
+        c.set_push_chunk_size(3);
         let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
@@ -3930,31 +4143,38 @@ mod test {
         );
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_image_roundtrip_anon_auth() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn test_image_roundtrip_anon_auth(#[case] kind: ClientKind) {
         let test_container = registry_image()
             .start()
             .await
             .expect("Failed to start registry container");
 
-        test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
+        test_image_roundtrip(kind, &RegistryAuth::Anonymous, &test_container).await;
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_image_roundtrip_basic_auth() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn test_image_roundtrip_basic_auth(#[case] kind: ClientKind) {
         let image = registry_image_basic_auth();
         let test_container = image.start().await.expect("cannot registry container");
 
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        test_image_roundtrip(&auth, &test_container).await;
+        test_image_roundtrip(kind, &auth, &test_container).await;
     }
 
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip(
+        kind: ClientKind,
         registry_auth: &RegistryAuth,
         test_container: &testcontainers::ContainerAsync<GenericImage>,
     ) {
@@ -3964,10 +4184,14 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
-            ..Default::default()
-        });
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         // pulling webassembly.azurecr.io/hello-wasm:v1
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
@@ -3976,7 +4200,7 @@ mod test {
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = c
-            ._pull_image_manifest(&image)
+            .pull_image_manifest_stored_auth(&image)
             .await
             .expect("failed to pull manifest");
 
@@ -4010,7 +4234,7 @@ mod test {
             .expect("failed to pull pushed image");
 
         let (pulled_manifest, _digest) = c
-            ._pull_image_manifest(&push_image)
+            .pull_image_manifest_stored_auth(&push_image)
             .await
             .expect("failed to pull pushed image manifest");
 
@@ -4027,11 +4251,14 @@ mod test {
         assert_eq!(manifest.config.digest, pulled_manifest.config.digest);
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_raw_manifest_digest() {
+    async fn test_raw_manifest_digest(#[case] kind: ClientKind) {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let c = Client::default();
+        let c = TestClient::with_default_config(kind).await;
 
         // pulling webassembly.azurecr.io/hello-wasm:v1@sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
@@ -4056,9 +4283,12 @@ mod test {
         assert_eq!(image.digest().unwrap(), hex);
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_mount() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn test_mount(#[case] kind: ClientKind) {
         // initialize the registry
         let test_container = registry_image()
             .start()
@@ -4069,10 +4299,14 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let c = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
-            ..Default::default()
-        });
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         // Create a dummy layer and push it to `layer-repository`
         let layer_reference: Reference = format!("localhost:{port}/layer-repository")
@@ -4083,13 +4317,9 @@ mod test {
             digest: sha256_digest(&layer_data),
             ..Default::default()
         };
-        c.push_blob(
-            &layer_reference,
-            Bytes::copy_from_slice(&layer_data),
-            &layer.digest,
-        )
-        .await
-        .expect("Failed to push");
+        c.push_blob(&layer_reference, layer_data.clone(), &layer.digest)
+            .await
+            .expect("Failed to push");
 
         // Mount the layer at `image-repository`
         let image_reference: Reference = format!("localhost:{port}/image-repository")
@@ -4100,22 +4330,29 @@ mod test {
             .expect("Failed to mount");
 
         // Pull the layer from `image-repository`
-        let mut buf = Vec::new();
-        c.pull_blob(&image_reference, &layer, &mut buf)
+        let buf = c
+            .pull_blob(&image_reference, &layer)
             .await
             .expect("Failed to pull");
 
         assert_eq!(layer_data, buf);
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_platform_resolution() {
+    async fn test_platform_resolution(#[case] kind: ClientKind) {
         // test that we get an error when we pull a manifest list
         let reference = Reference::try_from(DOCKER_IO_IMAGE).expect("failed to parse reference");
-        let mut c = Client::new(ClientConfig {
-            platform_resolver: None,
-            ..Default::default()
-        });
+        let mut c = TestClient::new(
+            kind,
+            ClientConfig {
+                platform_resolver: None,
+                ..Default::default()
+            },
+        )
+        .await;
         let err = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
             .await
@@ -4125,10 +4362,14 @@ mod test {
             "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
         );
 
-        c = Client::new(ClientConfig {
-            platform_resolver: Some(Box::new(linux_amd64_resolver)),
-            ..Default::default()
-        });
+        c = TestClient::new(
+            kind,
+            ClientConfig {
+                platform_resolver: Some(Box::new(linux_amd64_resolver)),
+                ..Default::default()
+            },
+        )
+        .await;
         let (_manifest, digest) = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
             .await
@@ -4139,10 +4380,13 @@ mod test {
         );
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_ghcr_io() {
+    async fn test_pull_ghcr_io(#[case] kind: ClientKind) {
         let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
-        let c = Client::default();
+        let c = TestClient::with_default_config(kind).await;
         let (manifest, _manifest_str) = c
             .pull_image_manifest(&reference, &RegistryAuth::Anonymous)
             .await
@@ -4150,13 +4394,16 @@ mod test {
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_list_all_tags_ghcr_io() {
+    async fn test_list_all_tags_ghcr_io(#[case] kind: ClientKind) {
         const MAX_TAGS_PER_LIST: usize = 100;
         const MAX_TAG_REQUESTS: usize = 10;
 
         let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
-        let c = Client::default();
+        let c = TestClient::with_default_config(kind).await;
 
         // When listing beyond the last tag in the repository, ghcr.io has been observed to emit
         // a JSON `null` for the "tags" field rather than an empty array. This must be handled
@@ -4183,14 +4430,21 @@ mod test {
         panic!("failed to list all tags for {GHCR_IO_IMAGE} in {MAX_TAG_REQUESTS} requests");
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
     #[ignore]
-    async fn test_roundtrip_multiple_layers() {
+    async fn test_roundtrip_multiple_layers(#[case] kind: ClientKind) {
         let _ = tracing_subscriber::fmt::try_init();
-        let c = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
-            ..Default::default()
-        });
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec!["oci.registry.local".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await;
         let src_image = Reference::try_from("registry:2.7.1").expect("failed to parse reference");
         let dest_image = Reference::try_from("oci.registry.local/registry:roundtrip-test")
             .expect("failed to parse reference");

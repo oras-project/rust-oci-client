@@ -6,9 +6,9 @@ doc:
 
 test: && test-native-tls check-rustls-tls-no-provider
     cargo fmt --all -- --check
-    cargo clippy --workspace
-    cargo test --workspace --lib --tests
-    cargo test --doc --all
+    cargo clippy --workspace --features blocking
+    cargo test --workspace --lib --tests --features blocking
+    cargo test --doc --all --features blocking
 
 # The full test suite under the OpenSSL (native-tls) backend.
 test-native-tls:
