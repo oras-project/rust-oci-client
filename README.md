@@ -52,18 +52,11 @@ constructing reqwest or a default TLS backend. This is useful with
 specific config fields such as proxy URLs and root certificates are not
 validated or applied on this path.
 
-On `wasm32-unknown-unknown`, the default transport uses browser Fetch with
-`redirect: "manual"` so the browser cannot silently follow or replay a request.
-TLS certificates, proxies, and connection timeouts are browser-controlled.
-The OCI client prepares the configured `User-Agent` header, but the browser may
-filter or replace it according to Fetch rules.
-The Fetch API exposes a manual redirect only as an `opaqueredirect` response:
-the redirect status and `Location` header are hidden from WebAssembly. The
-client therefore refuses the redirect with
-`OciDistributionError::BrowserRedirectNotObservable`; browser redirects cannot
-provide the same behavior as native transports. Request bodies, including
-streaming bodies, are buffered before Fetch sends them, but are never replayed
-by the default browser transport.
+On `wasm32-unknown-unknown`, the default transport uses reqwest's browser Fetch
+backend. The browser handles redirects, and response bodies are streamed.
+Request bodies are buffered before Fetch sends them because browser request
+streams are not portable across supported runtimes. TLS certificates, proxies,
+connection timeouts, and the `User-Agent` header remain browser-controlled.
 
 ## Code of Conduct
 

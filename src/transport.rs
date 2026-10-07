@@ -11,6 +11,8 @@ use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+#[cfg(target_arch = "wasm32")]
+use futures_util::SinkExt;
 use futures_util::{Stream, StreamExt};
 use http_body::{Body as HttpBody, Frame};
 use http_body_util::combinators::BoxBody;
@@ -18,12 +20,15 @@ use http_body_util::BodyExt;
 use tower::util::BoxCloneSyncService;
 #[cfg(not(target_arch = "wasm32"))]
 use tower::ServiceExt;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::wasm_bindgen;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{JsCast, JsValue};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    )
+))]
 use crate::client::Certificate;
 use crate::client::ClientConfig;
 use crate::errors::OciDistributionError;
@@ -174,21 +179,8 @@ pub type Response = http::Response<Body>;
 /// Boxed transport used by an OCI client.
 pub type Transport = BoxCloneSyncService<Request, Response, BoxError>;
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "browser Fetch concealed the redirect response for {url}; its status and Location header are not observable"
-)]
-struct BrowserRedirectError {
-    url: String,
-}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug, thiserror::Error)]
-#[error("browser Fetch failed while attempting to {operation}: {message}")]
-struct BrowserFetchError {
-    operation: &'static str,
-    message: String,
-}
+#[derive(Clone, Debug)]
+pub(crate) struct ResponseUrl(pub(crate) url::Url);
 
 /// Creates a transport body from in-memory bytes.
 pub fn body(data: impl Into<Bytes>) -> Body {
@@ -254,8 +246,17 @@ pub(crate) fn configured_transport(
 ) -> Result<Transport, OciDistributionError> {
     let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(config.user_agent)
-        .danger_accept_invalid_certs(config.accept_invalid_certificates);
+        .user_agent(config.user_agent);
+
+    #[cfg(any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    ))]
+    {
+        client_builder =
+            client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
+    }
 
     client_builder = match () {
         #[cfg(feature = "native-tls")]
@@ -264,12 +265,19 @@ pub(crate) fn configured_transport(
         () => client_builder,
     };
 
-    if !config.tls_certs_only.is_empty() {
+    #[cfg(any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    ))]
+    {
+        if !config.tls_certs_only.is_empty() {
+            client_builder =
+                client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+        }
         client_builder =
-            client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+            client_builder.tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
     }
-    client_builder =
-        client_builder.tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
 
     if let Some(timeout) = config.read_timeout {
         client_builder = client_builder.read_timeout(timeout);
@@ -312,7 +320,14 @@ pub(crate) fn configured_transport(
     Ok(browser_transport())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    )
+))]
 fn convert_certificates(
     certs: &[Certificate],
 ) -> Result<Vec<reqwest::Certificate>, OciDistributionError> {
@@ -343,111 +358,66 @@ impl From<Body> for reqwest::Body {
     }
 }
 
-/// Uses browser Fetch while keeping it behind the same transport selected by
-/// `Client`.
+/// Uses reqwest's browser Fetch adapter while keeping it behind the same
+/// transport selected by `Client`.
 ///
 /// JavaScript futures are `!Send`, so the Fetch operation runs locally and
 /// sends only the transport response back to the Send Tower future.
 #[cfg(target_arch = "wasm32")]
 fn browser_transport() -> Transport {
-    BoxCloneSyncService::new(tower::service_fn(move |request: Request| async move {
-        let (parts, body) = request.into_parts();
-        let body = body.collect().await?.to_bytes();
-        let (sender, receiver) = futures_channel::oneshot::channel();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = execute_browser_request(parts, body).await;
-            let _ = sender.send(result);
-        });
-        receiver
-            .await
-            .map_err(|_| browser_fetch_error("receive the response", "task was cancelled"))?
+    let client = reqwest::Client::new();
+    BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
+        let client = client.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            let body = body.collect().await?.to_bytes();
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = execute_browser_request(client, parts, body).await;
+                let _ = sender.send(result);
+            });
+            receiver.await.map_err(|_| {
+                BoxError::from(std::io::Error::other("browser request task was cancelled"))
+            })?
+        }
     }))
 }
 
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = fetch)]
-    fn fetch_with_request(input: &web_sys::Request) -> js_sys::Promise;
-}
-
-#[cfg(target_arch = "wasm32")]
 async fn execute_browser_request(
+    client: reqwest::Client,
     parts: http::request::Parts,
     body: Bytes,
 ) -> Result<Response, BoxError> {
-    let url = parts.uri.to_string();
-    let headers = web_sys::Headers::new()
-        .map_err(|error| browser_fetch_js_error("create request headers", error))?;
-    for (name, value) in &parts.headers {
-        headers
-            .append(name.as_str(), value.to_str().map_err(BoxError::from)?)
-            .map_err(|error| browser_fetch_js_error("set a request header", error))?;
+    let response = client
+        .request(parts.method, parts.uri.to_string())
+        .headers(parts.headers)
+        .body(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let response_url = response.url().clone();
+    let (mut sender, receiver) = futures_channel::mpsc::channel(1);
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            if sender.send(chunk.map_err(BoxError::from)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut response_builder = http::Response::builder().status(status);
+    if let Some(response_headers) = response_builder.headers_mut() {
+        response_headers.extend(headers);
     }
-
-    let init = web_sys::RequestInit::new();
-    init.set_method(parts.method.as_str());
-    init.set_headers(headers.as_ref());
-    init.set_redirect(web_sys::RequestRedirect::Manual);
-    let body = (!body.is_empty()).then(|| js_sys::Uint8Array::from(body.as_ref()));
-    if let Some(body) = body.as_ref() {
-        init.set_body(body.as_ref());
+    if let Some(extensions) = response_builder.extensions_mut() {
+        extensions.insert(ResponseUrl(response_url));
     }
-
-    let request = web_sys::Request::new_with_str_and_init(&url, &init)
-        .map_err(|error| browser_fetch_js_error("construct the request", error))?;
-    let response = wasm_bindgen_futures::JsFuture::from(fetch_with_request(&request))
-        .await
-        .map_err(|error| browser_fetch_js_error("send the request", error))?
-        .dyn_into::<web_sys::Response>()
-        .map_err(|error| browser_fetch_js_error("read the response", error))?;
-
-    if response.type_() == web_sys::ResponseType::Opaqueredirect {
-        return Err(Box::new(BrowserRedirectError { url }));
-    }
-
-    let mut response_builder = http::Response::builder().status(response.status());
-    for item in response.headers().entries() {
-        let item = item.map_err(|error| browser_fetch_js_error("read response headers", error))?;
-        let pair = item
-            .dyn_into::<js_sys::Array>()
-            .map_err(|error| browser_fetch_js_error("read a response header", error))?;
-        let name = pair
-            .get(0)
-            .as_string()
-            .ok_or_else(|| browser_fetch_error("read a response header", "name is not a string"))?;
-        let value = pair.get(1).as_string().ok_or_else(|| {
-            browser_fetch_error("read a response header", "value is not a string")
-        })?;
-        response_builder = response_builder.header(name, value);
-    }
-
-    let buffer = response
-        .array_buffer()
-        .map_err(|error| browser_fetch_js_error("read the response body", error))?;
-    let buffer = wasm_bindgen_futures::JsFuture::from(buffer)
-        .await
-        .map_err(|error| browser_fetch_js_error("read the response body", error))?;
-    let bytes = js_sys::Uint8Array::new(&buffer);
-    let mut body = vec![0; bytes.length() as usize];
-    bytes.copy_to(&mut body);
-
     response_builder
-        .body(crate::transport::body(body))
+        .body(stream_body(receiver))
         .map_err(BoxError::from)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn browser_fetch_js_error(operation: &'static str, error: JsValue) -> BoxError {
-    browser_fetch_error(operation, format!("{error:?}"))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn browser_fetch_error(operation: &'static str, message: impl Into<String>) -> BoxError {
-    Box::new(BrowserFetchError {
-        operation,
-        message: message.into(),
-    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -462,10 +432,7 @@ pub(crate) async fn collect(body: Body) -> Result<Bytes, OciDistributionError> {
 pub(crate) fn into_oci_error(error: BoxError) -> OciDistributionError {
     match error.downcast::<reqwest::Error>() {
         Ok(error) => OciDistributionError::RequestError(*error),
-        Err(error) => match error.downcast::<BrowserRedirectError>() {
-            Ok(error) => OciDistributionError::BrowserRedirectNotObservable { url: error.url },
-            Err(error) => OciDistributionError::TransportError(error),
-        },
+        Err(error) => OciDistributionError::TransportError(error),
     }
 }
 
@@ -479,20 +446,7 @@ mod tests {
 
     use crate::errors::OciDistributionError;
 
-    use super::{body, into_oci_error, stream_body, Body, BrowserRedirectError};
-
-    #[test]
-    fn browser_redirect_maps_to_typed_client_error() {
-        let error = into_oci_error(Box::new(BrowserRedirectError {
-            url: "https://registry.example/blob".to_string(),
-        }));
-
-        assert!(matches!(
-            error,
-            OciDistributionError::BrowserRedirectNotObservable { url }
-                if url == "https://registry.example/blob"
-        ));
-    }
+    use super::{body, stream_body, Body};
 
     #[test]
     fn buffered_body_is_replayable() {

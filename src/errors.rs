@@ -37,14 +37,6 @@ pub enum OciDistributionError {
     #[error(transparent)]
     /// Transparent wrapper around `serde_json::error::Error`
     JsonError(#[from] serde_json::error::Error),
-    /// Browser Fetch concealed a manual redirect response.
-    #[error(
-        "browser Fetch concealed the redirect response for {url}; its status and Location header are not observable"
-    )]
-    BrowserRedirectNotObservable {
-        /// URL whose redirect response could not be inspected.
-        url: String,
-    },
     /// Manifest is not valid UTF-8
     #[error("Manifest is not valid UTF-8")]
     ManifestEncodingError(#[from] std::str::Utf8Error),

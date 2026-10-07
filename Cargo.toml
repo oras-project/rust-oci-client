@@ -66,18 +66,8 @@ url = "2"
 web-time = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-futures-channel = "0.3"
-js-sys = "0.3"
-wasm-bindgen = "0.2"
+futures-channel = { version = "0.3", features = ["sink"] }
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3.70", features = [
-  "Headers",
-  "Request",
-  "RequestInit",
-  "RequestRedirect",
-  "Response",
-  "ResponseType",
-] }
 
 [dev-dependencies]
 assert-json-diff = "2.0"

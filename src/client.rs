@@ -510,10 +510,18 @@ impl Client {
                 .call(request)
                 .await
                 .map_err(transport::into_oci_error)?;
+            let response_url = response
+                .extensions()
+                .get::<transport::ResponseUrl>()
+                .map(|response_url| response_url.0.clone())
+                .unwrap_or_else(|| url.clone());
 
             let Some(location) = redirect_location(response.status(), response.headers(), &url)
             else {
-                return Ok(TransportResponse { response, url });
+                return Ok(TransportResponse {
+                    response,
+                    url: response_url,
+                });
             };
 
             let previous_method = method.clone();
@@ -2760,7 +2768,14 @@ pub struct Certificate {
     pub data: Vec<u8>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    )
+))]
 impl TryFrom<&Certificate> for reqwest::Certificate {
     type Error = OciDistributionError;
 
@@ -3305,7 +3320,7 @@ mod test {
         }
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     use testcontainers::{
         core::WaitFor, runners::AsyncRunner, ContainerRequest, CopyTargetOptions, GenericImage,
         ImageExt,
@@ -3326,11 +3341,16 @@ mod test {
     ];
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD_USERNAME: &str = "testuser";
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD_PASSWORD: &str = "testpassword";
 
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const EMPTY_JSON_BLOB: &str = "{}";
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const EMPTY_JSON_DIGEST: &str =
         "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
@@ -3932,7 +3952,7 @@ mod test {
         }
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_list_tags() {
         let test_container = registry_image_edge()
@@ -3997,7 +4017,7 @@ mod test {
         assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_catalog() {
         let test_container = registry_image_edge()
@@ -4400,19 +4420,19 @@ mod test {
     // https://github.com/distribution/distribution/pull/3143
     //
     // We require this fix only when testing the capability to list tags
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     fn registry_image_edge() -> GenericImage {
         GenericImage::new("distribution/distribution", "edge")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     fn registry_image() -> GenericImage {
         GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     fn registry_image_basic_auth() -> ContainerRequest<GenericImage> {
         GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
@@ -4426,7 +4446,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn can_push_chunk() {
         let test_container = registry_image()
             .start()
@@ -4472,7 +4492,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn can_push_multiple_chunks() {
         let test_container = registry_image()
             .start()
@@ -4512,7 +4532,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_image_roundtrip_anon_auth() {
         let test_container = registry_image()
             .start()
@@ -4523,7 +4543,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_image_roundtrip_basic_auth() {
         let image = registry_image_basic_auth();
         let test_container = image.start().await.expect("cannot registry container");
@@ -4534,7 +4554,7 @@ mod test {
         test_image_roundtrip(&auth, &test_container).await;
     }
 
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
         test_container: &testcontainers::ContainerAsync<GenericImage>,
@@ -4638,7 +4658,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_mount() {
         // initialize the registry
         let test_container = registry_image()
@@ -4893,7 +4913,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_blob_exists() {
         let real_registry = registry_image_edge()
             .start()
@@ -4931,7 +4951,7 @@ mod test {
     #[case::chunked(false)]
     #[case::monolithic(true)]
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_push_stream(#[case] use_monolithic_push: bool) {
         let real_registry = registry_image_edge()
             .start()
@@ -4983,7 +5003,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_push_stream_monolithic_requires_size() {
         let real_registry = registry_image_edge()
             .start()
@@ -5016,7 +5036,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_push_stream_chunked_without_digest() {
         let real_registry = registry_image_edge()
             .start()
@@ -5062,7 +5082,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_push_stream_chunked_empty_stream() {
         let real_registry = registry_image_edge()
             .start()
@@ -5099,7 +5119,7 @@ mod test {
     ///
     /// The manifest is pushed under the given `reference`.  The caller is responsible for
     /// authenticating the client for push operations beforehand.
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn push_minimal_manifest(
         client: &Client,
         reference: &Reference,
@@ -5154,7 +5174,7 @@ mod test {
     ///   3. Call `pull_referrers` and verify that the fallback is used and the
     ///      returned index contains the expected entries (both unfiltered and filtered).
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_pull_referrers_with_tag_schema_fallback() {
         let test_container = registry_image()
             .start()
@@ -5300,7 +5320,7 @@ mod test {
     /// API nor the referrers tag schema returns anything — i.e. the target image exists but
     /// has no referrers at all.
     #[tokio::test]
-    #[cfg(feature = "test-registry")]
+    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     async fn test_pull_referrers_no_tag_schema() {
         let test_container = registry_image()
             .start()

@@ -45,6 +45,11 @@ async fn default_transport_sends_requests() {
 }
 
 #[tokio::test]
+#[cfg(any(
+    feature = "native-tls",
+    feature = "rustls-tls",
+    feature = "rustls-tls-no-provider"
+))]
 async fn configured_user_agent_is_sent_on_https_proxy_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
