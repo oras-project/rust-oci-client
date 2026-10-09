@@ -64,6 +64,13 @@ unicase = "2.8"
 url = "2"
 web-time = "1"
 
+# The default transport on `wasm32-unknown-unknown` uses the Fetch API of the
+# browser, see `transport::browser`. The condition is the one that reqwest uses
+# to select its browser backend.
+[target.'cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))'.dependencies]
+futures-channel = { version = "0.3", features = ["sink"] }
+wasm-bindgen-futures = "0.4"
+
 [dev-dependencies]
 assert-json-diff = "2.0"
 anyhow = "1"

@@ -17,7 +17,9 @@
 //! - `native-tls`: The client uses the TLS library of the operating system.
 //!
 //! If you use your own HTTP transport, you do not have to enable a TLS
-//! feature. In that case, your transport supplies TLS.
+//! feature. In that case, your transport supplies TLS. On
+//! `wasm32-unknown-unknown`, the browser supplies TLS, and the features have no
+//! effect.
 //!
 //! # Custom HTTP transport
 //!

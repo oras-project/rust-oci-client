@@ -38,6 +38,10 @@ the client to send the request to a different URL. Registries often redirect
 blob downloads to a CDN or to an object store. As a result, a transport that
 does not follow redirects cannot pull images.
 
+On `wasm32-unknown-unknown`, the default transport uses the Fetch API of the
+browser. The browser controls TLS, proxies, timeouts and redirects, so the
+client ignores the related fields of `ClientConfig`.
+
 The [`custom-transport`](examples/custom-transport/main.rs) example builds a
 transport from hyper, rustls and tower layers. Run it with this command:
 

@@ -34,6 +34,14 @@
 //! The client uses all the other fields, for example `protocol` and
 //! `user_agent`.
 //!
+//! # WebAssembly
+//!
+//! On `wasm32-unknown-unknown`, the default transport uses the Fetch API of
+//! the browser. The browser controls TLS, proxies, timeouts and redirects, so
+//! the client ignores the related fields of [`ClientConfig`]. The browser can
+//! also remove the `User-Agent` header, because Fetch forbids it. The transport
+//! reads each request body into memory before it sends the request.
+//!
 //! # Errors
 //!
 //! The client returns transport errors as
@@ -103,15 +111,6 @@ use http_body::{Body as HttpBody, Frame};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use tower::util::BoxCloneSyncService;
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-        feature = "native-tls",
-        feature = "rustls-tls",
-        feature = "rustls-tls-no-provider"
-    )
-))]
-use crate::client::Certificate;
 use crate::client::ClientConfig;
 use crate::errors::OciDistributionError;
 
@@ -281,107 +280,236 @@ pub(crate) fn into_oci_error(error: BoxError) -> OciDistributionError {
 
 /// Builds the default transport. This function does not use a client configuration.
 pub(crate) fn default_transport() -> Transport {
-    from_reqwest(reqwest::Client::new())
+    #[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))]
+    {
+        native::default_transport()
+    }
+    #[cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))]
+    {
+        browser::default_transport()
+    }
 }
 
 /// Builds the default transport from a client configuration.
 pub(crate) fn configured_transport(
     config: &ClientConfig,
 ) -> Result<Transport, OciDistributionError> {
-    let mut client_builder = reqwest::Client::builder().user_agent(config.user_agent);
+    #[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))]
+    {
+        native::configured_transport(config)
+    }
+    #[cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))]
+    {
+        browser::configured_transport(config)
+    }
+}
 
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(
+/// The default transport on native targets: a reqwest client.
+#[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))]
+mod native {
+    use super::{Body, BodyKind, BoxError, Request, Transport};
+    use crate::client::ClientConfig;
+    use crate::errors::OciDistributionError;
+    use http_body_util::BodyExt;
+    use tower::util::BoxCloneSyncService;
+
+    /// Builds the default transport. This function does not use a client configuration.
+    pub(super) fn default_transport() -> Transport {
+        from_reqwest(reqwest::Client::new())
+    }
+
+    /// Builds the default transport from a client configuration.
+    pub(super) fn configured_transport(
+        config: &ClientConfig,
+    ) -> Result<Transport, OciDistributionError> {
+        let mut client_builder = reqwest::Client::builder().user_agent(config.user_agent);
+
+        #[cfg(any(
             feature = "native-tls",
             feature = "rustls-tls",
             feature = "rustls-tls-no-provider"
-        )
-    ))]
-    {
-        client_builder =
-            client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
-
-        #[cfg(feature = "native-tls")]
+        ))]
         {
             client_builder =
-                client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames);
+                client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
+
+            #[cfg(feature = "native-tls")]
+            {
+                client_builder =
+                    client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames);
+            }
+
+            if !config.tls_certs_only.is_empty() {
+                client_builder =
+                    client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+            }
+            client_builder = client_builder
+                .tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
         }
 
-        if !config.tls_certs_only.is_empty() {
-            client_builder =
-                client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+        if let Some(timeout) = config.read_timeout {
+            client_builder = client_builder.read_timeout(timeout);
         }
-        client_builder =
-            client_builder.tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
+        if let Some(timeout) = config.connect_timeout {
+            client_builder = client_builder.connect_timeout(timeout);
+        }
+
+        if let Some(proxy_addr) = &config.https_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| reqwest::NoProxy::from_string(no_proxy));
+            let proxy = reqwest::Proxy::https(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        if let Some(proxy_addr) = &config.http_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| reqwest::NoProxy::from_string(no_proxy));
+            let proxy = reqwest::Proxy::http(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        Ok(from_reqwest(client_builder.build()?))
     }
 
-    if let Some(timeout) = config.read_timeout {
-        client_builder = client_builder.read_timeout(timeout);
-    }
-    if let Some(timeout) = config.connect_timeout {
-        client_builder = client_builder.connect_timeout(timeout);
-    }
-
-    if let Some(proxy_addr) = &config.https_proxy {
-        let no_proxy = config
-            .no_proxy
-            .as_ref()
-            .and_then(|no_proxy| reqwest::NoProxy::from_string(no_proxy));
-        let proxy = reqwest::Proxy::https(proxy_addr)?.no_proxy(no_proxy);
-        client_builder = client_builder.proxy(proxy);
-    }
-
-    if let Some(proxy_addr) = &config.http_proxy {
-        let no_proxy = config
-            .no_proxy
-            .as_ref()
-            .and_then(|no_proxy| reqwest::NoProxy::from_string(no_proxy));
-        let proxy = reqwest::Proxy::http(proxy_addr)?.no_proxy(no_proxy);
-        client_builder = client_builder.proxy(proxy);
-    }
-
-    Ok(from_reqwest(client_builder.build()?))
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(
+    #[cfg(any(
         feature = "native-tls",
         feature = "rustls-tls",
         feature = "rustls-tls-no-provider"
-    )
-))]
-fn convert_certificates(
-    certs: &[Certificate],
-) -> Result<Vec<reqwest::Certificate>, OciDistributionError> {
-    certs.iter().map(reqwest::Certificate::try_from).collect()
+    ))]
+    fn convert_certificates(
+        certs: &[crate::client::Certificate],
+    ) -> Result<Vec<reqwest::Certificate>, OciDistributionError> {
+        certs.iter().map(reqwest::Certificate::try_from).collect()
+    }
+
+    /// Puts a `reqwest::Client` in a [`Transport`].
+    ///
+    /// The reqwest client keeps its own redirect policy. As a result, the
+    /// transport follows redirects as reqwest does. If a redirect goes to a
+    /// different origin, reqwest removes the credentials from the request.
+    fn from_reqwest(client: reqwest::Client) -> Transport {
+        BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
+            let client = client.clone();
+            async move {
+                let request = reqwest::Request::try_from(request)?;
+                let response = client.execute(request).await?;
+                Ok::<_, BoxError>(http::Response::from(response).map(Body::wrap))
+            }
+        }))
+    }
+
+    impl From<Body> for reqwest::Body {
+        fn from(body: Body) -> Self {
+            match body.0 {
+                // If the registry redirects the request, reqwest can send a
+                // buffered body again.
+                BodyKind::Buffered(bytes) => Self::from(bytes),
+                BodyKind::Streaming(body) => Self::wrap_stream(body.into_data_stream()),
+            }
+        }
+    }
 }
 
-/// Puts a `reqwest::Client` in a [`Transport`].
+/// The default transport on `wasm32-unknown-unknown`: the Fetch API of the
+/// browser, through the wasm backend of reqwest.
 ///
-/// The reqwest client keeps its own redirect policy. As a result, the
-/// transport follows redirects as reqwest does. If a redirect goes to a
-/// different origin, reqwest removes the credentials from the request.
-fn from_reqwest(client: reqwest::Client) -> Transport {
-    BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
-        let client = client.clone();
-        async move {
-            let request = reqwest::Request::try_from(request)?;
-            let response = client.execute(request).await?;
-            Ok::<_, BoxError>(http::Response::from(response).map(Body::wrap))
-        }
-    }))
-}
+/// The browser controls TLS, proxies, timeouts and redirects. As a result,
+/// `ClientConfig` cannot configure them, and the transport ignores those
+/// fields. The browser can also remove the `User-Agent` header, because
+/// Fetch forbids it.
+///
+/// The transport reads each request body into memory before it sends the
+/// request, because Fetch cannot stream a request body on all browsers.
+///
+/// The futures of the Fetch API are not `Send`. The transport runs the
+/// request in a local task, and gets the response back through a channel. In
+/// this way the service and its future are `Send`, as [`Transport`] requires.
+#[cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))]
+mod browser {
+    use super::{stream_body, BoxError, Request, Response, Transport};
+    use crate::client::ClientConfig;
+    use crate::errors::OciDistributionError;
+    use bytes::Bytes;
+    use futures_util::{SinkExt, StreamExt};
+    use http_body_util::BodyExt;
+    use tower::util::BoxCloneSyncService;
 
-impl From<Body> for reqwest::Body {
-    fn from(body: Body) -> Self {
-        match body.0 {
-            // If the registry redirects the request, reqwest can send a
-            // buffered body again.
-            BodyKind::Buffered(bytes) => Self::from(bytes),
-            BodyKind::Streaming(body) => Self::wrap_stream(body.into_data_stream()),
+    /// Builds the default transport. This function does not use a client configuration.
+    pub(super) fn default_transport() -> Transport {
+        from_reqwest(reqwest::Client::new())
+    }
+
+    /// Builds the default transport from a client configuration.
+    ///
+    /// The browser controls TLS, proxies and timeouts, so this function only
+    /// uses `user_agent`.
+    pub(super) fn configured_transport(
+        config: &ClientConfig,
+    ) -> Result<Transport, OciDistributionError> {
+        let client = reqwest::Client::builder()
+            .user_agent(config.user_agent)
+            .build()?;
+        Ok(from_reqwest(client))
+    }
+
+    /// Puts a `reqwest::Client` in a [`Transport`].
+    fn from_reqwest(client: reqwest::Client) -> Transport {
+        BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
+            let client = client.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = body.collect().await?.to_bytes();
+                let (sender, receiver) = futures_channel::oneshot::channel();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = execute(client, parts, body).await;
+                    let _ = sender.send(result);
+                });
+                receiver.await.map_err(|_| {
+                    BoxError::from(std::io::Error::other(
+                        "the browser request task was cancelled",
+                    ))
+                })?
+            }
+        }))
+    }
+
+    /// Sends one request with the Fetch API and converts the response.
+    ///
+    /// The body of the response is a stream. A local task reads the stream
+    /// of the browser and forwards each chunk through a channel.
+    async fn execute(
+        client: reqwest::Client,
+        parts: http::request::Parts,
+        body: Bytes,
+    ) -> Result<Response, BoxError> {
+        let response = client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers)
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        let (mut sender, receiver) = futures_channel::mpsc::channel(1);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                if sender.send(chunk.map_err(BoxError::from)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut response = http::Response::builder().status(status);
+        if let Some(response_headers) = response.headers_mut() {
+            response_headers.extend(headers);
         }
+        response.body(stream_body(receiver)).map_err(BoxError::from)
     }
 }
 

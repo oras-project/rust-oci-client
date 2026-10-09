@@ -1,5 +1,5 @@
 build +FLAGS='':
-    cargo build {{FLAGS}}
+    cargo build {{ FLAGS }}
 
 doc:
     RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --workspace --all-features --no-deps
@@ -26,6 +26,9 @@ check-rustls-tls-no-provider:
 check-no-tls:
     cargo check --no-default-features
     cargo check --no-default-features --all-targets --features test-registry
+
+check-wasm32:
+    cargo clippy --lib --target wasm32-unknown-unknown --no-default-features -- -D warnings
 
 check-deny:
     cargo deny  --all-features check bans licenses sources advisories
