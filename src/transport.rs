@@ -1,25 +1,107 @@
-//! HTTP transport types used by [`crate::Client`].
+//! The HTTP transport that [`crate::Client`] uses to send requests to registries.
 //!
-//! A transport is a cloneable [`tower::Service`] that accepts an HTTP request
-//! and returns an HTTP response. Callers can replace the default reqwest-backed
-//! transport with [`crate::Client::with_transport`] to apply their own TLS,
-//! observability, proxy, or traffic-shaping policy.
+//! A transport is a cloneable [`tower::Service`]. It takes an HTTP
+//! [`Request`] and returns an HTTP [`Response`]. By default, the client sends
+//! its requests with a `reqwest::Client` that it builds from [`ClientConfig`].
+//! An application can have an HTTP stack of its own, for example for a TLS
+//! policy, observability or traffic shaping. Such an application can give its
+//! stack to the client with
+//! [`Client::new_with_transport`](crate::Client::new_with_transport).
+//!
+//! # Contract
+//!
+//! The client prepares each request fully: the URL, the method, the headers
+//! and the body. The headers include `User-Agent` and the registry credentials.
+//! The transport controls all the network work: connections, TLS, proxies,
+//! timeouts and retries.
+//!
+//! The transport must also follow HTTP redirects. Registries
+//! often redirect blob downloads to a CDN or to an object store. As a result,
+//! a transport that does not follow redirects cannot pull images.
+//!
+//! The default transport follows redirects with the default policy of reqwest.
+//! A transport built on hyper can use
+//! [`tower_http::follow_redirect::FollowRedirectLayer`](https://docs.rs/tower-http/latest/tower_http/follow_redirect/struct.FollowRedirectLayer.html).
+//! Reqwest uses this layer internally. If a redirect goes to a different origin
+//! (scheme, host and port), the two remove the `Authorization` header.
+//!
+//! # Configuration
+//!
+//! [`Client::new_with_transport`](crate::Client::new_with_transport) does not
+//! build a reqwest client or a TLS backend. Some fields of
+//! [`ClientConfig`] only configure the default transport: the TLS fields, the
+//! proxies and the timeouts. With a custom transport, the client ignores them.
+//! The client uses all the other fields, for example `protocol` and
+//! `user_agent`.
+//!
+//! # Errors
+//!
+//! The client returns transport errors as
+//! [`OciDistributionError::TransportError`]. It returns the errors of the
+//! default transport as [`OciDistributionError::RequestError`].
+//!
+//! # Example
+//!
+//! This example builds a transport from hyper, rustls and tower layers. It
+//! uses these crates: `hyper`, `hyper-util`, `hyper-rustls`, `rustls`, `tower`
+//! and `tower-http`.
+//!
+//! ```no_run
+//! use hyper_rustls::HttpsConnectorBuilder;
+//! use hyper_util::client::legacy::Client as HyperClient;
+//! use hyper_util::rt::TokioExecutor;
+//! use oci_client::client::ClientConfig;
+//! use oci_client::{transport, Client};
+//! use tower::ServiceBuilder;
+//! use tower_http::follow_redirect::FollowRedirectLayer;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // The transport supplies TLS. This code gives the crypto provider to
+//! // rustls. If an application includes more than one rustls provider,
+//! // rustls cannot select one.
+//! let https = HttpsConnectorBuilder::new()
+//!     .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())?
+//!     .https_or_http()
+//!     .enable_http1()
+//!     .build();
+//! let hyper_client =
+//!     HyperClient::builder(TokioExecutor::new()).build::<_, transport::Body>(https);
+//!
+//! let service = ServiceBuilder::new()
+//!     // The client needs the transport errors as `BoxError`.
+//!     .map_err(transport::BoxError::from)
+//!     // The transport must follow redirects.
+//!     .layer(FollowRedirectLayer::new())
+//!     // The client needs responses with a `transport::Body`.
+//!     .map_response(|response: http::Response<hyper::body::Incoming>| {
+//!         response.map(transport::Body::wrap)
+//!     })
+//!     .service(hyper_client);
+//!
+//! let client = Client::new_with_transport(ClientConfig::default(), service);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [`custom-transport` example](https://github.com/oras-project/rust-oci-client/blob/main/examples/custom-transport/main.rs)
+//! adds a trace layer to this stack and pulls an image. Run it with this
+//! command:
+//!
+//! ```text
+//! cargo run --example custom-transport -- --verbose docker.io/library/hello-world:latest
+//! ```
 
-use std::fmt;
-use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
-#[cfg(target_arch = "wasm32")]
-use futures_util::SinkExt;
 use futures_util::{Stream, StreamExt};
 use http_body::{Body as HttpBody, Frame};
-use http_body_util::combinators::BoxBody;
-use http_body_util::BodyExt;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use tower::util::BoxCloneSyncService;
-#[cfg(not(target_arch = "wasm32"))]
-use tower::ServiceExt;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -33,78 +115,55 @@ use crate::client::Certificate;
 use crate::client::ClientConfig;
 use crate::errors::OciDistributionError;
 
-/// Error type returned by transports and transport bodies.
+/// The error type of transports and of transport bodies.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Body type used by transport requests and responses.
-///
-/// Bodies created with [`body`] or [`Body::empty`] retain their bytes and can
-/// be replayed by redirect handling or custom retry layers. Bodies created with
-/// [`Body::streaming`] are consumed once and cannot be replayed.
-pub struct Body {
-    inner: BodyInner,
-}
+/// The type of the requests that a transport receives.
+pub type Request = http::Request<Body>;
 
-enum BodyInner {
-    Replayable { bytes: Bytes, sent: bool },
-    Streaming(BoxBody<Bytes, BoxError>),
+/// The type of the responses that a transport returns.
+pub type Response = http::Response<Body>;
+
+/// The boxed service that a [`crate::Client`] sends its requests through.
+pub type Transport = BoxCloneSyncService<Request, Response, BoxError>;
+
+/// The body of transport requests and responses.
+///
+/// A body is buffered or streamed:
+///
+/// - A buffered body keeps all its bytes in memory. [`Body::from_bytes`],
+///   [`Body::empty`] and the `From` conversions make buffered bodies.
+/// - A streamed body reads its bytes from another [`http_body::Body`].
+///   [`Body::wrap`] makes streamed bodies.
+///
+/// If the registry redirects a request, the default transport can send a
+/// buffered body again. The transport can read a streamed body only one time.
+pub struct Body(BodyKind);
+
+enum BodyKind {
+    Buffered(Bytes),
+    Streaming(UnsyncBoxBody<Bytes, BoxError>),
 }
 
 impl Body {
-    /// Creates an empty replayable body.
+    /// Creates an empty body.
     pub fn empty() -> Self {
         Self::from_bytes(Bytes::new())
     }
 
-    /// Creates a replayable body from in-memory bytes.
+    /// Creates a buffered body, which keeps all its bytes in memory.
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
-        Self {
-            inner: BodyInner::Replayable {
-                bytes: data.into(),
-                sent: false,
-            },
-        }
+        Self(BodyKind::Buffered(data.into()))
     }
 
-    /// Creates a non-replayable streaming body.
-    pub fn streaming<B, E>(body: B) -> Self
+    /// Creates a streamed body, which reads its bytes from another
+    /// [`http_body::Body`].
+    pub fn wrap<B>(body: B) -> Self
     where
-        B: HttpBody<Data = Bytes, Error = E> + Send + Sync + 'static,
-        E: Into<BoxError> + 'static,
+        B: HttpBody<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
     {
-        Self {
-            inner: BodyInner::Streaming(body.map_err(Into::into).boxed()),
-        }
-    }
-
-    /// Returns whether this body can be cloned for another request attempt.
-    pub fn is_replayable(&self) -> bool {
-        matches!(self.inner, BodyInner::Replayable { .. })
-    }
-
-    /// Clones this body when its content is replayable.
-    ///
-    /// Streaming bodies return `None`. Retry layers should call this before the
-    /// first attempt and retain the original request as their replay template.
-    pub fn try_clone(&self) -> Option<Self> {
-        match &self.inner {
-            BodyInner::Replayable { bytes, sent } => Some(Self {
-                inner: BodyInner::Replayable {
-                    bytes: bytes.clone(),
-                    sent: *sent,
-                },
-            }),
-            BodyInner::Streaming(_) => None,
-        }
-    }
-
-    /// Returns the remaining in-memory bytes, or `None` for a streaming body.
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match &self.inner {
-            BodyInner::Replayable { bytes, sent: false } => Some(bytes.as_ref()),
-            BodyInner::Replayable { sent: true, .. } => Some(&[]),
-            BodyInner::Streaming(_) => None,
-        }
+        Self(BodyKind::Streaming(body.map_err(Into::into).boxed_unsync()))
     }
 }
 
@@ -114,15 +173,45 @@ impl Default for Body {
     }
 }
 
+impl From<Bytes> for Body {
+    fn from(data: Bytes) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
+impl From<&'static [u8]> for Body {
+    fn from(data: &'static [u8]) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
+impl From<String> for Body {
+    fn from(data: String) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
+impl From<&'static str> for Body {
+    fn from(data: &'static str) -> Self {
+        Self::from_bytes(data)
+    }
+}
+
 impl fmt::Debug for Body {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.inner {
-            BodyInner::Replayable { bytes, sent } => formatter
+        match &self.0 {
+            BodyKind::Buffered(bytes) => formatter
                 .debug_struct("Body")
-                .field("kind", &"replayable")
-                .field("remaining", &if *sent { 0 } else { bytes.len() })
+                .field("kind", &"buffered")
+                .field("remaining", &bytes.len())
                 .finish(),
-            BodyInner::Streaming(_) => formatter
+            BodyKind::Streaming(_) => formatter
                 .debug_struct("Body")
                 .field("kind", &"streaming")
                 .finish_non_exhaustive(),
@@ -138,139 +227,87 @@ impl HttpBody for Body {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match &mut self.get_mut().inner {
-            BodyInner::Replayable { bytes, sent } => {
-                if *sent || bytes.is_empty() {
-                    *sent = true;
+        match &mut self.get_mut().0 {
+            BodyKind::Buffered(bytes) => {
+                if bytes.is_empty() {
                     Poll::Ready(None)
                 } else {
-                    *sent = true;
-                    Poll::Ready(Some(Ok(Frame::data(bytes.clone()))))
+                    Poll::Ready(Some(Ok(Frame::data(std::mem::take(bytes)))))
                 }
             }
-            BodyInner::Streaming(body) => Pin::new(body).poll_frame(context),
+            BodyKind::Streaming(body) => Pin::new(body).poll_frame(context),
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        match &self.inner {
-            BodyInner::Replayable { bytes, sent } => *sent || bytes.is_empty(),
-            BodyInner::Streaming(body) => body.is_end_stream(),
+        match &self.0 {
+            BodyKind::Buffered(bytes) => bytes.is_empty(),
+            BodyKind::Streaming(body) => body.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        match &self.inner {
-            BodyInner::Replayable { bytes, sent: false } => {
-                http_body::SizeHint::with_exact(bytes.len() as u64)
-            }
-            BodyInner::Replayable { sent: true, .. } => http_body::SizeHint::with_exact(0),
-            BodyInner::Streaming(body) => body.size_hint(),
+        match &self.0 {
+            BodyKind::Buffered(bytes) => http_body::SizeHint::with_exact(bytes.len() as u64),
+            BodyKind::Streaming(body) => body.size_hint(),
         }
     }
 }
 
-/// Request type accepted by an OCI client transport.
-pub type Request = http::Request<Body>;
-
-/// Response type returned by an OCI client transport.
-pub type Response = http::Response<Body>;
-
-/// Boxed transport used by an OCI client.
-pub type Transport = BoxCloneSyncService<Request, Response, BoxError>;
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResponseUrl(pub(crate) url::Url);
-
-/// Creates a transport body from in-memory bytes.
-pub fn body(data: impl Into<Bytes>) -> Body {
-    Body::from_bytes(data)
-}
-
-type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
-
-struct SyncStreamBody {
-    stream: Mutex<BoxByteStream>,
-}
-
-impl HttpBody for SyncStreamBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.get_mut()
-            .stream
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .poll_next(context)
-            .map(|item| item.map(|result| result.map(Frame::data)))
-    }
-}
-
+/// Creates a streamed body from a stream of byte chunks.
 pub(crate) fn stream_body<S, E>(stream: S) -> Body
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<BoxError> + 'static,
 {
-    let stream = stream.map(|result| result.map_err(Into::into));
-    Body::streaming(SyncStreamBody {
-        stream: Mutex::new(Box::pin(stream)),
-    })
+    Body::wrap(http_body_util::StreamBody::new(
+        stream.map(|chunk| chunk.map(Frame::data).map_err(Into::into)),
+    ))
 }
 
-/// Builds the default transport without applying client configuration.
+/// Reads all the bytes of a body into memory.
+pub(crate) async fn collect(body: Body) -> Result<Bytes, OciDistributionError> {
+    Ok(body.collect().await.map_err(into_oci_error)?.to_bytes())
+}
+
+/// Converts an error of a transport, or of a transport body, into an
+/// [`OciDistributionError`].
+pub(crate) fn into_oci_error(error: BoxError) -> OciDistributionError {
+    match error.downcast::<reqwest::Error>() {
+        Ok(error) => OciDistributionError::RequestError(*error),
+        Err(error) => OciDistributionError::TransportError(error),
+    }
+}
+
+/// Builds the default transport. This function does not use a client configuration.
 pub(crate) fn default_transport() -> Transport {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        from_reqwest(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("the default reqwest client configuration is valid"),
-        )
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        browser_transport()
-    }
+    from_reqwest(reqwest::Client::new())
 }
 
-/// Builds the default transport using the supplied client configuration.
-#[cfg(not(target_arch = "wasm32"))]
+/// Builds the default transport from a client configuration.
 pub(crate) fn configured_transport(
     config: &ClientConfig,
 ) -> Result<Transport, OciDistributionError> {
-    let mut client_builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(config.user_agent);
+    let mut client_builder = reqwest::Client::builder().user_agent(config.user_agent);
 
-    #[cfg(any(
-        feature = "native-tls",
-        feature = "rustls-tls",
-        feature = "rustls-tls-no-provider"
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(
+            feature = "native-tls",
+            feature = "rustls-tls",
+            feature = "rustls-tls-no-provider"
+        )
     ))]
     {
         client_builder =
             client_builder.danger_accept_invalid_certs(config.accept_invalid_certificates);
-    }
 
-    client_builder = match () {
         #[cfg(feature = "native-tls")]
-        () => client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames),
-        #[cfg(not(feature = "native-tls"))]
-        () => client_builder,
-    };
+        {
+            client_builder =
+                client_builder.danger_accept_invalid_hostnames(config.accept_invalid_hostnames);
+        }
 
-    #[cfg(any(
-        feature = "native-tls",
-        feature = "rustls-tls",
-        feature = "rustls-tls-no-provider"
-    ))]
-    {
         if !config.tls_certs_only.is_empty() {
             client_builder =
                 client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
@@ -307,19 +344,6 @@ pub(crate) fn configured_transport(
     Ok(from_reqwest(client_builder.build()?))
 }
 
-/// Builds the browser Fetch-backed transport.
-///
-/// TLS certificates, proxies, connection timeouts, and the `User-Agent` header
-/// are controlled by the browser on wasm32 and therefore cannot be configured
-/// by `ClientConfig`. Redirects are requested in manual mode so Fetch cannot
-/// bypass the client's redirect policy.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn configured_transport(
-    _config: &ClientConfig,
-) -> Result<Transport, OciDistributionError> {
-    Ok(browser_transport())
-}
-
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(
@@ -334,169 +358,89 @@ fn convert_certificates(
     certs.iter().map(reqwest::Certificate::try_from).collect()
 }
 
-/// Wraps a reqwest client as a transport.
-#[cfg(not(target_arch = "wasm32"))]
+/// Puts a `reqwest::Client` in a [`Transport`].
+///
+/// The reqwest client keeps its own redirect policy. As a result, the
+/// transport follows redirects as reqwest does. If a redirect goes to a
+/// different origin, reqwest removes the credentials from the request.
 fn from_reqwest(client: reqwest::Client) -> Transport {
     BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
         let client = client.clone();
         async move {
             let request = reqwest::Request::try_from(request)?;
-            let response = client.oneshot(request).await?;
-            Ok::<_, BoxError>(http::Response::from(response).map(from_reqwest_body))
+            let response = client.execute(request).await?;
+            Ok::<_, BoxError>(http::Response::from(response).map(Body::wrap))
         }
     }))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl From<Body> for reqwest::Body {
     fn from(body: Body) -> Self {
-        match body.inner {
-            BodyInner::Replayable { bytes, sent: false } => Self::from(bytes),
-            BodyInner::Replayable { sent: true, .. } => Self::from(Bytes::new()),
-            BodyInner::Streaming(body) => Self::wrap(body),
+        match body.0 {
+            // If the registry redirects the request, reqwest can send a
+            // buffered body again.
+            BodyKind::Buffered(bytes) => Self::from(bytes),
+            BodyKind::Streaming(body) => Self::wrap_stream(body.into_data_stream()),
         }
-    }
-}
-
-/// Uses reqwest's browser Fetch adapter while keeping it behind the same
-/// transport selected by `Client`.
-///
-/// JavaScript futures are `!Send`, so the Fetch operation runs locally and
-/// sends only the transport response back to the Send Tower future.
-#[cfg(target_arch = "wasm32")]
-fn browser_transport() -> Transport {
-    let client = reqwest::Client::new();
-    BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
-        let client = client.clone();
-        async move {
-            let (parts, body) = request.into_parts();
-            let body = body.collect().await?.to_bytes();
-            let (sender, receiver) = futures_channel::oneshot::channel();
-            wasm_bindgen_futures::spawn_local(async move {
-                let result = execute_browser_request(client, parts, body).await;
-                let _ = sender.send(result);
-            });
-            receiver.await.map_err(|_| {
-                BoxError::from(std::io::Error::other("browser request task was cancelled"))
-            })?
-        }
-    }))
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn execute_browser_request(
-    client: reqwest::Client,
-    parts: http::request::Parts,
-    body: Bytes,
-) -> Result<Response, BoxError> {
-    let response = client
-        .request(parts.method, parts.uri.to_string())
-        .headers(parts.headers)
-        .body(body)
-        .send()
-        .await?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let response_url = response.url().clone();
-    let (mut sender, receiver) = futures_channel::mpsc::channel(1);
-    wasm_bindgen_futures::spawn_local(async move {
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if sender.send(chunk.map_err(BoxError::from)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut response_builder = http::Response::builder().status(status);
-    if let Some(response_headers) = response_builder.headers_mut() {
-        response_headers.extend(headers);
-    }
-    if let Some(extensions) = response_builder.extensions_mut() {
-        extensions.insert(ResponseUrl(response_url));
-    }
-    response_builder
-        .body(stream_body(receiver))
-        .map_err(BoxError::from)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn from_reqwest_body(body: reqwest::Body) -> Body {
-    Body::streaming(body)
-}
-
-pub(crate) async fn collect(body: Body) -> Result<Bytes, OciDistributionError> {
-    Ok(body.collect().await.map_err(into_oci_error)?.to_bytes())
-}
-
-pub(crate) fn into_oci_error(error: BoxError) -> OciDistributionError {
-    match error.downcast::<reqwest::Error>() {
-        Ok(error) => OciDistributionError::RequestError(*error),
-        Err(error) => OciDistributionError::TransportError(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    #[cfg(not(target_arch = "wasm32"))]
     use http::Method;
     use http_body::Body as _;
     use http_body_util::BodyExt;
 
     use crate::errors::OciDistributionError;
 
-    use super::{body, stream_body, Body};
+    use super::{stream_body, Body};
 
     #[test]
-    fn buffered_body_is_replayable() {
-        let body = body("payload");
-        let cloned = body
-            .try_clone()
-            .expect("buffered body should be replayable");
+    fn empty_body_is_immediately_at_end_stream() {
+        let body = Body::empty();
 
-        assert_eq!(cloned.as_bytes(), Some("payload".as_bytes()));
-    }
-
-    #[test]
-    fn empty_replayable_body_is_immediately_at_end_stream() {
-        assert!(Body::empty().is_end_stream());
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 
     #[tokio::test]
-    async fn nonempty_replayable_body_reaches_end_stream_after_consumption() {
-        let mut body = body("payload");
+    async fn buffered_body_yields_its_bytes_then_ends() {
+        let mut body = Body::from("payload");
         assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(7));
 
+        let frame = body
+            .frame()
+            .await
+            .expect("buffered body should yield one frame")
+            .expect("buffered body frame should be valid");
         assert_eq!(
-            body.frame()
-                .await
-                .expect("buffered body should yield one frame")
-                .expect("buffered body frame should be valid")
-                .into_data()
-                .expect("buffered body should yield data"),
+            frame.into_data().expect("frame should carry data"),
             Bytes::from_static(b"payload")
         );
         assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_body_forwards_every_chunk() {
+        let body = stream_body(futures_util::stream::iter([
+            Ok::<_, OciDistributionError>(Bytes::from_static(b"pay")),
+            Ok(Bytes::from_static(b"load")),
+        ]));
+        assert_eq!(body.size_hint().exact(), None);
+
+        let collected = body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected, Bytes::from_static(b"payload"));
     }
 
     #[test]
-    fn streaming_body_is_not_replayable() {
-        let body = stream_body(futures_util::stream::once(async {
-            Ok::<_, OciDistributionError>(Bytes::from_static(b"payload"))
-        }));
-
-        assert!(!body.is_replayable());
-        assert!(body.try_clone().is_none());
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn default_adapter_keeps_empty_and_buffered_requests_cloneable() {
+    fn default_transport_keeps_buffered_requests_replayable() {
         for (method, body) in [
             (Method::GET, Body::empty()),
             (Method::HEAD, Body::empty()),
-            (Method::PUT, body("payload")),
+            (Method::PUT, Body::from("payload")),
         ] {
             let request = http::Request::builder()
                 .method(method)
@@ -509,9 +453,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn default_adapter_keeps_streaming_requests_non_replayable() {
+    fn default_transport_keeps_streamed_requests_single_use() {
         let body = stream_body(futures_util::stream::once(async {
             Ok::<_, OciDistributionError>(Bytes::from_static(b"payload"))
         }));

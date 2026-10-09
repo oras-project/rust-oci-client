@@ -10,12 +10,12 @@ use base64::Engine as _;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures_util::{future, Stream};
 use http::header::{
-    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER, TRANSFER_ENCODING,
-    USER_AGENT, WWW_AUTHENTICATE,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, LOCATION, RANGE, USER_AGENT, WWW_AUTHENTICATE,
 };
 use http::{Method, StatusCode};
 use http_auth::{parser::ChallengeParser, ChallengeRef};
+use http_body::Body as _;
 use http_body_util::BodyExt;
 use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
@@ -49,7 +49,6 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     OCI_IMAGE_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 ];
-const REDIRECT_LIMIT: usize = 10;
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
 
@@ -308,50 +307,9 @@ pub struct Client {
     auth_store: Arc<RwLock<HashMap<String, RegistryAuth>>>,
     /// Token cache for the client
     pub tokens: TokenCache,
+    /// The HTTP transport that the client sends its requests through
     transport: Transport,
     push_chunk_size: usize,
-}
-
-struct TransportResponse {
-    response: transport::Response,
-    url: Url,
-}
-
-impl TransportResponse {
-    fn status(&self) -> StatusCode {
-        self.response.status()
-    }
-
-    fn headers(&self) -> &http::HeaderMap {
-        self.response.headers()
-    }
-
-    fn url(&self) -> &Url {
-        &self.url
-    }
-
-    fn content_length(&self) -> Option<u64> {
-        self.headers()
-            .get(http::header::CONTENT_LENGTH)?
-            .to_str()
-            .ok()?
-            .parse()
-            .ok()
-    }
-
-    async fn bytes(self) -> Result<bytes::Bytes> {
-        transport::collect(self.response.into_body()).await
-    }
-
-    async fn text(self) -> Result<String> {
-        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
-    }
-
-    fn bytes_stream(
-        self,
-    ) -> impl Stream<Item = std::result::Result<bytes::Bytes, transport::BoxError>> {
-        self.response.into_body().into_data_stream()
-    }
 }
 
 impl Default for Client {
@@ -410,15 +368,22 @@ impl Client {
         Self::new(config_source.client_config())
     }
 
-    /// Creates a client with the supplied config and HTTP transport.
+    /// Creates a client that sends its requests through `transport`, not
+    /// through the default reqwest client.
     ///
-    /// Unlike [`Client::new`] and [`Client::default`], this constructor never
-    /// creates a reqwest client or initializes a default TLS backend. Reqwest-only
-    /// settings such as proxy URLs and root certificates remain available in the
-    /// stored config but are the custom transport's responsibility.
+    /// The transport receives all the requests of the client: the registry
+    /// requests and the token requests. Before the client gives a request to
+    /// the transport, it sets the URL, the headers, the credentials and the
+    /// body. The transport does all the other work, and it must follow
+    /// redirects.
     ///
-    /// This is the constructor to use with `rustls-tls-no-provider` when the
-    /// supplied transport does not require a process-wide rustls crypto provider.
+    /// This constructor does not build a reqwest client or a TLS backend. As a
+    /// result, it ignores some fields of `config`. The [`crate::transport`]
+    /// module gives the contract of the transport, the fields that the client
+    /// ignores, and an example with hyper and rustls.
+    ///
+    /// The example that follows shows a minimal transport. It answers each
+    /// request with an empty response.
     ///
     /// ```
     /// use std::convert::Infallible;
@@ -452,118 +417,9 @@ impl Client {
         }
     }
 
-    /// Replaces the HTTP transport used to send registry and authentication requests.
-    ///
-    /// Request construction, authentication, redirect handling, and response validation
-    /// remain managed by the OCI client. The supplied service must return redirects
-    /// rather than following them. It is responsible for executing each individual
-    /// request, including TLS, connection policy, and any transport-level retries.
-    /// Service errors must convert into [`crate::transport::BoxError`].
-    ///
-    /// The service and its futures must be safe to move between async executor threads.
-    ///
-    /// This method replaces a transport after the client has already been constructed.
-    /// Use [`Client::new_with_transport`] when constructing the default reqwest client
-    /// or its TLS backend must be avoided.
-    pub fn with_transport<T, E>(mut self, transport: T) -> Self
-    where
-        T: Service<transport::Request, Response = transport::Response, Error = E>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        T::Future: Send + 'static,
-        E: Into<transport::BoxError> + 'static,
-    {
-        self.transport = tower::util::BoxCloneSyncService::new(transport.map_err(Into::into));
-        self
-    }
-
-    async fn send_request(&self, request: RequestBuilder) -> Result<TransportResponse> {
-        let (mut method, mut url, mut headers, mut body) = request.into_parts()?;
-        if !headers.contains_key(USER_AGENT) {
-            let user_agent = HeaderValue::from_str(self.config.user_agent)
-                .map_err(|error| OciDistributionError::GenericError(Some(error.to_string())))?;
-            headers.insert(USER_AGENT, user_agent);
-        }
-        let mut redirects = 0;
-
-        loop {
-            let request_body = match body.for_attempt() {
-                Some(body) => body,
-                None => {
-                    return Err(OciDistributionError::GenericError(Some(
-                        "request body cannot be replayed".to_string(),
-                    )));
-                }
-            };
-            let mut request = http::Request::builder()
-                .method(method.clone())
-                .uri(url.as_str())
-                .body(request_body)
-                .map_err(|error| OciDistributionError::GenericError(Some(error.to_string())))?;
-            request.headers_mut().extend(headers.clone());
-
-            let mut transport = self.transport.clone();
-            transport.ready().await.map_err(transport::into_oci_error)?;
-            let response = transport
-                .call(request)
-                .await
-                .map_err(transport::into_oci_error)?;
-            let response_url = response
-                .extensions()
-                .get::<transport::ResponseUrl>()
-                .map(|response_url| response_url.0.clone())
-                .unwrap_or_else(|| url.clone());
-
-            let Some(location) = redirect_location(response.status(), response.headers(), &url)
-            else {
-                return Ok(TransportResponse {
-                    response,
-                    url: response_url,
-                });
-            };
-
-            let previous_method = method.clone();
-            match response.status() {
-                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if method == Method::POST => {
-                    method = Method::GET;
-                    body = RequestBody::empty();
-                    remove_payload_headers(&mut headers);
-                }
-                StatusCode::SEE_OTHER => {
-                    if method != Method::HEAD {
-                        method = Method::GET;
-                    }
-                    body = RequestBody::empty();
-                    remove_payload_headers(&mut headers);
-                }
-                _ => {}
-            }
-
-            if !body.can_replay() {
-                return Ok(TransportResponse { response, url });
-            }
-            redirects += 1;
-            if redirects > REDIRECT_LIMIT {
-                return Err(OciDistributionError::RedirectLimitExceeded {
-                    url: url.to_string(),
-                    limit: REDIRECT_LIMIT,
-                });
-            }
-
-            remove_sensitive_headers(&mut headers, &url, &location);
-            set_referer(&mut headers, &url, &location);
-            debug!(
-                status = %response.status(),
-                previous_method = %previous_method,
-                method = %method,
-                from = %url,
-                to = %location,
-                "Following HTTP redirect"
-            );
-            url = location;
-        }
+    /// Starts a request to `url`. The client sends this request through its transport.
+    fn request(&self, method: Method, url: impl AsRef<str>) -> Result<RequestBuilderWrapper<'_>> {
+        RequestBuilderWrapper::from_client(self, method, url)
     }
 
     async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
@@ -626,24 +482,18 @@ impl Client {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        let mut request = RequestBuilder::new(Method::GET, &url);
+        let mut request = self.request(Method::GET, &url)?;
         if let Some(num) = n {
-            request = request.query_pair("n", num);
+            request = request.query("n", num);
         }
         if let Some(last) = last {
-            request = request.query_pair("last", last);
+            request = request.query("last", last);
         }
-        let request = RequestBuilderWrapper {
-            client: self,
-            request_builder: request,
-        };
-        let request = request.apply_auth(image, op).await?.into_request_builder();
-        let res = self.send_request(request).await?;
+        let res = request.apply_auth(image, op).await?.send().await?;
         let status = res.status();
-        let response_url = res.url().to_string();
-        let body = res.bytes().await?;
+        let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &response_url)?;
+        validate_registry_response(status, &body, &url)?;
 
         Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
@@ -700,24 +550,19 @@ impl Client {
     /// Checks if a blob exists in the remote registry
     pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
         let url = self.to_v2_blob_url(image, digest);
-        let request = RequestBuilderWrapper {
-            client: self,
-            request_builder: RequestBuilder::new(Method::HEAD, &url),
-        };
-
-        let request = request
+        let res = self
+            .request(Method::HEAD, &url)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder();
-        let res = self.send_request(request).await?;
-        let response_url = res.url().to_string();
+            .send()
+            .await?;
 
         match res.status() {
             status if status.is_success() => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
             status => {
-                let body = res.bytes().await?;
-                validate_registry_response(status, &body, &response_url)?;
+                let body = transport::collect(res.into_body()).await?;
+                validate_registry_response(status, &body, &url)?;
                 unreachable!("non-success responses are rejected above")
             }
         }
@@ -1002,9 +847,7 @@ impl Client {
             })));
         }
 
-        let res = self
-            .send_request(RequestBuilder::new(Method::GET, &url))
-            .await?;
+        let res = self.request(Method::GET, &url)?.send().await?;
         let dist_hdr = match res.headers().get(WWW_AUTHENTICATE) {
             Some(h) => h,
             None => return Ok(None),
@@ -1032,36 +875,20 @@ impl Client {
 
         let realm = challenge.realm.as_ref();
         let service = challenge.service.as_ref();
-        let mut query = vec![("scope", &scope)];
-
-        if let Some(s) = service {
-            query.push(("service", s))
-        }
 
         // TODO: At some point in the future, we should support sending a secret to the
         // server for auth. This particular workflow is for read-only public auth.
         debug!(?realm, ?service, ?scope, "Making authentication call");
 
-        let mut request = RequestBuilder::new(Method::GET, realm);
-        for (name, value) in query {
-            request = request.query_pair(name, value);
+        let mut request = self.request(Method::GET, realm)?.query("scope", &scope);
+        if let Some(service) = service {
+            request = request.query("service", service);
         }
-        request = match authentication {
-            RegistryAuth::Anonymous => request,
-            RegistryAuth::Basic(username, password) => {
-                let credentials = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"));
-                request.header("Authorization", format!("Basic {credentials}"))
-            }
-            RegistryAuth::Bearer(token) => {
-                request.header("Authorization", format!("Bearer {token}"))
-            }
-        };
-        let auth_res = self.send_request(request).await?;
+        let auth_res = request.apply_credentials(authentication)?.send().await?;
 
         match auth_res.status() {
             StatusCode::OK => {
-                let text = auth_res.text().await?;
+                let text = response_text(auth_res).await?;
                 debug!("Received response from auth request");
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
@@ -1069,7 +896,7 @@ impl Client {
                 Ok(Some(RegistryTokenType::Bearer(token)))
             }
             _ => {
-                let reason = auth_res.text().await?;
+                let reason = response_text(auth_res).await?;
                 debug!("Failed to authenticate for image '{:?}': {}", image, reason);
                 Err(OciDistributionError::AuthenticationFailure(reason))
             }
@@ -1094,18 +921,18 @@ impl Client {
 
         let url = self.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
-        let request = RequestBuilderWrapper::from_client(self, Method::HEAD, &url)
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+        let res = self
+            .request(Method::HEAD, &url)?
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder();
-        let res = self.send_request(request).await?;
+            .send()
+            .await?;
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
             let status = res.status();
-            let response_url = res.url().to_string();
-            let body = res.bytes().await?;
-            validate_registry_response(status, &body, &response_url)?;
+            let body = transport::collect(res.into_body()).await?;
+            validate_registry_response(status, &body, &url)?;
 
             // If the reference has a digest and the digest header has a matching algorithm, compare
             // them and return an error if they don't match.
@@ -1126,18 +953,18 @@ impl Client {
             Ok(digest)
         } else {
             debug!("GET image manifest from {}", url);
-            let request = RequestBuilderWrapper::from_client(self, Method::GET, &url)
-                .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            let res = self
+                .request(Method::GET, &url)?
+                .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
                 .apply_auth(image, RegistryOperation::Pull)
                 .await?
-                .into_request_builder();
-            let res = self.send_request(request).await?;
+                .send()
+                .await?;
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
-            let response_url = res.url().to_string();
-            let body = res.bytes().await?;
-            validate_registry_response(status, &body, &response_url)?;
+            let body = transport::collect(res.into_body()).await?;
+            validate_registry_response(status, &body, &url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1323,18 +1150,18 @@ impl Client {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
-        let request = RequestBuilderWrapper::from_client(self, Method::GET, &url)
-            .apply_accept(accepted_media_types)?
+        let res = self
+            .request(Method::GET, &url)?
+            .apply_accept(accepted_media_types)
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder();
-        let res = self.send_request(request).await?;
+            .send()
+            .await?;
         let status = res.status();
         let headers = res.headers().clone();
-        let response_url = res.url().to_string();
-        let body = res.bytes().await?;
+        let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &response_url)?;
+        validate_registry_response(status, &body, &url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
@@ -1506,7 +1333,7 @@ impl Client {
         layer: impl AsLayerDescriptor,
         out: T,
     ) -> Result<()> {
-        let response = self.pull_blob_response(image, &layer, None, None).await?;
+        let (response, url) = self.pull_blob_response(image, &layer, None, None).await?;
 
         let mut maybe_header_digester = digest_header_value(response.headers().clone())?
             .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
@@ -1517,12 +1344,11 @@ impl Client {
         let mut layer_digester = Digester::new(&layer_digest)?;
 
         let status = response.status();
-        let url = response.url().to_string();
         if !status.is_success() {
-            let body = response.bytes().await?;
+            let body = transport::collect(response.into_body()).await?;
             return validate_registry_response(status, &body, &url);
         }
-        let mut stream = response.bytes_stream();
+        let mut stream = response.into_body().into_data_stream();
 
         let mut out = pin!(out);
 
@@ -1596,12 +1422,8 @@ impl Client {
         image: &Reference,
         layer: impl AsLayerDescriptor,
     ) -> Result<SizedStream> {
-        stream_from_response(
-            self.pull_blob_response(image, &layer, None, None).await?,
-            layer,
-            true,
-        )
-        .await
+        let (response, url) = self.pull_blob_response(image, &layer, None, None).await?;
+        stream_from_response(response, &url, layer, true).await
     }
 
     /// Stream a single layer from an OCI registry starting with a byte offset. This can be used to
@@ -1620,84 +1442,84 @@ impl Client {
         offset: u64,
         length: Option<u64>,
     ) -> Result<BlobResponse> {
-        let response = self
+        let (response, url) = self
             .pull_blob_response(image, &layer, Some(offset), length)
             .await?;
 
         let status = response.status();
         match status {
             StatusCode::OK => Ok(BlobResponse::Full(
-                stream_from_response(response, &layer, true).await?,
+                stream_from_response(response, &url, &layer, true).await?,
             )),
             StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(
-                stream_from_response(response, &layer, false).await?,
+                stream_from_response(response, &url, &layer, false).await?,
             )),
             _ => {
-                let url = response.url().to_string();
-                let body = response.bytes().await?;
+                let body = transport::collect(response.into_body()).await?;
                 Err(validate_registry_response(status, &body, &url).expect_err("validate_registry_response should return an error for non-success status codes"))
             }
         }
     }
 
     /// Pull a single layer from an OCI registry.
+    ///
+    /// Returns the response and the URL that the response came from. This URL
+    /// is the blob URL of the registry, or one of the alternate URLs of the
+    /// layer.
     async fn pull_blob_response(
         &self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
         offset: Option<u64>,
         length: Option<u64>,
-    ) -> Result<TransportResponse> {
+    ) -> Result<(transport::Response, String)> {
         let layer = layer.as_layer_descriptor();
-        let url = self.to_v2_blob_url(image, layer.digest);
+        let range = match (offset, length) {
+            (Some(offset), Some(length)) => {
+                let end = (offset + length).saturating_sub(1);
+                Some(format!("bytes={offset}-{end}"))
+            }
+            (Some(offset), None) => Some(format!("bytes={offset}-")),
+            (None, _) => None,
+        };
 
-        let mut request = RequestBuilderWrapper::from_client(self, Method::GET, &url)
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+        let mut url = self.to_v2_blob_url(image, layer.digest);
+        let mut request = self
+            .request(Method::GET, &url)?
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
             .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder();
-        if let (Some(off), Some(len)) = (offset, length) {
-            let end = (off + len).saturating_sub(1);
-            request = request.header(
-                RANGE,
-                HeaderValue::from_str(&format!("bytes={off}-{end}")).unwrap(),
-            );
-        } else if let Some(offset) = offset {
-            request = request.header(
-                RANGE,
-                HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
-            );
+            .await?;
+        if let Some(range) = &range {
+            request = request.header(RANGE, range);
         }
-        let mut response = self.send_request(request).await?;
+        let mut response = request.send().await?;
 
         if let Some(urls) = &layer.urls {
-            for url in urls {
+            for alternate_url in urls {
                 if response.status().is_success() {
                     break;
                 }
 
-                let url = Url::parse(url)
+                let alternate_url = Url::parse(alternate_url)
                     .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
-                if url.scheme() == "http" || url.scheme() == "https" {
+                if alternate_url.scheme() == "http" || alternate_url.scheme() == "https" {
                     // NOTE: we must not authenticate on additional URLs as those
                     // can be abused to leak credentials or tokens.  Please
                     // refer to CVE-2020-15157 for more information.
-                    request = RequestBuilderWrapper::from_client(self, Method::GET, url.clone())
-                        .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                        .into_request_builder();
-                    if let Some(offset) = offset {
-                        request = request.header(
-                            RANGE,
-                            HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
-                        );
+                    let mut request = self
+                        .request(Method::GET, &alternate_url)?
+                        .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST);
+                    if let Some(range) = &range {
+                        request = request.header(RANGE, range);
                     }
-                    response = self.send_request(request).await?
+                    response = request.send().await?;
+                    url = alternate_url.into();
                 }
             }
         }
 
-        Ok(response)
+        Ok((response, url))
     }
 
     /// Begins a session to push an image to registry in a monolithical way
@@ -1706,19 +1528,20 @@ impl Client {
     async fn begin_push_monolithical_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
-        let request = RequestBuilderWrapper::from_client(self, Method::POST, url)
+        let res = self
+            .request(Method::POST, url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
             // We set "Content-Length" to 0 here even though the OCI Distribution
             // spec does not strictly require that. In practice we have seen that
             // certain registries require "Content-Length" to be present for all
             // types of push sessions.
-            .header("Content-Length", 0);
-        let res = self.send_request(request).await?;
+            .header(CONTENT_LENGTH, 0)
+            .send()
+            .await?;
 
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
-        self.extract_location_header(image, res, &StatusCode::ACCEPTED)
+        self.extract_location_header(image, res, url, &StatusCode::ACCEPTED)
             .await
     }
 
@@ -1728,15 +1551,16 @@ impl Client {
     async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
-        let request = RequestBuilderWrapper::from_client(self, Method::POST, url)
+        let res = self
+            .request(Method::POST, url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .header("Content-Length", 0);
-        let res = self.send_request(request).await?;
+            .header(CONTENT_LENGTH, 0)
+            .send()
+            .await?;
 
         // OCI spec requires the status code be 202 Accepted to successfully begin the push process
-        self.extract_location_header(image, res, &StatusCode::ACCEPTED)
+        self.extract_location_header(image, res, url, &StatusCode::ACCEPTED)
             .await
     }
 
@@ -1751,13 +1575,14 @@ impl Client {
     ) -> Result<String> {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
-        let request = RequestBuilderWrapper::from_client(self, Method::PUT, url.clone())
+        let res = self
+            .request(Method::PUT, &url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .header("Content-Length", 0);
-        let res = self.send_request(request).await?;
-        self.extract_location_header(image, res, &StatusCode::CREATED)
+            .header(CONTENT_LENGTH, 0)
+            .send()
+            .await?;
+        self.extract_location_header(image, res, url.as_str(), &StatusCode::CREATED)
             .await
     }
 
@@ -1778,27 +1603,18 @@ impl Client {
         let url = url.to_string();
 
         debug!(size, location = ?url, "Pushing monolithically");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Length",
-            format!("{}", size)
-                .parse()
-                .map_err(|e: http::header::InvalidHeaderValue| {
-                    OciDistributionError::GenericError(Some(e.to_string()))
-                })?,
-        );
-        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-
-        let request = RequestBuilderWrapper::from_client(self, Method::PUT, &url)
+        let res = self
+            .request(Method::PUT, &url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .headers(headers)
-            .streaming_body(transport::stream_body(layer));
-        let res = self.send_request(request).await?;
+            .header(CONTENT_LENGTH, size)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(transport::stream_body(layer))
+            .send()
+            .await?;
 
         // Returns location
-        self.extract_location_header(image, res, &StatusCode::CREATED)
+        self.extract_location_header(image, res, &url, &StatusCode::CREATED)
             .await
     }
 
@@ -1812,7 +1628,8 @@ impl Client {
         layer: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
-        let mut url = Url::parse(location).unwrap();
+        let mut url =
+            Url::parse(location).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
@@ -1821,23 +1638,19 @@ impl Client {
         if layer.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
         };
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Length",
-            format!("{}", layer.len()).parse().unwrap(),
-        );
-        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
-        let request = RequestBuilderWrapper::from_client(self, Method::PUT, &url)
+        let res = self
+            .request(Method::PUT, &url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(layer);
-        let res = self.send_request(request).await?;
+            .header(CONTENT_LENGTH, layer.len())
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(layer)
+            .send()
+            .await?;
 
         // Returns location
-        self.extract_location_header(image, res, &StatusCode::CREATED)
+        self.extract_location_header(image, res, &url, &StatusCode::CREATED)
             .await
     }
 
@@ -1858,38 +1671,31 @@ impl Client {
 
         let chunk_size = blob_chunk.len();
         let end_range_inclusive = range_start + chunk_size - 1;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Range",
-            format!("{range_start}-{end_range_inclusive}")
-                .parse()
-                .unwrap(),
-        );
-
-        headers.insert("Content-Length", format!("{chunk_size}").parse().unwrap());
-        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+        let content_range = format!("{range_start}-{end_range_inclusive}");
 
         debug!(
             ?range_start,
             ?end_range_inclusive,
             chunk_size,
             ?location,
-            ?headers,
+            ?content_range,
             "Pushing chunk"
         );
 
-        let request = RequestBuilderWrapper::from_client(self, Method::PATCH, location)
+        let res = self
+            .request(Method::PATCH, location)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(blob_chunk);
-        let res = self.send_request(request).await?;
+            .header(CONTENT_RANGE, content_range)
+            .header(CONTENT_LENGTH, chunk_size)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(blob_chunk)
+            .send()
+            .await?;
 
         // Returns location for next chunk and the start byte for the next range
         Ok((
-            self.extract_location_header(image, res, &StatusCode::ACCEPTED)
+            self.extract_location_header(image, res, location, &StatusCode::ACCEPTED)
                 .await?,
             end_range_inclusive + 1,
         ))
@@ -1944,13 +1750,14 @@ impl Client {
         )
         .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
 
-        let request = RequestBuilderWrapper::from_client(self, Method::POST, url.clone())
+        let res = self
+            .request(Method::POST, &url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder();
-        let res = self.send_request(request).await?;
+            .send()
+            .await?;
 
-        self.extract_location_header(image, res, &StatusCode::CREATED)
+        self.extract_location_header(image, res, url.as_str(), &StatusCode::CREATED)
             .await?;
 
         Ok(())
@@ -1986,9 +1793,6 @@ impl Client {
         let url = self.to_v2_manifest_url(image);
         debug!(?url, ?content_type, "push manifest");
 
-        let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", content_type);
-
         let body = body.into();
 
         // Calculate the digest of the manifest, this is useful
@@ -1996,16 +1800,17 @@ impl Client {
         // See below for more details.
         let manifest_hash = sha256_digest(&body);
 
-        let request = RequestBuilderWrapper::from_client(self, Method::PUT, url.clone())
+        let res = self
+            .request(Method::PUT, &url)?
             .apply_auth(image, RegistryOperation::Push)
             .await?
-            .into_request_builder()
-            .headers(headers)
-            .body(body);
-        let res = self.send_request(request).await?;
+            .header(CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await?;
 
         let ret = self
-            .extract_location_header(image, res, &StatusCode::CREATED)
+            .extract_location_header(image, res, &url, &StatusCode::CREATED)
             .await;
 
         if matches!(ret, Err(OciDistributionError::RegistryNoLocationError)) {
@@ -2058,15 +1863,15 @@ impl Client {
         let url = self.to_v2_referrers_url(image, artifact_type)?;
         debug!("Pulling referrers from {}", url);
 
-        let request = RequestBuilderWrapper::from_client(self, Method::GET, &url)
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+        let res = self
+            .request(Method::GET, &url)?
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder();
-        let res = self.send_request(request).await?;
+            .send()
+            .await?;
         let status = res.status();
-        let response_url = res.url().to_string();
-        let body = res.bytes().await?;
+        let body = transport::collect(res.into_body()).await?;
 
         // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
         // registry does not support it; fall back to the referrers tag schema.
@@ -2080,7 +1885,7 @@ impl Client {
                 .await;
         }
 
-        validate_registry_response(status, &body, &response_url)?;
+        validate_registry_response(status, &body, &url)?;
         let manifest = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
@@ -2179,39 +1984,38 @@ impl Client {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
-        let mut request = RequestBuilder::new(Method::GET, &url);
+        let mut request = self.request(Method::GET, &url)?;
         if let Some(num) = n {
-            request = request.query_pair("n", num);
+            request = request.query("n", num);
         }
         if let Some(last) = last {
-            request = request.query_pair("last", last);
+            request = request.query("last", last);
         }
-        let request = RequestBuilderWrapper {
-            client: self,
-            request_builder: request,
-        };
-        let request = request.apply_auth(image, op).await?.into_request_builder();
-        let res = self.send_request(request).await?;
+        let res = request.apply_auth(image, op).await?.send().await?;
         let status = res.status();
-        let response_url = res.url().to_string();
-        let body = res.bytes().await?;
+        let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &response_url)?;
+        validate_registry_response(status, &body, &url)?;
 
         Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
 
+    /// Returns the `Location` header of a response that has the expected status.
+    ///
+    /// `url` is the URL that the response came from. The function uses it only
+    /// in error messages.
     async fn extract_location_header(
         &self,
         image: &Reference,
-        res: TransportResponse,
+        res: transport::Response,
+        url: &str,
         expected_status: &StatusCode,
     ) -> Result<String> {
         debug!(expected_status_code=?expected_status.as_u16(),
             status_code=?res.status().as_u16(),
             "extract location header");
         if res.status().eq(expected_status) {
-            let location_header = res.headers().get("Location");
+            let location_header = res.headers().get(LOCATION);
             debug!(location=?location_header, "Location header");
             match location_header {
                 None => Err(OciDistributionError::RegistryNoLocationError),
@@ -2224,10 +2028,13 @@ impl Client {
                 res.status(),
             )))
         } else {
-            let url = res.url().to_string();
             let code = res.status().as_u16();
-            let message = res.text().await?;
-            Err(OciDistributionError::ServerError { url, code, message })
+            let message = response_text(res).await?;
+            Err(OciDistributionError::ServerError {
+                url: url.to_string(),
+                code,
+                message,
+            })
         }
     }
 
@@ -2365,6 +2172,15 @@ fn validate_registry_response(status: StatusCode, body: &[u8], url: &str) -> Res
             StatusCode::OK,
             status,
         ))),
+        // The HTTP transport must follow redirects. If a redirect gets to
+        // this point, the transport did not follow it.
+        s if s.is_redirection() => Err(OciDistributionError::ServerError {
+            code: s.as_u16(),
+            url: url.to_string(),
+            message: "the registry redirected the request, but the HTTP transport of the client \
+                      did not follow the redirect"
+                .to_string(),
+        }),
         s if s.is_client_error() => {
             match serde_json::from_slice::<OciEnvelope>(body) {
                 // According to the OCI spec, we should see an error in the message body.
@@ -2380,7 +2196,7 @@ fn validate_registry_response(status: StatusCode, body: &[u8], url: &str) -> Res
                 }),
             }
         }
-        // Catch-all for any remaining status: mostly 5xx, but also 1xx, 3xx and non-standard codes.
+        // All the other status codes: mostly 5xx, but also 1xx and non-standard codes.
         // Use a lossy conversion so a non UTF-8 body doesn't hide the status code
         s => Err(OciDistributionError::ServerError {
             code: s.as_u16(),
@@ -2388,6 +2204,12 @@ fn validate_registry_response(status: StatusCode, body: &[u8], url: &str) -> Res
             message: String::from_utf8_lossy(body).to_string(),
         }),
     }
+}
+
+/// Reads the body of a response as text.
+async fn response_text(response: transport::Response) -> Result<String> {
+    let body = transport::collect(response.into_body()).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Returns an empty OCI Image Index, as used when no referrers exist.
@@ -2402,22 +2224,28 @@ fn empty_image_index() -> OciImageIndex {
 }
 
 /// Converts a response into a stream
+///
+/// `url` is the URL that the response came from. The function uses it only in
+/// error messages.
 async fn stream_from_response(
-    response: TransportResponse,
+    response: transport::Response,
+    url: &str,
     layer: impl AsLayerDescriptor,
     verify: bool,
 ) -> Result<SizedStream> {
     let status = response.status();
-    let url = response.url().to_string();
-    let content_length = response.content_length();
+    let content_length = response.body().size_hint().exact();
     let headers = response.headers().clone();
     if !status.is_success() {
-        let body = response.bytes().await?;
-        return Err(validate_registry_response(status, &body, &url).expect_err(
+        let body = transport::collect(response.into_body()).await?;
+        return Err(validate_registry_response(status, &body, url).expect_err(
             "validate_registry_response should return an error for non-success status codes",
         ));
     }
-    let stream = response.bytes_stream().map_err(std::io::Error::other);
+    let stream = response
+        .into_body()
+        .into_data_stream()
+        .map_err(std::io::Error::other);
 
     let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
     let layer_digester = Digester::new(&expected_layer_digest)?;
@@ -2447,221 +2275,67 @@ async fn stream_from_response(
     })
 }
 
-struct RequestBuilder {
-    method: Method,
-    url: std::result::Result<Url, url::ParseError>,
-    headers: HeaderMap,
-    body: RequestBody,
-    error: Option<String>,
-}
-
-struct RequestBody(Option<transport::Body>);
-
-impl RequestBody {
-    fn empty() -> Self {
-        Self(Some(transport::Body::empty()))
-    }
-
-    fn replayable(bytes: impl Into<bytes::Bytes>) -> Self {
-        Self(Some(transport::body(bytes)))
-    }
-
-    fn streaming(body: transport::Body) -> Self {
-        Self(Some(body))
-    }
-
-    fn for_attempt(&mut self) -> Option<transport::Body> {
-        self.0
-            .as_ref()
-            .and_then(transport::Body::try_clone)
-            .or_else(|| self.0.take())
-    }
-
-    fn can_replay(&self) -> bool {
-        self.0.as_ref().is_some_and(transport::Body::is_replayable)
-    }
-}
-
-fn sensitive_authorization_value(value: &str) -> Result<HeaderValue> {
-    let mut value = HeaderValue::from_str(value)
-        .map_err(|error| OciDistributionError::GenericError(Some(error.to_string())))?;
-    value.set_sensitive(true);
-    Ok(value)
-}
-
-impl RequestBuilder {
-    fn new(method: Method, url: impl ToString) -> Self {
-        Self {
-            method,
-            url: Url::parse(&url.to_string()),
-            headers: HeaderMap::new(),
-            body: RequestBody::empty(),
-            error: None,
-        }
-    }
-
-    fn query_pair(mut self, name: &str, value: impl ToString) -> Self {
-        if let Ok(url) = &mut self.url {
-            url.query_pairs_mut().append_pair(name, &value.to_string());
-        }
-        self
-    }
-
-    fn header<N, V>(mut self, name: N, value: V) -> Self
-    where
-        N: TryInto<HeaderName>,
-        N::Error: std::fmt::Display,
-        V: TryInto<HeaderValue>,
-        V::Error: std::fmt::Display,
-    {
-        match (name.try_into(), value.try_into()) {
-            (Ok(name), Ok(mut value)) => {
-                if name == AUTHORIZATION {
-                    value.set_sensitive(true);
-                }
-                self.headers.insert(name, value);
-            }
-            (Err(error), _) => self.error = Some(error.to_string()),
-            (_, Err(error)) => self.error = Some(error.to_string()),
-        }
-        self
-    }
-
-    fn headers(mut self, headers: HeaderMap) -> Self {
-        self.headers.extend(headers);
-        self
-    }
-
-    fn body(mut self, body: impl Into<bytes::Bytes>) -> Self {
-        self.body = RequestBody::replayable(body);
-        self
-    }
-
-    fn streaming_body(mut self, body: transport::Body) -> Self {
-        self.body = RequestBody::streaming(body);
-        self
-    }
-
-    fn url(&self) -> Result<&Url> {
-        self.url
-            .as_ref()
-            .map_err(|error| OciDistributionError::UrlParseError(error.to_string()))
-    }
-
-    fn into_parts(self) -> Result<(Method, Url, HeaderMap, RequestBody)> {
-        if let Some(error) = self.error {
-            return Err(OciDistributionError::GenericError(Some(error)));
-        }
-        let url = self
-            .url
-            .map_err(|error| OciDistributionError::UrlParseError(error.to_string()))?;
-        Ok((self.method, url, self.headers, self.body))
-    }
-
-    #[cfg(test)]
-    fn build(self) -> Result<transport::Request> {
-        let (method, url, headers, mut body) = self.into_parts()?;
-        let mut request = http::Request::builder()
-            .method(method)
-            .uri(url.as_str())
-            .body(body.for_attempt().expect("a new request has a body"))
-            .map_err(|error| OciDistributionError::GenericError(Some(error.to_string())))?;
-        request.headers_mut().extend(headers);
-        Ok(request)
-    }
-}
-
-fn redirect_location(status: StatusCode, headers: &HeaderMap, previous: &Url) -> Option<Url> {
-    if !matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    ) {
-        return None;
-    }
-    let location = headers.get(LOCATION)?.to_str().ok()?;
-    let next = previous.join(location).ok()?;
-    matches!(next.scheme(), "http" | "https").then_some(next)
-}
-
-fn remove_payload_headers(headers: &mut HeaderMap) {
-    for header in [
-        CONTENT_TYPE,
-        CONTENT_LENGTH,
-        CONTENT_ENCODING,
-        TRANSFER_ENCODING,
-    ] {
-        headers.remove(header);
-    }
-}
-
-fn remove_sensitive_headers(headers: &mut HeaderMap, previous: &Url, next: &Url) {
-    let crosses_origin = previous.scheme() != next.scheme()
-        || previous.host_str() != next.host_str()
-        || previous.port_or_known_default() != next.port_or_known_default();
-    if crosses_origin {
-        for header in [
-            AUTHORIZATION,
-            COOKIE,
-            HeaderName::from_static("cookie2"),
-            PROXY_AUTHORIZATION,
-            WWW_AUTHENTICATE,
-        ] {
-            headers.remove(header);
-        }
-    }
-}
-
-fn set_referer(headers: &mut HeaderMap, previous: &Url, next: &Url) {
-    if previous.scheme() == "https" && next.scheme() != "https" {
-        headers.remove(REFERER);
-        return;
-    }
-    let mut referer = previous.clone();
-    let _ = referer.set_username("");
-    let _ = referer.set_password(None);
-    referer.set_fragment(None);
-    if let Ok(value) = HeaderValue::from_str(referer.as_str()) {
-        headers.insert(REFERER, value);
-    }
-}
-
-/// The request builder wrapper allows composable operations on a request before
-/// it is sent through the selected transport.
+/// Builds a request that a [`Client`] sends through its transport.
+///
+/// This type adds to [`http::request::Builder`] the operations that the
+/// client needs: query parameters, registry credentials and a transport body.
 struct RequestBuilderWrapper<'a> {
     client: &'a Client,
-    request_builder: RequestBuilder,
+    url: Url,
+    builder: http::request::Builder,
+    body: transport::Body,
 }
 
-// RequestBuilderWrapper type management
 impl<'a> RequestBuilderWrapper<'a> {
-    fn from_client(
-        client: &'a Client,
-        method: Method,
-        url: impl ToString,
-    ) -> RequestBuilderWrapper<'a> {
-        RequestBuilderWrapper {
+    /// Creates a builder for a `method` request to `url`.
+    ///
+    /// The request has the `User-Agent` header from the client configuration.
+    fn from_client(client: &'a Client, method: Method, url: impl AsRef<str>) -> Result<Self> {
+        let url = Url::parse(url.as_ref())
+            .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        let builder = http::Request::builder()
+            .method(method)
+            .header(USER_AGENT, client.config.user_agent);
+        Ok(Self {
             client,
-            request_builder: RequestBuilder::new(method, url),
-        }
+            url,
+            builder,
+            body: transport::Body::empty(),
+        })
     }
 
-    // Produces a final `RequestBuilder` out of this `RequestBuilderWrapper`
-    fn into_request_builder(self) -> RequestBuilder {
-        self.request_builder
+    /// Appends a query parameter to the URL of the request.
+    fn query(mut self, name: &str, value: impl std::fmt::Display) -> Self {
+        self.url
+            .query_pairs_mut()
+            .append_pair(name, &value.to_string());
+        self
     }
-}
 
-// Composable functions applicable to a `RequestBuilderWrapper`
-impl<'a> RequestBuilderWrapper<'a> {
-    fn apply_accept(mut self, accept: &[&str]) -> Result<Self> {
-        self.request_builder = self
-            .request_builder
-            .header("Accept", Vec::from(accept).join(", "));
-        Ok(self)
+    /// Sets a header of the request.
+    ///
+    /// If the name or the value is not valid, [`Self::build`] returns an error.
+    /// [`http::request::Builder::header`] works in the same way.
+    fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header(key, value);
+        self
+    }
+
+    /// Sets the body of the request.
+    fn body(mut self, body: impl Into<transport::Body>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Sets the `Accept` header of the request.
+    fn apply_accept(self, accept: &[&str]) -> Self {
+        self.header(ACCEPT, accept.join(", "))
     }
 
     /// Returns whether the request being built is addressed to the registry the
@@ -2677,7 +2351,7 @@ impl<'a> RequestBuilderWrapper<'a> {
     /// A same-host location that drops back from https to http is treated the
     /// same way, since the credentials would otherwise go out in the clear.
     fn targets_credential_registry(&self, image: &Reference) -> Result<bool> {
-        let target = self.request_builder.url()?;
+        let target = &self.url;
 
         let registry = image.resolve_registry();
         let registry_url = Url::parse(&format!(
@@ -2701,17 +2375,26 @@ impl<'a> RequestBuilderWrapper<'a> {
         Ok(true)
     }
 
+    /// Adds the credentials that the caller gives to the request.
+    fn apply_credentials(self, auth: &RegistryAuth) -> Result<Self> {
+        let authorization = match auth {
+            RegistryAuth::Anonymous => return Ok(self),
+            RegistryAuth::Basic(username, password) => basic_authorization(username, password)?,
+            RegistryAuth::Bearer(token) => bearer_authorization(token)?,
+        };
+        Ok(self.header(AUTHORIZATION, authorization))
+    }
+
     /// Updates request as necessary for authentication.
     ///
-    /// If the struct has Some(bearer), this will insert the bearer token in an
-    /// Authorization header. It will also set the Accept header, which must
-    /// be set on all OCI Registry requests. If the struct has HTTP Basic Auth
-    /// credentials, these will be configured.
+    /// If the client has a bearer token for `image` and `op`, this function
+    /// puts the token in an `Authorization` header. If the client has HTTP
+    /// Basic Auth credentials, this function puts them in that header.
     ///
-    /// Requests addressed to a host other than the registry the credentials
-    /// belong to are left unauthenticated, see
+    /// If the request goes to a host that is not the registry of the
+    /// credentials, this function does not add credentials. Refer to
     /// [`Self::targets_credential_registry`].
-    async fn apply_auth(mut self, image: &Reference, op: RegistryOperation) -> Result<Self> {
+    async fn apply_auth(self, image: &Reference, op: RegistryOperation) -> Result<Self> {
         // NOTE: we must not authenticate requests addressed outside of the
         // registry, as those can be abused to leak credentials or tokens.
         // Please refer to CVE-2020-15157 for more information.
@@ -2723,30 +2406,62 @@ impl<'a> RequestBuilderWrapper<'a> {
             return Ok(self);
         }
 
-        let mut headers = HeaderMap::new();
-        if let Some(token) = self.client.get_auth_token(image, op).await {
-            match token {
-                RegistryTokenType::Bearer(token) => {
-                    debug!("Using bearer token authentication.");
-                    headers.insert(
-                        AUTHORIZATION,
-                        sensitive_authorization_value(&token.bearer_token())?,
-                    );
-                }
-                RegistryTokenType::Basic(username, password) => {
-                    debug!("Using HTTP basic authentication.");
-                    let credentials = base64::engine::general_purpose::STANDARD
-                        .encode(format!("{username}:{password}"));
-                    headers.insert(
-                        AUTHORIZATION,
-                        sensitive_authorization_value(&format!("Basic {credentials}"))?,
-                    );
-                }
+        let Some(token) = self.client.get_auth_token(image, op).await else {
+            return Ok(self);
+        };
+        let authorization = match token {
+            RegistryTokenType::Bearer(token) => {
+                debug!("Using bearer token authentication.");
+                bearer_authorization(token.token())?
             }
-        }
-        self.request_builder = self.request_builder.headers(headers);
-        Ok(self)
+            RegistryTokenType::Basic(username, password) => {
+                debug!("Using HTTP basic authentication.");
+                basic_authorization(&username, &password)?
+            }
+        };
+        Ok(self.header(AUTHORIZATION, authorization))
     }
+
+    /// Builds the request.
+    fn build(self) -> Result<transport::Request> {
+        self.builder
+            .uri(self.url.as_str())
+            .body(self.body)
+            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))
+    }
+
+    /// Sends the request through the transport of the client.
+    async fn send(self) -> Result<transport::Response> {
+        let client = self.client;
+        let request = self.build()?;
+        client
+            .transport
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(transport::into_oci_error)
+    }
+}
+
+/// Builds the value of an `Authorization` header for HTTP Basic Auth.
+fn basic_authorization(username: &str, password: &str) -> Result<HeaderValue> {
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    authorization_header_value(format!("Basic {credentials}"))
+}
+
+/// Builds the value of an `Authorization` header for a bearer token.
+fn bearer_authorization(token: &str) -> Result<HeaderValue> {
+    authorization_header_value(format!("Bearer {token}"))
+}
+
+/// Builds the value of an `Authorization` header. The function marks the value
+/// as sensitive, so the debug output does not show the credentials.
+fn authorization_header_value(value: String) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(&value)
+        .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// The encoding of the certificate
@@ -3027,261 +2742,16 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::convert::TryFrom;
+    use std::convert::{Infallible, TryFrom};
     use std::result::Result;
-    use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
     use rstest::rstest;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
-    use tower::service_fn;
 
     use crate::errors::OciErrorCode;
     use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
-
-    #[tokio::test]
-    async fn redirects_replay_method_body_and_report_final_url() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&requests);
-        let client =
-            Client::default().with_transport(service_fn(move |request: transport::Request| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    let method = request.method().clone();
-                    let uri = request.uri().clone();
-                    let authorization = request.headers().get(AUTHORIZATION).cloned();
-                    let body = transport::collect(request.into_body()).await.unwrap();
-                    seen.lock()
-                        .unwrap()
-                        .push((method, uri.clone(), authorization, body));
-                    let response = if uri.path() == "/start" {
-                        http::Response::builder()
-                            .status(StatusCode::TEMPORARY_REDIRECT)
-                            .header(LOCATION, "/final")
-                            .body(transport::body(Bytes::new()))
-                            .unwrap()
-                    } else {
-                        http::Response::new(transport::body("done"))
-                    };
-                    Ok::<_, std::convert::Infallible>(response)
-                }
-            }));
-
-        let response = client
-            .send_request(
-                RequestBuilder::new(Method::PUT, "https://registry.example/start")
-                    .header(AUTHORIZATION, "Bearer secret")
-                    .body("payload"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.url().as_str(), "https://registry.example/final");
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        for (method, _, authorization, body) in requests.iter() {
-            assert_eq!(method, Method::PUT);
-            assert_eq!(authorization.as_ref().unwrap(), "Bearer secret");
-            assert_eq!(body, "payload");
-        }
-    }
-
-    #[tokio::test]
-    async fn cross_origin_redirect_strips_sensitive_credentials() {
-        let redirected_headers = Arc::new(Mutex::new(None));
-        let seen = Arc::clone(&redirected_headers);
-        let client =
-            Client::default().with_transport(service_fn(move |request: transport::Request| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    let response = if request.uri().host() == Some("registry.example") {
-                        http::Response::builder()
-                            .status(StatusCode::FOUND)
-                            .header(LOCATION, "https://storage.example/blob")
-                            .body(transport::body(Bytes::new()))
-                            .unwrap()
-                    } else {
-                        *seen.lock().unwrap() = Some(request.headers().clone());
-                        http::Response::new(transport::body(Bytes::new()))
-                    };
-                    Ok::<_, std::convert::Infallible>(response)
-                }
-            }));
-
-        let response = client
-            .send_request(
-                RequestBuilder::new(Method::GET, "https://registry.example/blob")
-                    .header(AUTHORIZATION, "Bearer secret")
-                    .header(COOKIE, "session=secret")
-                    .header("cookie2", "legacy=secret")
-                    .header(PROXY_AUTHORIZATION, "Basic secret")
-                    .header(WWW_AUTHENTICATE, "secret"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.url().as_str(), "https://storage.example/blob");
-        let headers = redirected_headers.lock().unwrap();
-        let headers = headers.as_ref().expect("redirected request was sent");
-        for header in [
-            AUTHORIZATION,
-            COOKIE,
-            HeaderName::from_static("cookie2"),
-            PROXY_AUTHORIZATION,
-            WWW_AUTHENTICATE,
-        ] {
-            assert!(!headers.contains_key(header));
-        }
-    }
-
-    #[tokio::test]
-    async fn post_redirect_changes_to_get_and_drops_body_headers() {
-        let redirected = Arc::new(Mutex::new(None));
-        let seen = Arc::clone(&redirected);
-        let client =
-            Client::default().with_transport(service_fn(move |request: transport::Request| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    if request.uri().path() == "/start" {
-                        return Ok::<_, std::convert::Infallible>(
-                            http::Response::builder()
-                                .status(StatusCode::MOVED_PERMANENTLY)
-                                .header(LOCATION, "/final")
-                                .body(transport::body(Bytes::new()))
-                                .unwrap(),
-                        );
-                    }
-                    let method = request.method().clone();
-                    let has_content_length = request.headers().contains_key(CONTENT_LENGTH);
-                    let body = transport::collect(request.into_body()).await.unwrap();
-                    *seen.lock().unwrap() = Some((method, has_content_length, body));
-                    Ok(http::Response::new(transport::body(Bytes::new())))
-                }
-            }));
-
-        client
-            .send_request(
-                RequestBuilder::new(Method::POST, "https://registry.example/start")
-                    .header(CONTENT_LENGTH, "7")
-                    .body("payload"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            *redirected.lock().unwrap(),
-            Some((Method::GET, false, Bytes::new()))
-        );
-    }
-
-    #[tokio::test]
-    async fn redirect_limit_is_enforced() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::clone(&attempts);
-        let client = Client::default().with_transport(service_fn(move |_| {
-            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async {
-                Ok::<_, std::convert::Infallible>(
-                    http::Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(LOCATION, "/loop")
-                        .body(transport::body(Bytes::new()))
-                        .unwrap(),
-                )
-            }
-        }));
-
-        let error = match client
-            .send_request(RequestBuilder::new(
-                Method::GET,
-                "https://registry.example/loop",
-            ))
-            .await
-        {
-            Ok(_) => panic!("redirect loop should fail"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            OciDistributionError::RedirectLimitExceeded {
-                limit: REDIRECT_LIMIT,
-                ..
-            }
-        ));
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            REDIRECT_LIMIT + 1
-        );
-    }
-
-    #[tokio::test]
-    async fn streaming_body_is_not_replayed_on_redirect() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = Arc::clone(&attempts);
-        let client =
-            Client::default().with_transport(service_fn(move |request: transport::Request| {
-                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move {
-                    let _ = transport::collect(request.into_body()).await.unwrap();
-                    Ok::<_, std::convert::Infallible>(
-                        http::Response::builder()
-                            .status(StatusCode::TEMPORARY_REDIRECT)
-                            .header(LOCATION, "/unsafe-replay")
-                            .body(transport::body(Bytes::new()))
-                            .unwrap(),
-                    )
-                }
-            }));
-        let body = transport::stream_body(futures_util::stream::once(async {
-            Ok::<_, OciDistributionError>(Bytes::from_static(b"stream"))
-        }));
-
-        let response = client
-            .send_request(
-                RequestBuilder::new(Method::PUT, "https://registry.example/start")
-                    .streaming_body(body),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(response.url().path(), "/start");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn explicit_user_agent_overrides_client_config() {
-        let seen = Arc::new(Mutex::new(None));
-        let captured = Arc::clone(&seen);
-        let client = Client::new_with_transport(
-            ClientConfig {
-                user_agent: "configured-agent",
-                ..Default::default()
-            },
-            service_fn(move |request: transport::Request| {
-                let captured = Arc::clone(&captured);
-                async move {
-                    *captured.lock().unwrap() = request.headers().get(USER_AGENT).cloned();
-                    Ok::<_, std::convert::Infallible>(http::Response::new(transport::Body::empty()))
-                }
-            }),
-        );
-
-        client
-            .send_request(
-                RequestBuilder::new(Method::GET, "https://registry.example/v2/")
-                    .header(USER_AGENT, "request-agent"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            Some(HeaderValue::from_static("request-agent"))
-        );
-    }
 
     #[test]
     fn test_validate_registry_response_server_error_non_utf8_body() {
@@ -3320,7 +2790,7 @@ mod test {
         }
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     use testcontainers::{
         core::WaitFor, runners::AsyncRunner, ContainerRequest, CopyTargetOptions, GenericImage,
         ImageExt,
@@ -3341,18 +2811,74 @@ mod test {
     ];
     const GHCR_IO_IMAGE: &str = "ghcr.io/krustlet/oci-distribution/hello-wasm:v1";
     const DOCKER_IO_IMAGE: &str = "docker.io/library/hello-world@sha256:37a0b92b08d4919615c3ee023f7ddb068d12b8387475d64c622ac30f45c29c51";
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD_USERNAME: &str = "testuser";
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const HTPASSWD_PASSWORD: &str = "testpassword";
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const EMPTY_JSON_BLOB: &str = "{}";
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
     const EMPTY_JSON_DIGEST: &str =
         "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+
+    #[test]
+    fn requests_carry_the_configured_user_agent() -> anyhow::Result<()> {
+        let client = Client::new_with_transport(
+            ClientConfig {
+                user_agent: "configured-agent",
+                ..Default::default()
+            },
+            tower::service_fn(|_: transport::Request| async {
+                Ok::<_, Infallible>(http::Response::new(transport::Body::empty()))
+            }),
+        );
+
+        let request = client
+            .request(Method::GET, "https://registry.example/v2/")?
+            .build()?;
+
+        assert_eq!(request.headers()[USER_AGENT], "configured-agent");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_are_sent_through_the_transport() -> anyhow::Result<()> {
+        let client = Client::new_with_transport(
+            ClientConfig::default(),
+            tower::service_fn(|request: transport::Request| async move {
+                let body = format!("{} {}", request.method(), request.uri());
+                Ok::<_, Infallible>(http::Response::new(transport::Body::from(body)))
+            }),
+        );
+
+        let response = client
+            .request(Method::GET, "https://registry.example/v2/")?
+            .query("n", 10)
+            .send()
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            transport::collect(response.into_body()).await?,
+            "GET https://registry.example/v2/?n=10"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unfollowed_redirects_are_reported_as_a_transport_problem() {
+        let err = validate_registry_response(
+            StatusCode::TEMPORARY_REDIRECT,
+            b"",
+            "https://registry.example/v2/repo/blobs/sha256:abc",
+        )
+        .expect_err("3xx should be an error");
+        match err {
+            OciDistributionError::ServerError { code, message, .. } => {
+                assert_eq!(307, code);
+                assert!(message.contains("did not follow the redirect"), "{message}");
+            }
+            e => panic!("expected ServerError, got {e:?}"),
+        }
+    }
 
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
@@ -3361,9 +2887,8 @@ mod test {
                 &Client::default(),
                 Method::GET,
                 "https://example.com/some/module.wasm",
-            )
-            .apply_accept(&["*/*"])?
-            .into_request_builder()
+            )?
+            .apply_accept(&["*/*"])
             .build()?
             .headers()["Accept"],
             "*/*"
@@ -3374,9 +2899,8 @@ mod test {
                 &Client::default(),
                 Method::GET,
                 "https://example.com/some/module.wasm",
-            )
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .into_request_builder()
+            )?
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)
             .build()?
             .headers()["Accept"],
             MIME_TYPES_DISTRIBUTION_MANIFEST.join(", ")
@@ -3391,13 +2915,12 @@ mod test {
             &Client::default(),
             Method::GET,
             "https://example.com/some/module.wasm",
-        )
+        )?
         .apply_auth(
             &Reference::try_from(HELLO_IMAGE_TAG)?,
             RegistryOperation::Pull
         )
         .await?
-        .into_request_builder()
         .build()?
         .headers()
         .contains_key("Authorization"));
@@ -3436,13 +2959,12 @@ mod test {
                 &client,
                 Method::GET,
                 "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef",
-            )
+            )?
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
             )
             .await?
-            .into_request_builder()
             .build()?
             .headers()["Authorization"],
             format!("Bearer {}", token)
@@ -3451,13 +2973,12 @@ mod test {
             &client,
             Method::GET,
             "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef",
-        )
+        )?
         .apply_auth(
             &Reference::try_from(HELLO_IMAGE_TAG)?,
             RegistryOperation::Pull,
         )
         .await?
-        .into_request_builder()
         .build()?
         .headers()[AUTHORIZATION]
             .clone();
@@ -3470,13 +2991,12 @@ mod test {
             &client,
             Method::GET,
             "https://example.com/some/module.wasm",
-        )
+        )?
         .apply_auth(
             &Reference::try_from(HELLO_IMAGE_TAG)?,
             RegistryOperation::Pull
         )
         .await?
-        .into_request_builder()
         .build()?
         .headers()
         .contains_key("Authorization"));
@@ -3507,10 +3027,9 @@ mod test {
             &client,
             Method::PATCH,
             "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
-        )
+        )?
         .apply_auth(&image, RegistryOperation::Push)
         .await?
-        .into_request_builder()
         .build()?
         .headers()
         .contains_key("Authorization"));
@@ -3518,10 +3037,9 @@ mod test {
             &client,
             Method::PATCH,
             "https://webassembly.azurecr.io/v2/hello-wasm/blobs/uploads/abc",
-        )
+        )?
         .apply_auth(&image, RegistryOperation::Push)
         .await?
-        .into_request_builder()
         .build()?
         .headers()[AUTHORIZATION]
             .clone();
@@ -3532,10 +3050,9 @@ mod test {
             &client,
             Method::PATCH,
             "https://elsewhere.example.com/upload/abc",
-        )
+        )?
         .apply_auth(&image, RegistryOperation::Push)
         .await?
-        .into_request_builder()
         .build()?
         .headers()
         .contains_key("Authorization"));
@@ -3565,7 +3082,8 @@ mod test {
     fn test_targets_credential_registry(#[case] location: &str, #[case] expected: bool) {
         let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
         let client = Client::default();
-        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location);
+        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location)
+            .expect("failed to parse the location");
 
         assert_eq!(
             request
@@ -3588,7 +3106,8 @@ mod test {
         let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
         image.set_mirror_registry("docker.mirror.io".to_owned());
         let client = Client::default();
-        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location);
+        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location)
+            .expect("failed to parse the location");
 
         assert_eq!(
             request
@@ -3609,7 +3128,8 @@ mod test {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
-        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location);
+        let request = RequestBuilderWrapper::from_client(&client, Method::PATCH, location)
+            .expect("failed to parse the location");
 
         assert_eq!(
             request
@@ -3952,7 +3472,7 @@ mod test {
         }
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_list_tags() {
         let test_container = registry_image_edge()
@@ -4017,7 +3537,7 @@ mod test {
         assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_catalog() {
         let test_container = registry_image_edge()
@@ -4420,19 +3940,19 @@ mod test {
     // https://github.com/distribution/distribution/pull/3143
     //
     // We require this fix only when testing the capability to list tags
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     fn registry_image_edge() -> GenericImage {
         GenericImage::new("distribution/distribution", "edge")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     fn registry_image() -> GenericImage {
         GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     fn registry_image_basic_auth() -> ContainerRequest<GenericImage> {
         GenericImage::new("docker.io/library/registry", "2")
             .with_wait_for(WaitFor::message_on_stderr("listening on "))
@@ -4446,7 +3966,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn can_push_chunk() {
         let test_container = registry_image()
             .start()
@@ -4492,7 +4012,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn can_push_multiple_chunks() {
         let test_container = registry_image()
             .start()
@@ -4532,7 +4052,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_anon_auth() {
         let test_container = registry_image()
             .start()
@@ -4543,7 +4063,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_basic_auth() {
         let image = registry_image_basic_auth();
         let test_container = image.start().await.expect("cannot registry container");
@@ -4554,7 +4074,7 @@ mod test {
         test_image_roundtrip(&auth, &test_container).await;
     }
 
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
         test_container: &testcontainers::ContainerAsync<GenericImage>,
@@ -4658,7 +4178,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_mount() {
         // initialize the registry
         let test_container = registry_image()
@@ -4913,7 +4433,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_blob_exists() {
         let real_registry = registry_image_edge()
             .start()
@@ -4951,7 +4471,7 @@ mod test {
     #[case::chunked(false)]
     #[case::monolithic(true)]
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_push_stream(#[case] use_monolithic_push: bool) {
         let real_registry = registry_image_edge()
             .start()
@@ -5003,7 +4523,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_push_stream_monolithic_requires_size() {
         let real_registry = registry_image_edge()
             .start()
@@ -5036,7 +4556,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_push_stream_chunked_without_digest() {
         let real_registry = registry_image_edge()
             .start()
@@ -5082,7 +4602,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_push_stream_chunked_empty_stream() {
         let real_registry = registry_image_edge()
             .start()
@@ -5119,7 +4639,7 @@ mod test {
     ///
     /// The manifest is pushed under the given `reference`.  The caller is responsible for
     /// authenticating the client for push operations beforehand.
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn push_minimal_manifest(
         client: &Client,
         reference: &Reference,
@@ -5174,7 +4694,7 @@ mod test {
     ///   3. Call `pull_referrers` and verify that the fallback is used and the
     ///      returned index contains the expected entries (both unfiltered and filtered).
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_pull_referrers_with_tag_schema_fallback() {
         let test_container = registry_image()
             .start()
@@ -5320,7 +4840,7 @@ mod test {
     /// API nor the referrers tag schema returns anything — i.e. the target image exists but
     /// has no referrers at all.
     #[tokio::test]
-    #[cfg(all(feature = "test-registry", not(target_arch = "wasm32")))]
+    #[cfg(feature = "test-registry")]
     async fn test_pull_referrers_no_tag_schema() {
         let test_container = registry_image()
             .start()

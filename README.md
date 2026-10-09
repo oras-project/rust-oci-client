@@ -16,47 +16,43 @@ This crate offers three Cargo features for TLS, you must enable exactly one of t
 - `rustls-tls-no-provider`: Uses `rustls`, but leaves the crypto provider to you. Before you build a `Client`, install one, for example with `rustls::crypto::ring::default_provider().install_default()`. Choose this feature when your application already picks a crypto provider and you want to avoid `aws-lc-rs`.
 - `native-tls`: Uses the TLS library of your operating system instead of `rustls`.
 
+If you use your own HTTP transport, you do not have to enable a TLS feature.
+In that case, your transport supplies TLS. The next section gives more
+information.
+
 ## Custom HTTP transport
 
-By default, `Client` sends requests with the reqwest client configured by
-`ClientConfig`. Applications that need their own TLS, observability, proxy, or
-traffic-shaping policy can replace it with a cloneable Tower service:
+By default, `Client` sends its requests with a reqwest client that it builds
+from `ClientConfig`. An application can have an HTTP stack of its own, for
+example for a TLS policy, observability or traffic shaping. Such an
+application can give its stack to `Client::new_with_transport` as a
+cloneable Tower service.
 
-```rust
-use std::convert::Infallible;
+The client prepares each request fully: the URL, the method, the headers and
+the body. The headers include `User-Agent` and the registry credentials. Then
+the client gives the request to the transport. The transport controls all the
+network work: connections, TLS, proxies, timeouts and retries.
 
-use oci_client::client::ClientConfig;
-use oci_client::{transport, Client};
-use tower::service_fn;
+The transport must also follow redirects. A redirect is a response that tells
+the client to send the request to a different URL. Registries often redirect
+blob downloads to a CDN or to an object store. As a result, a transport that
+does not follow redirects cannot pull images.
 
-let transport = service_fn(|_request: transport::Request| async move {
-    // Forward the request with your HTTP stack and return its response.
-    Ok::<_, Infallible>(http::Response::new(transport::Body::empty()))
-});
+The [`custom-transport`](examples/custom-transport/main.rs) example builds a
+transport from hyper, rustls and tower layers. Run it with this command:
 
-let client = Client::new_with_transport(ClientConfig::default(), transport);
+```sh
+cargo run --example custom-transport -- docker.io/library/hello-world:latest
 ```
 
-The service receives every registry and authentication request after the OCI
-client has applied headers, credentials, and request bodies. It should execute
-one HTTP exchange and return redirect responses unchanged: the OCI client owns
-redirect handling, including its redirect limit, body replay rules, and removal
-of credentials when a redirect crosses an origin. Transport-level retries are
-the service's responsibility. [`transport::Body`](https://docs.rs/oci-client/latest/oci_client/transport/struct.Body.html)
-reports whether a body is replayable and can clone buffered bodies for retry
-layers; streaming bodies are intentionally single-use.
+To see a trace of each HTTP exchange, add `--verbose`. The trace also shows
+the blob download that the registry redirects.
 
-`Client::new_with_transport` stores the supplied `ClientConfig` without
-constructing reqwest or a default TLS backend. This is useful with
-`rustls-tls-no-provider` when the custom transport manages TLS itself. Reqwest-
-specific config fields such as proxy URLs and root certificates are not
-validated or applied on this path.
-
-On `wasm32-unknown-unknown`, the default transport uses reqwest's browser Fetch
-backend. The browser handles redirects, and response bodies are streamed.
-Request bodies are buffered before Fetch sends them because browser request
-streams are not portable across supported runtimes. TLS certificates, proxies,
-connection timeouts, and the `User-Agent` header remain browser-controlled.
+`Client::new_with_transport` does not build a reqwest client or a TLS backend.
+Some fields of `ClientConfig` only configure the default transport: the TLS
+fields, the proxies and the timeouts. With a custom transport, the client
+ignores them. The client uses all the other fields, for example `protocol` and
+`user_agent`.
 
 ## Code of Conduct
 

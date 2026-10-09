@@ -72,15 +72,8 @@ pub enum OciDistributionError {
     /// Transparent wrapper around `reqwest::Error`
     #[error(transparent)]
     RequestError(#[from] reqwest::Error),
-    /// The HTTP redirect limit was exceeded.
-    #[error("too many redirects (limit {limit}) while requesting {url}")]
-    RedirectLimitExceeded {
-        /// The last URL requested before the limit was exceeded.
-        url: String,
-        /// Maximum number of redirects followed.
-        limit: usize,
-    },
-    /// An error returned by a caller-provided HTTP transport
+    /// An error from the HTTP transport of the client. Refer to
+    /// [`crate::transport`].
     #[error("HTTP transport error: {0}")]
     TransportError(#[source] crate::transport::BoxError),
     /// HTTP Server error

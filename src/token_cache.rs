@@ -8,6 +8,9 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+// On native targets, `web_time` is the same as `std::time`. On
+// `wasm32-unknown-unknown`, `std::time::SystemTime::now()` panics, but
+// `web_time` gives a clock that works.
 use web_time::{SystemTime, UNIX_EPOCH};
 
 /// A token granted during the OAuth2-like workflow for OCI registries.
