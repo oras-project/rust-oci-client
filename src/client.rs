@@ -77,6 +77,19 @@ pub struct PushResponse {
     pub config_url: String,
     /// Pullable url for the manifest
     pub manifest_url: String,
+    /// Digest of the pushed manifest, in `sha256:<hex>` form.
+    /// Computed on the client side, so it does not depend on the registry.
+    pub manifest_digest: String,
+}
+
+/// The result of a manifest push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPushResponse {
+    /// Pullable url for the manifest, as returned by the registry
+    pub url: String,
+    /// Digest of the manifest bytes that were sent, in `sha256:<hex>` form.
+    /// Computed on the client side, so it does not depend on the registry.
+    pub digest: String,
 }
 
 /// The data returned by [`Client::push_blob_stream_chunked`].
@@ -635,11 +648,12 @@ impl Client {
         let config_url = self
             .push_blob(image_ref, config.data, &manifest.config.digest)
             .await?;
-        let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
+        let manifest_push_response = self.push_manifest(image_ref, &manifest.into()).await?;
 
         Ok(PushResponse {
             config_url,
-            manifest_url,
+            manifest_url: manifest_push_response.url,
+            manifest_digest: manifest_push_response.digest,
         })
     }
 
@@ -1327,7 +1341,7 @@ impl Client {
         reference: &Reference,
         auth: &RegistryAuth,
         manifest: OciImageIndex,
-    ) -> Result<String> {
+    ) -> Result<ManifestPushResponse> {
         self.store_auth_if_needed(reference.resolve_registry(), auth)
             .await;
         self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
@@ -1807,8 +1821,13 @@ impl Client {
 
     /// Pushes the manifest for a specified image
     ///
-    /// Returns pullable manifest URL
-    pub async fn push_manifest(&self, image: &Reference, manifest: &OciManifest) -> Result<String> {
+    /// Returns the pullable manifest URL and the locally computed digest of
+    /// the manifest that was sent.
+    pub async fn push_manifest(
+        &self,
+        image: &Reference,
+        manifest: &OciManifest,
+    ) -> Result<ManifestPushResponse> {
         let mut headers = HeaderMap::new();
         let content_type = manifest.content_type();
         headers.insert("Content-Type", content_type.parse().unwrap());
@@ -1825,13 +1844,14 @@ impl Client {
 
     /// Pushes the manifest, provided as raw bytes, for a specified image
     ///
-    /// Returns pullable manifest url
+    /// Returns the pullable manifest URL and the locally computed digest of
+    /// the manifest that was sent.
     pub async fn push_manifest_raw(
         &self,
         image: &Reference,
         body: impl Into<bytes::Bytes>,
         content_type: HeaderValue,
-    ) -> Result<String> {
+    ) -> Result<ManifestPushResponse> {
         let url = self.to_v2_manifest_url(image);
         debug!(?url, ?content_type, "push manifest");
 
@@ -1840,8 +1860,12 @@ impl Client {
 
         let body = body.into();
 
-        // Calculate the digest of the manifest, this is useful
-        // if the remote registry is violating the OCI Distribution Specification.
+        // Calculate the digest of the manifest ourselves rather than trusting
+        // any digest the registry hands back. The distribution spec requires
+        // the registry to store the manifest byte-for-byte and requires
+        // `Docker-Content-Digest` to equal the client-provided digest, so this
+        // is also useful as a fallback if the remote registry is violating the
+        // OCI Distribution Specification and omits the `Location` header.
         // See below for more details.
         let manifest_hash = sha256_digest(&body);
 
@@ -1853,6 +1877,8 @@ impl Client {
             .body(body)
             .send()
             .await?;
+
+        let response_headers = res.headers().clone();
 
         let ret = self
             .extract_location_header(image, res, &reqwest::StatusCode::CREATED)
@@ -1873,10 +1899,34 @@ impl Client {
                 .expect("The manifest URL always ends with the image tag suffix");
             let url_by_digest = format!("{url_base}{manifest_hash}");
 
-            return Ok(url_by_digest);
+            return Ok(ManifestPushResponse {
+                url: url_by_digest,
+                digest: manifest_hash,
+            });
         }
 
-        ret
+        let url = ret?;
+
+        // The registry MAY return `Docker-Content-Digest` alongside the
+        // Location header. When it does, the spec requires it to equal the
+        // client-provided digest. A mismatch means the registry stored
+        // something other than the bytes we sent, so treat it as a hard
+        // error rather than silently trusting our own digest.
+        if let Some(header_digest) = digest_header_value(response_headers)? {
+            if header_digest != manifest_hash {
+                return Err(OciDistributionError::DigestError(
+                    DigestError::VerificationError {
+                        expected: manifest_hash,
+                        actual: header_digest,
+                    },
+                ));
+            }
+        }
+
+        Ok(ManifestPushResponse {
+            url,
+            digest: manifest_hash,
+        })
     }
 
     /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
@@ -3990,15 +4040,16 @@ mod test {
             .await
             .expect("authenticated");
 
-        c.push(
-            &push_image,
-            &image_data.layers,
-            image_data.config.clone(),
-            registry_auth,
-            Some(manifest.clone()),
-        )
-        .await
-        .expect("failed to push image");
+        let push_response = c
+            .push(
+                &push_image,
+                &image_data.layers,
+                image_data.config.clone(),
+                registry_auth,
+                Some(manifest.clone()),
+            )
+            .await
+            .expect("failed to push image");
 
         let pulled_image_data = c
             .pull(
@@ -4009,10 +4060,14 @@ mod test {
             .await
             .expect("failed to pull pushed image");
 
-        let (pulled_manifest, _digest) = c
+        let (pulled_manifest, pulled_manifest_digest) = c
             ._pull_image_manifest(&push_image)
             .await
             .expect("failed to pull pushed image manifest");
+
+        // The digest computed locally at push time must match the digest the registry reports
+        // for the same manifest: https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests
+        assert_eq!(push_response.manifest_digest, pulled_manifest_digest);
 
         assert!(image_data.layers.len() == 1);
         assert!(pulled_image_data.layers.len() == 1);
@@ -4552,11 +4607,7 @@ mod test {
             .push_manifest(reference, &oci_manifest)
             .await
             .expect("failed to push manifest")
-            // push_manifest returns the URL; extract the digest from the end
-            .rsplit('/')
-            .next()
-            .expect("manifest URL has no digest component")
-            .to_string()
+            .digest
     }
 
     /// `distribution/distribution` does not implement the native OCI referrers API — it returns 404 for
