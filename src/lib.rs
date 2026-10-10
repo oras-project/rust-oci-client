@@ -34,8 +34,6 @@
 //! contract that the stack must obey, and an example.
 #![deny(missing_docs)]
 
-use sha2::Digest;
-
 pub mod annotations;
 mod blob;
 pub mod client;
@@ -56,5 +54,11 @@ pub use token_cache::RegistryOperation;
 
 /// Computes the SHA256 digest of a byte vector
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    format!(
+        "sha256:{}",
+        hex::encode(
+            openssl::hash::hash(openssl::hash::MessageDigest::sha256(), bytes)
+                .expect("OpenSSL digest failure")
+        )
+    )
 }

@@ -20,7 +20,6 @@ use http_body_util::BodyExt;
 use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use serde::{Deserialize, Deserializer, Serialize};
-use sha2::Digest as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tower::{Service, ServiceExt};
@@ -782,7 +781,10 @@ impl Client {
 
         let location = self.begin_push_chunked_session(image).await?;
 
-        let mut digester = Digester::Sha256(sha2::Sha256::new());
+        let mut digester = Digester::Sha256(
+            openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
+                .expect("failed to initialize OpenSSL hasher"),
+        );
         let (location, size) = self
             .push_stream_chunks(location, image, blob_data_stream, |chunk| {
                 digester.update(chunk)
@@ -4267,7 +4269,8 @@ mod test {
             .expect("failed to pull manifest");
 
         // Compute the digest of the returned manifest text.
-        let digest = sha2::Sha256::digest(manifest);
+        let digest =
+            openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &manifest).unwrap();
         let hex = format!("sha256:{}", hex::encode(digest));
 
         // Validate that the computed digest and the digest in the pulled reference match.

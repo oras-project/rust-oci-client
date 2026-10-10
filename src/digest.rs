@@ -1,7 +1,6 @@
 //! Errors and functions for validating digests
 
 use http::HeaderMap;
-use sha2::Digest as _;
 use std::fmt::{Display, Formatter};
 
 use crate::sha256_digest;
@@ -61,9 +60,9 @@ impl<'a> Digest<'a> {
 /// utils. This has to be an enum because the digest algorithms aren't object safe so we can't box
 /// dynner them
 pub(crate) enum Digester {
-    Sha256(sha2::Sha256),
-    Sha384(sha2::Sha384),
-    Sha512(sha2::Sha512),
+    Sha256(openssl::hash::Hasher),
+    Sha384(openssl::hash::Hasher),
+    Sha512(openssl::hash::Hasher),
 }
 
 impl Digester {
@@ -71,9 +70,18 @@ impl Digester {
         let parsed_digest = Digest::new(digest)?;
 
         match parsed_digest.algorithm {
-            "sha256" => Ok(Digester::Sha256(sha2::Sha256::new())),
-            "sha384" => Ok(Digester::Sha384(sha2::Sha384::new())),
-            "sha512" => Ok(Digester::Sha512(sha2::Sha512::new())),
+            "sha256" => Ok(Digester::Sha256(
+                openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256())
+                    .expect("failed to initialize OpenSSL hasher"),
+            )),
+            "sha384" => Ok(Digester::Sha384(
+                openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha384())
+                    .expect("failed to initialize OpenSSL hasher"),
+            )),
+            "sha512" => Ok(Digester::Sha512(
+                openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha512())
+                    .expect("failed to initialize OpenSSL hasher"),
+            )),
             // We already check this above when parsing, but just in case, we return the error as
             // well here
             _ => Err(DigestError::UnsupportedAlgorithm(
@@ -83,18 +91,30 @@ impl Digester {
     }
 
     pub fn update(&mut self, data: impl AsRef<[u8]>) {
-        match self {
-            Self::Sha256(d) => d.update(data),
-            Self::Sha384(d) => d.update(data),
-            Self::Sha512(d) => d.update(data),
-        }
+        let hasher = match self {
+            Self::Sha256(h) => h,
+            Self::Sha384(h) => h,
+            Self::Sha512(h) => h,
+        };
+        hasher
+            .update(data.as_ref())
+            .expect("OpenSSL hasher update failure");
     }
 
     pub fn finalize(&mut self) -> String {
         match self {
-            Self::Sha256(d) => format!("sha256:{}", hex::encode(d.finalize_reset())),
-            Self::Sha384(d) => format!("sha384:{}", hex::encode(d.finalize_reset())),
-            Self::Sha512(d) => format!("sha512:{}", hex::encode(d.finalize_reset())),
+            Self::Sha256(h) => format!(
+                "sha256:{}",
+                hex::encode(h.finish().expect("OpenSSL hasher finish failure"))
+            ),
+            Self::Sha384(h) => format!(
+                "sha384:{}",
+                hex::encode(h.finish().expect("OpenSSL hasher finish failure"))
+            ),
+            Self::Sha512(h) => format!(
+                "sha512:{}",
+                hex::encode(h.finish().expect("OpenSSL hasher finish failure"))
+            ),
         }
     }
 }
@@ -145,9 +165,18 @@ pub fn validate_digest(
 /// Helper for calculating and validating the digest of the given content
 fn calculate_and_validate(content: &[u8], parsed_digest: Digest) -> Result<String> {
     let digest_calculated = match parsed_digest.algorithm {
-        "sha256" => hex::encode(sha2::Sha256::digest(content)),
-        "sha384" => hex::encode(sha2::Sha384::digest(content)),
-        "sha512" => hex::encode(sha2::Sha512::digest(content)),
+        "sha256" => hex::encode(
+            openssl::hash::hash(openssl::hash::MessageDigest::sha256(), content)
+                .expect("OpenSSL digest failure"),
+        ),
+        "sha384" => hex::encode(
+            openssl::hash::hash(openssl::hash::MessageDigest::sha384(), content)
+                .expect("OpenSSL digest failure"),
+        ),
+        "sha512" => hex::encode(
+            openssl::hash::hash(openssl::hash::MessageDigest::sha512(), content)
+                .expect("OpenSSL digest failure"),
+        ),
         other => return Err(DigestError::UnsupportedAlgorithm(other.to_string())),
     };
     let hex = Digest {
@@ -175,8 +204,18 @@ mod tests {
     #[test]
     fn test_validate_digest() {
         let body = b"hello world";
-        let digest_sha256 = format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)));
-        let digest_sha384 = format!("sha384:{}", hex::encode(sha2::Sha384::digest(body)));
+        let digest_sha256 = format!(
+            "sha256:{}",
+            hex::encode(
+                openssl::hash::hash(openssl::hash::MessageDigest::sha256(), body).unwrap()
+            )
+        );
+        let digest_sha384 = format!(
+            "sha384:{}",
+            hex::encode(
+                openssl::hash::hash(openssl::hash::MessageDigest::sha384(), body).unwrap()
+            )
+        );
 
         // Test case 1: Both digests are equal
         assert_eq!(

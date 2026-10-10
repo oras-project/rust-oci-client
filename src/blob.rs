@@ -131,13 +131,15 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::TryStreamExt;
-    use sha2::Digest as _;
 
     #[tokio::test]
     async fn test_verifying_stream() {
         // Test with correct SHA
         let data = b"Hello, world!";
-        let correct_sha = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+        let correct_sha = format!(
+            "sha256:{}",
+            hex::encode(openssl::hash::hash(openssl::hash::MessageDigest::sha256(), data).unwrap())
+        );
         let stream = VerifyingStream::new(
             Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
                 data,
@@ -178,7 +180,10 @@ mod tests {
         );
 
         // Test with correct SHA and header
-        let correct_header_sha = format!("sha512:{}", hex::encode(sha2::Sha512::digest(data)));
+        let correct_header_sha = format!(
+            "sha512:{}",
+            hex::encode(openssl::hash::hash(openssl::hash::MessageDigest::sha512(), data).unwrap())
+        );
         let stream = VerifyingStream::new(
             Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
                 data,
