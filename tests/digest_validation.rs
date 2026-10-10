@@ -418,6 +418,38 @@ async fn test_empty_digest_header() {
         .expect("Expected empty digest header to be treated as missing");
 }
 
+#[rstest]
+#[case::digest_header(false)]
+#[case::no_digest_header(true)]
+#[tokio::test]
+async fn test_fetch_manifest_digest(#[case] empty_digest: bool) {
+    // Without a digest header in the HEAD response, the client falls back to a
+    // GET request and computes the digest from the manifest.
+    let server = BadServer::new(ServerConfig {
+        bad_manifest: false,
+        bad_config: false,
+        bad_blob: false,
+        blob_sha512: false,
+        empty_digest,
+    })
+    .await;
+
+    let client = Client::new(ClientConfig {
+        protocol: ClientProtocol::Http,
+        ..Default::default()
+    });
+    let auth = &oci_client::secrets::RegistryAuth::Anonymous;
+
+    let reference = Reference::try_from(format!("{}/busybox:latest", server.server))
+        .expect("failed to parse reference");
+
+    let digest = client
+        .fetch_manifest_digest(&reference, auth)
+        .await
+        .expect("Expected the manifest digest");
+    assert_eq!(digest, MANIFEST_DIGEST.as_str());
+}
+
 // Regression test for https://github.com/oras-project/rust-oci-client/issues/64:
 // pulling a blob that the registry doesn't have (404 with a BLOB_UNKNOWN envelope) must return an
 // error and must not write the error body into the caller's output buffer.

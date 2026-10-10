@@ -12,6 +12,7 @@ pub mod errors;
 pub mod manifest;
 pub mod secrets;
 pub mod token_cache;
+mod transport;
 
 #[doc(inline)]
 pub use client::Client;
