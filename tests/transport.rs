@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::Path;
 use axum::response::{IntoResponse, Redirect};
 use axum::{routing::get, Router};
+use bytes::Bytes;
 use http::header::{AUTHORIZATION, USER_AGENT};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use hyper_util::client::legacy::Client as HyperClient;
@@ -361,6 +362,34 @@ async fn empty_get_and_head_bodies_do_not_emit_content_length() {
     for request in requests {
         assert!(!request.to_ascii_lowercase().contains("\r\ncontent-length:"));
     }
+}
+
+/// A transport can stream a response body with no known length, for example
+/// the browser transport. When this happens, the client takes the length of
+/// the stream from the `Content-Length` header.
+#[tokio::test]
+async fn content_length_falls_back_to_the_header() {
+    let service = service_fn(|_: transport::Request| async {
+        let stream = futures_util::stream::once(async {
+            Ok::<_, transport::BoxError>(http_body::Frame::data(Bytes::from_static(BLOB)))
+        });
+        let body = transport::Body::wrap(http_body_util::StreamBody::new(stream));
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .header(http::header::CONTENT_LENGTH, BLOB.len())
+                .body(body)
+                .unwrap(),
+        )
+    });
+    let client = Client::new_with_transport(ClientConfig::default(), service);
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let stream = client
+        .pull_blob_stream(&reference, BLOB_DIGEST)
+        .await
+        .unwrap();
+
+    assert_eq!(stream.content_length, Some(BLOB.len() as u64));
 }
 
 #[tokio::test]

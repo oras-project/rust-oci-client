@@ -2236,6 +2236,11 @@ fn response_url(response: &transport::Response, requested: &str) -> String {
         .unwrap_or_else(|| requested.to_string())
 }
 
+/// Returns the value of the `Content-Length` header of `headers`.
+fn content_length_header(headers: &HeaderMap) -> Option<u64> {
+    headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+}
+
 /// Returns an empty OCI Image Index, as used when no referrers exist.
 fn empty_image_index() -> OciImageIndex {
     OciImageIndex {
@@ -2259,8 +2264,12 @@ async fn stream_from_response(
 ) -> Result<SizedStream> {
     let status = response.status();
     let effective_url = response_url(&response, url);
-    let content_length = response.body().size_hint().exact();
     let headers = response.headers().clone();
+    let content_length = response
+        .body()
+        .size_hint()
+        .exact()
+        .or_else(|| content_length_header(&headers));
     if !status.is_success() {
         let body = transport::collect(response.into_body()).await?;
         return Err(
