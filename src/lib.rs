@@ -7,8 +7,8 @@
 //!
 //! # TLS backends
 //!
-//! This crate has three Cargo features for TLS. You must enable exactly one of
-//! them:
+//! This crate has three Cargo features for TLS. If you use the default HTTP
+//! transport, you must enable exactly one of them:
 //!
 //! - `rustls-tls` (default): The client uses `rustls` with its `aws-lc-rs`
 //!   crypto provider.
@@ -16,10 +16,14 @@
 //!   crypto provider. Install the provider before you build a [`Client`].
 //! - `native-tls`: The client uses the TLS library of the operating system.
 //!
-//! If you use your own HTTP transport, you do not have to enable a TLS
-//! feature. In that case, your transport supplies TLS. On
-//! `wasm32-unknown-unknown`, the browser supplies TLS, and the features have no
-//! effect.
+//! You do not have to enable a TLS feature in two cases:
+//!
+//! - You give the client your own HTTP transport. The transport supplies
+//!   TLS.
+//! - You build for `wasm32-unknown-unknown`. The browser supplies TLS. The
+//!   features have no effect.
+//!
+//! The next section explains how to use a custom transport.
 //!
 //! # Custom HTTP transport
 //!

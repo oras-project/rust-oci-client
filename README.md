@@ -10,15 +10,19 @@ which is the protocol that Docker Hub and other container registries use.
 
 ## TLS backends
 
-This crate offers three Cargo features for TLS, you must enable exactly one of them.
+This crate has three Cargo features for TLS. If you use the default HTTP
+transport, you must enable exactly one of them.
 
 - `rustls-tls` (default): Uses the `rustls` library with its built-in `aws-lc-rs` crypto provider.
 - `rustls-tls-no-provider`: Uses `rustls`, but leaves the crypto provider to you. Before you build a `Client`, install one, for example with `rustls::crypto::ring::default_provider().install_default()`. Choose this feature when your application already picks a crypto provider and you want to avoid `aws-lc-rs`.
 - `native-tls`: Uses the TLS library of your operating system instead of `rustls`.
 
-If you use your own HTTP transport, you do not have to enable a TLS feature.
-In that case, your transport supplies TLS. The next section gives more
-information.
+You do not have to enable a TLS feature in two cases:
+
+- You give the client your own HTTP transport. The transport supplies TLS.
+- You build for `wasm32-unknown-unknown`. The browser supplies TLS. The features have no effect.
+
+The next section explains how to use a custom transport.
 
 ## Custom HTTP transport
 
