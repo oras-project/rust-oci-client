@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Path;
-use axum::response::Redirect;
+use axum::response::{IntoResponse, Redirect};
 use axum::{routing::get, Router};
 use http::header::{AUTHORIZATION, USER_AGENT};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -22,6 +22,10 @@ use tower_http::follow_redirect::FollowRedirectLayer;
 const BEARER_TOKEN: &str = "test-token";
 const BLOB: &[u8] = b"blob content";
 const BLOB_DIGEST: &str = "sha256:7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5";
+/// A digest that the storage server answers with a `500`, see
+/// [`spawn_redirecting_registry`].
+const FAILING_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A hyper client, used as a transport for [`Client::new_with_transport`].
 ///
@@ -41,9 +45,14 @@ fn hyper_transport() -> transport::Transport {
 
 /// A registry that redirects blob downloads to a storage server on another
 /// port. Registries that use a CDN or an object store do the same.
+///
+/// The storage server answers [`BLOB_DIGEST`] with [`BLOB`], and
+/// [`FAILING_DIGEST`] with a `500`.
 struct RedirectingRegistry {
     /// The address of the registry.
     address: String,
+    /// The address of the storage server.
+    storage_address: String,
     /// The `Authorization` header of each request that the registry receives.
     registry_authorizations: Arc<Mutex<Vec<Option<HeaderValue>>>>,
     /// The `Authorization` header of each request that the storage server receives.
@@ -59,13 +68,17 @@ async fn spawn_redirecting_registry() -> RedirectingRegistry {
     let seen = Arc::clone(&storage_authorizations);
     let storage = Router::new().route(
         "/storage/{digest}",
-        get(move |headers: HeaderMap| {
+        get(move |Path(digest): Path<String>, headers: HeaderMap| {
             let seen = Arc::clone(&seen);
             async move {
                 seen.lock()
                     .unwrap()
                     .push(headers.get(AUTHORIZATION).cloned());
-                BLOB
+                if digest == FAILING_DIGEST {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "server error").into_response()
+                } else {
+                    BLOB.into_response()
+                }
             }
         }),
     );
@@ -90,6 +103,7 @@ async fn spawn_redirecting_registry() -> RedirectingRegistry {
 
     RedirectingRegistry {
         address: registry_address.to_string(),
+        storage_address: storage_address.to_string(),
         registry_authorizations,
         storage_authorizations,
     }
@@ -190,6 +204,43 @@ async fn transport_follows_blob_redirects(#[case] kind: TransportKind) {
         vec![Some(HeaderValue::from_static("Bearer test-token"))]
     );
     assert_eq!(*registry.storage_authorizations.lock().unwrap(), vec![None]);
+}
+
+/// A failed blob download is reported with the URL of the server that
+/// answered it. This is the storage server, not the registry it was
+/// redirected from.
+///
+/// This test also makes sure that the `tower-http` version of the crate
+/// matches the one reqwest uses. A mismatch gives two separate `RequestUri`
+/// types, and the `default_transport` case then fails.
+#[rstest]
+#[case::default_transport(TransportKind::Default)]
+#[case::hyper_transport(TransportKind::Hyper)]
+#[tokio::test]
+async fn failed_redirected_blob_names_the_storage_url(#[case] kind: TransportKind) {
+    let registry = spawn_redirecting_registry().await;
+    let client = client_with(kind);
+    let reference = Reference::try_from(format!("{}/repo:latest", registry.address)).unwrap();
+
+    let error = client
+        .pull_blob(&reference, FAILING_DIGEST, &mut Vec::new())
+        .await
+        .unwrap_err();
+
+    match error {
+        OciDistributionError::ServerError { url, code, .. } => {
+            assert_eq!(code, 500);
+            assert!(
+                url.contains(&registry.storage_address),
+                "the error should name the storage server: {url}"
+            );
+            assert!(
+                !url.contains(&registry.address),
+                "the error should not name the registry: {url}"
+            );
+        }
+        other => panic!("expected a ServerError, got {other:?}"),
+    }
 }
 
 #[tokio::test]

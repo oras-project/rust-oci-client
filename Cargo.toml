@@ -59,6 +59,12 @@ sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "io-util", "sync"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# This version must match the one reqwest uses internally. Both sides must
+# see the same `RequestUri` type, see `client::response_url`. A mismatch does
+# not fail the build, but `tests/transport.rs` catches it.
+tower-http = { version = "0.6", default-features = false, features = [
+  "follow-redirect",
+] }
 tracing = { version = "0.1", features = ['log'] }
 unicase = "2.8"
 url = "2"
@@ -95,7 +101,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 testcontainers = "0.28"
 tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["compat", "io"] }
-tower-http = { version = "0.6", default-features = false, features = [
-  "follow-redirect",
-  "trace",
-] }
+tower-http = { version = "0.6", default-features = false, features = ["trace"] }

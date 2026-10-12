@@ -25,6 +25,12 @@
 //! Reqwest uses this layer internally. If a redirect goes to a different origin
 //! (scheme, host and port), the two remove the `Authorization` header.
 //!
+//! If the transport follows a redirect, it can record the URL it ended on in
+//! a [`tower_http::follow_redirect::RequestUri`] extension of the response.
+//! `FollowRedirectLayer` does this on its own. The client reads this URL for
+//! its error messages, and falls back to the URL it requested if the
+//! response carries no such record.
+//!
 //! # Configuration
 //!
 //! [`Client::new_with_transport`](crate::Client::new_with_transport) does not
@@ -494,6 +500,9 @@ mod browser {
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
+        // The browser follows redirects on its own. `response.url()` is the
+        // URL Fetch ended on, which can differ from the requested URL.
+        let effective_url = response.url().clone();
 
         let (mut sender, receiver) = futures_channel::mpsc::channel(1);
         wasm_bindgen_futures::spawn_local(async move {
@@ -508,6 +517,11 @@ mod browser {
         let mut response = http::Response::builder().status(status);
         if let Some(response_headers) = response.headers_mut() {
             response_headers.extend(headers);
+        }
+        if let Some(extensions) = response.extensions_mut() {
+            if let Ok(uri) = http::Uri::try_from(effective_url.as_str()) {
+                extensions.insert(tower_http::follow_redirect::RequestUri(uri));
+            }
         }
         response.body(stream_body(receiver)).map_err(BoxError::from)
     }

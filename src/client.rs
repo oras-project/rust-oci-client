@@ -491,9 +491,10 @@ impl Client {
         }
         let res = request.apply_auth(image, op).await?.send().await?;
         let status = res.status();
+        let effective_url = response_url(&res, &url);
         let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &url)?;
+        validate_registry_response(status, &body, &effective_url)?;
 
         Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
@@ -561,8 +562,9 @@ impl Client {
             status if status.is_success() => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
             status => {
+                let effective_url = response_url(&res, &url);
                 let body = transport::collect(res.into_body()).await?;
-                validate_registry_response(status, &body, &url)?;
+                validate_registry_response(status, &body, &effective_url)?;
                 unreachable!("non-success responses are rejected above")
             }
         }
@@ -931,8 +933,9 @@ impl Client {
 
         if let Some(digest) = digest_header_value(res.headers().clone())? {
             let status = res.status();
+            let effective_url = response_url(&res, &url);
             let body = transport::collect(res.into_body()).await?;
-            validate_registry_response(status, &body, &url)?;
+            validate_registry_response(status, &body, &effective_url)?;
 
             // If the reference has a digest and the digest header has a matching algorithm, compare
             // them and return an error if they don't match.
@@ -963,8 +966,9 @@ impl Client {
             let status = res.status();
             trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
+            let effective_url = response_url(&res, &url);
             let body = transport::collect(res.into_body()).await?;
-            validate_registry_response(status, &body, &url)?;
+            validate_registry_response(status, &body, &effective_url)?;
 
             validate_digest(&body, digest_header_value(headers)?, image.digest())
                 .map_err(OciDistributionError::from)
@@ -1159,9 +1163,10 @@ impl Client {
             .await?;
         let status = res.status();
         let headers = res.headers().clone();
+        let effective_url = response_url(&res, &url);
         let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &url)?;
+        validate_registry_response(status, &body, &effective_url)?;
 
         let digest_header = digest_header_value(headers)?;
         let digest = validate_digest(&body, digest_header, image.digest())?;
@@ -1345,8 +1350,9 @@ impl Client {
 
         let status = response.status();
         if !status.is_success() {
+            let effective_url = response_url(&response, &url);
             let body = transport::collect(response.into_body()).await?;
-            return validate_registry_response(status, &body, &url);
+            return validate_registry_response(status, &body, &effective_url);
         }
         let mut stream = response.into_body().into_data_stream();
 
@@ -1455,8 +1461,9 @@ impl Client {
                 stream_from_response(response, &url, &layer, false).await?,
             )),
             _ => {
+                let effective_url = response_url(&response, &url);
                 let body = transport::collect(response.into_body()).await?;
-                Err(validate_registry_response(status, &body, &url).expect_err("validate_registry_response should return an error for non-success status codes"))
+                Err(validate_registry_response(status, &body, &effective_url).expect_err("validate_registry_response should return an error for non-success status codes"))
             }
         }
     }
@@ -1871,6 +1878,7 @@ impl Client {
             .send()
             .await?;
         let status = res.status();
+        let effective_url = response_url(&res, &url);
         let body = transport::collect(res.into_body()).await?;
 
         // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
@@ -1885,7 +1893,7 @@ impl Client {
                 .await;
         }
 
-        validate_registry_response(status, &body, &url)?;
+        validate_registry_response(status, &body, &effective_url)?;
         let manifest = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
@@ -1993,9 +2001,10 @@ impl Client {
         }
         let res = request.apply_auth(image, op).await?.send().await?;
         let status = res.status();
+        let effective_url = response_url(&res, &url);
         let body = transport::collect(res.into_body()).await?;
 
-        validate_registry_response(status, &body, &url)?;
+        validate_registry_response(status, &body, &effective_url)?;
 
         Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
@@ -2029,9 +2038,10 @@ impl Client {
             )))
         } else {
             let code = res.status().as_u16();
+            let effective_url = response_url(&res, url);
             let message = response_text(res).await?;
             Err(OciDistributionError::ServerError {
-                url: url.to_string(),
+                url: effective_url,
                 code,
                 message,
             })
@@ -2212,6 +2222,20 @@ async fn response_text(response: transport::Response) -> Result<String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Returns the URL that produced `response`.
+///
+/// `tower_http::follow_redirect::FollowRedirect` writes the final URL into
+/// the extensions of a response when it follows a redirect. The default
+/// reqwest transport uses this layer. If the response carries no such
+/// record, the function returns `requested`, the URL of the request.
+fn response_url(response: &transport::Response, requested: &str) -> String {
+    response
+        .extensions()
+        .get::<tower_http::follow_redirect::RequestUri>()
+        .map(|uri| uri.0.to_string())
+        .unwrap_or_else(|| requested.to_string())
+}
+
 /// Returns an empty OCI Image Index, as used when no referrers exist.
 fn empty_image_index() -> OciImageIndex {
     OciImageIndex {
@@ -2234,13 +2258,16 @@ async fn stream_from_response(
     verify: bool,
 ) -> Result<SizedStream> {
     let status = response.status();
+    let effective_url = response_url(&response, url);
     let content_length = response.body().size_hint().exact();
     let headers = response.headers().clone();
     if !status.is_success() {
         let body = transport::collect(response.into_body()).await?;
-        return Err(validate_registry_response(status, &body, url).expect_err(
-            "validate_registry_response should return an error for non-success status codes",
-        ));
+        return Err(
+            validate_registry_response(status, &body, &effective_url).expect_err(
+                "validate_registry_response should return an error for non-success status codes",
+            ),
+        );
     }
     let stream = response
         .into_body()
