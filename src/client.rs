@@ -564,8 +564,7 @@ impl Client {
             status => {
                 let effective_url = response_url(&res, &url);
                 let body = transport::collect(res.into_body()).await?;
-                validate_registry_response(status, &body, &effective_url)?;
-                unreachable!("non-success responses are rejected above")
+                Err(registry_error(status, &body, &effective_url))
             }
         }
     }
@@ -1463,7 +1462,7 @@ impl Client {
             _ => {
                 let effective_url = response_url(&response, &url);
                 let body = transport::collect(response.into_body()).await?;
-                Err(validate_registry_response(status, &body, &effective_url).expect_err("validate_registry_response should return an error for non-success status codes"))
+                Err(registry_error(status, &body, &effective_url))
             }
         }
     }
@@ -2168,51 +2167,62 @@ impl Client {
     }
 }
 
+/// Builds the error that corresponds to a non-`200 OK` registry response.
+///
 /// The OCI spec technically does not allow any codes but 200, 500, 401, and 404.
 /// Obviously, HTTP servers are going to send other codes. This tries to catch the
-/// obvious ones (200, 4XX, 5XX). Anything else is just treated as an error.
-fn validate_registry_response(status: StatusCode, body: &[u8], url: &str) -> Result<()> {
+/// obvious ones (4XX, 5XX). Anything else is just treated as an error.
+fn registry_error(status: StatusCode, body: &[u8], url: &str) -> OciDistributionError {
     match status {
-        StatusCode::OK => Ok(()),
-        StatusCode::UNAUTHORIZED => Err(OciDistributionError::UnauthorizedError {
+        StatusCode::UNAUTHORIZED => OciDistributionError::UnauthorizedError {
             url: url.to_string(),
-        }),
-        s if s.is_success() => Err(OciDistributionError::SpecViolationError(format!(
+        },
+        s if s.is_success() => OciDistributionError::SpecViolationError(format!(
             "Expected HTTP Status {}, got {} instead",
             StatusCode::OK,
             status,
-        ))),
+        )),
         // The HTTP transport must follow redirects. If a redirect gets to
         // this point, the transport did not follow it.
-        s if s.is_redirection() => Err(OciDistributionError::ServerError {
+        s if s.is_redirection() => OciDistributionError::ServerError {
             code: s.as_u16(),
             url: url.to_string(),
             message: "the registry redirected the request, but the HTTP transport of the client \
                       did not follow the redirect"
                 .to_string(),
-        }),
+        },
         s if s.is_client_error() => {
             match serde_json::from_slice::<OciEnvelope>(body) {
                 // According to the OCI spec, we should see an error in the message body.
-                Ok(envelope) => Err(OciDistributionError::RegistryError {
+                Ok(envelope) => OciDistributionError::RegistryError {
                     envelope,
                     url: url.to_string(),
-                }),
+                },
                 // Fall back to a plain server error if the body isn't a valid `OciEnvelope`
-                Err(_) => Err(OciDistributionError::ServerError {
+                Err(_) => OciDistributionError::ServerError {
                     code: s.as_u16(),
                     url: url.to_string(),
                     message: String::from_utf8_lossy(body).to_string(),
-                }),
+                },
             }
         }
         // All the other status codes: mostly 5xx, but also 1xx and non-standard codes.
         // Use a lossy conversion so a non UTF-8 body doesn't hide the status code
-        s => Err(OciDistributionError::ServerError {
+        s => OciDistributionError::ServerError {
             code: s.as_u16(),
             url: url.to_string(),
             message: String::from_utf8_lossy(body).to_string(),
-        }),
+        },
+    }
+}
+
+/// Returns `Ok(())` if `status` is `200 OK`, otherwise returns the error built
+/// by [`registry_error`].
+fn validate_registry_response(status: StatusCode, body: &[u8], url: &str) -> Result<()> {
+    if status == StatusCode::OK {
+        Ok(())
+    } else {
+        Err(registry_error(status, body, url))
     }
 }
 
@@ -2272,11 +2282,7 @@ async fn stream_from_response(
         .or_else(|| content_length_header(&headers));
     if !status.is_success() {
         let body = transport::collect(response.into_body()).await?;
-        return Err(
-            validate_registry_response(status, &body, &effective_url).expect_err(
-                "validate_registry_response should return an error for non-success status codes",
-            ),
-        );
+        return Err(registry_error(status, &body, &effective_url));
     }
     let stream = response
         .into_body()
