@@ -42,6 +42,13 @@ the client to send the request to a different URL. Registries often redirect
 blob downloads to a CDN or to an object store. As a result, a transport that
 does not follow redirects cannot pull images.
 
+A transport that follows a redirect can record the URL it ended on in a
+`transport::EffectiveUrl` extension of the response. The client reads this
+URL for its error messages. A transport built on
+`tower_http::follow_redirect::FollowRedirectLayer` must copy the final URL
+from that layer's own extension into an `EffectiveUrl`, as the
+[`custom-transport`](examples/custom-transport/main.rs) example shows.
+
 On `wasm32-unknown-unknown`, the default transport uses the Fetch API of the
 browser. The browser controls TLS, proxies, timeouts and redirects, so the
 client ignores the related fields of `ClientConfig`.

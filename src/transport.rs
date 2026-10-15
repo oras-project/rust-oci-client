@@ -22,14 +22,17 @@
 //! The default transport follows redirects with the default policy of reqwest.
 //! A transport built on hyper can use
 //! [`tower_http::follow_redirect::FollowRedirectLayer`](https://docs.rs/tower-http/latest/tower_http/follow_redirect/struct.FollowRedirectLayer.html).
-//! Reqwest uses this layer internally. If a redirect goes to a different origin
-//! (scheme, host and port), the two remove the `Authorization` header.
+//! If a redirect goes to a different origin (scheme, host and port), this
+//! layer removes the `Authorization` header, as reqwest does internally.
 //!
 //! If the transport follows a redirect, it can record the URL it ended on in
-//! a [`tower_http::follow_redirect::RequestUri`] extension of the response.
-//! `FollowRedirectLayer` does this on its own. The client reads this URL for
-//! its error messages, and falls back to the URL it requested if the
-//! response carries no such record.
+//! an [`EffectiveUrl`] extension of the response. The client reads this URL
+//! for its error messages. If the response carries no such record, the
+//! client reports the requested URL instead. The default transport sets the
+//! `EffectiveUrl` extension on its own. `FollowRedirectLayer` records the
+//! final URL in a `tower_http::follow_redirect::RequestUri` extension
+//! instead. A transport built on `FollowRedirectLayer` must copy that URL
+//! into an `EffectiveUrl`, as the example below shows.
 //!
 //! # Configuration
 //!
@@ -65,9 +68,10 @@
 //! use hyper_util::client::legacy::Client as HyperClient;
 //! use hyper_util::rt::TokioExecutor;
 //! use oci_client::client::ClientConfig;
+//! use oci_client::transport::EffectiveUrl;
 //! use oci_client::{transport, Client};
 //! use tower::ServiceBuilder;
-//! use tower_http::follow_redirect::FollowRedirectLayer;
+//! use tower_http::follow_redirect::{FollowRedirectLayer, RequestUri};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // The transport supplies TLS. This code gives the crypto provider to
@@ -84,6 +88,17 @@
 //! let service = ServiceBuilder::new()
 //!     // The client needs the transport errors as `BoxError`.
 //!     .map_err(transport::BoxError::from)
+//!     // After it calls the inner service below, `FollowRedirectLayer`
+//!     // writes the final URL into a `RequestUri` extension. This layer
+//!     // runs after `FollowRedirectLayer`, so it copies that URL into the
+//!     // `EffectiveUrl` extension. The client reads `EffectiveUrl` for its
+//!     // error messages.
+//!     .map_response(|mut response: http::Response<transport::Body>| {
+//!         if let Some(uri) = response.extensions().get::<RequestUri>().cloned() {
+//!             response.extensions_mut().insert(EffectiveUrl(uri.0));
+//!         }
+//!         response
+//!     })
 //!     // The transport must follow redirects.
 //!     .layer(FollowRedirectLayer::new())
 //!     // The client needs responses with a `transport::Body`.
@@ -131,6 +146,20 @@ pub type Response = http::Response<Body>;
 
 /// The boxed service that a [`crate::Client`] sends its requests through.
 pub type Transport = BoxCloneSyncService<Request, Response, BoxError>;
+
+/// The URL that a response came from, after the transport followed redirects.
+///
+/// When a transport follows one or more redirects, it can put this value in
+/// the extensions of its response. The client reads it for its error
+/// messages. If a response carries no `EffectiveUrl`, the client reports the
+/// requested URL instead.
+///
+/// The default transport sets this extension on its own. A transport built
+/// on `tower_http::follow_redirect::FollowRedirectLayer` must copy the final
+/// URL from that layer's `RequestUri` extension into an `EffectiveUrl`. The
+/// example at the top of this module shows how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveUrl(pub http::Uri);
 
 /// The body of transport requests and responses.
 ///
@@ -313,7 +342,7 @@ pub(crate) fn configured_transport(
 /// The default transport on native targets: a reqwest client.
 #[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))]
 mod native {
-    use super::{Body, BodyKind, BoxError, Request, Transport};
+    use super::{Body, BodyKind, BoxError, EffectiveUrl, Request, Transport};
     use crate::client::ClientConfig;
     use crate::errors::OciDistributionError;
     use http_body_util::BodyExt;
@@ -397,13 +426,20 @@ mod native {
     /// The reqwest client keeps its own redirect policy. As a result, the
     /// transport follows redirects as reqwest does. If a redirect goes to a
     /// different origin, reqwest removes the credentials from the request.
+    /// This function reads the final URL from `reqwest::Response::url`. It
+    /// records that URL as an [`EffectiveUrl`] extension of the response.
     fn from_reqwest(client: reqwest::Client) -> Transport {
         BoxCloneSyncService::new(tower::service_fn(move |request: Request| {
             let client = client.clone();
             async move {
                 let request = reqwest::Request::try_from(request)?;
                 let response = client.execute(request).await?;
-                Ok::<_, BoxError>(http::Response::from(response).map(Body::wrap))
+                let effective_url = response.url().clone();
+                let mut response = http::Response::from(response).map(Body::wrap);
+                if let Ok(uri) = http::Uri::try_from(effective_url.as_str()) {
+                    response.extensions_mut().insert(EffectiveUrl(uri));
+                }
+                Ok::<_, BoxError>(response)
             }
         }))
     }
@@ -436,7 +472,7 @@ mod native {
 /// this way the service and its future are `Send`, as [`Transport`] requires.
 #[cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))]
 mod browser {
-    use super::{stream_body, BoxError, Request, Response, Transport};
+    use super::{stream_body, BoxError, EffectiveUrl, Request, Response, Transport};
     use crate::client::ClientConfig;
     use crate::errors::OciDistributionError;
     use bytes::Bytes;
@@ -520,7 +556,7 @@ mod browser {
         }
         if let Some(extensions) = response.extensions_mut() {
             if let Ok(uri) = http::Uri::try_from(effective_url.as_str()) {
-                extensions.insert(tower_http::follow_redirect::RequestUri(uri));
+                extensions.insert(EffectiveUrl(uri));
             }
         }
         response.body(stream_body(receiver)).map_err(BoxError::from)

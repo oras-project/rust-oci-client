@@ -2234,14 +2234,14 @@ async fn response_text(response: transport::Response) -> Result<String> {
 
 /// Returns the URL that produced `response`.
 ///
-/// `tower_http::follow_redirect::FollowRedirect` writes the final URL into
-/// the extensions of a response when it follows a redirect. The default
-/// reqwest transport uses this layer. If the response carries no such
-/// record, the function returns `requested`, the URL of the request.
+/// A transport that follows a redirect can record the URL it ended on in an
+/// [`transport::EffectiveUrl`] extension of the response. If the response
+/// carries no such record, the function returns `requested`, the URL of the
+/// request.
 fn response_url(response: &transport::Response, requested: &str) -> String {
     response
         .extensions()
-        .get::<tower_http::follow_redirect::RequestUri>()
+        .get::<transport::EffectiveUrl>()
         .map(|uri| uri.0.to_string())
         .unwrap_or_else(|| requested.to_string())
 }

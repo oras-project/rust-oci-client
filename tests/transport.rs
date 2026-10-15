@@ -12,13 +12,14 @@ use hyper_util::rt::TokioExecutor;
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::errors::OciDistributionError;
 use oci_client::secrets::RegistryAuth;
+use oci_client::transport::EffectiveUrl;
 use oci_client::{transport, Client, Reference};
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tower::util::BoxCloneSyncService;
 use tower::{service_fn, ServiceBuilder, ServiceExt};
-use tower_http::follow_redirect::FollowRedirectLayer;
+use tower_http::follow_redirect::{FollowRedirectLayer, RequestUri};
 
 const BEARER_TOKEN: &str = "test-token";
 const BLOB: &[u8] = b"blob content";
@@ -36,6 +37,17 @@ fn hyper_transport() -> transport::Transport {
     let client = HyperClient::builder(TokioExecutor::new()).build_http::<transport::Body>();
     let service = ServiceBuilder::new()
         .map_err(transport::BoxError::from)
+        // After it calls the inner service below, `FollowRedirectLayer`
+        // writes the final URL into a `RequestUri` extension. This layer
+        // runs after `FollowRedirectLayer`, so it copies that URL into the
+        // `EffectiveUrl` extension. The client reads `EffectiveUrl` for its
+        // error messages.
+        .map_response(|mut response: http::Response<transport::Body>| {
+            if let Some(uri) = response.extensions().get::<RequestUri>().cloned() {
+                response.extensions_mut().insert(EffectiveUrl(uri.0));
+            }
+            response
+        })
         .layer(FollowRedirectLayer::new())
         .map_response(|response: http::Response<hyper::body::Incoming>| {
             response.map(transport::Body::wrap)
@@ -210,10 +222,6 @@ async fn transport_follows_blob_redirects(#[case] kind: TransportKind) {
 /// A failed blob download is reported with the URL of the server that
 /// answered it. This is the storage server, not the registry it was
 /// redirected from.
-///
-/// This test also makes sure that the `tower-http` version of the crate
-/// matches the one reqwest uses. A mismatch gives two separate `RequestUri`
-/// types, and the `default_transport` case then fails.
 #[rstest]
 #[case::default_transport(TransportKind::Default)]
 #[case::hyper_transport(TransportKind::Hyper)]
@@ -274,6 +282,45 @@ async fn transport_not_following_redirects_is_reported() {
         ),
         "{error:?}"
     );
+}
+
+/// When a transport puts an `EffectiveUrl` extension on its response, the
+/// client reports that URL in its error, not the URL it requested.
+///
+/// This is the contract that [`hyper_transport`] relies on: a transport that
+/// follows redirects records the URL it ended on as an `EffectiveUrl`.
+#[tokio::test]
+async fn effective_url_extension_names_the_response_in_errors() {
+    let service = service_fn(|_: transport::Request| async {
+        let mut response = http::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(transport::Body::empty())
+            .unwrap();
+        response.extensions_mut().insert(EffectiveUrl(
+            "https://storage.example/blob".parse().unwrap(),
+        ));
+        Ok::<_, TestTransportError>(response)
+    });
+    let client = Client::new_with_transport(ClientConfig::default(), service);
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let error = client
+        .list_tags(
+            &reference,
+            &RegistryAuth::Bearer(BEARER_TOKEN.to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        OciDistributionError::ServerError { url, code, .. } => {
+            assert_eq!(code, 500);
+            assert_eq!(url, "https://storage.example/blob");
+        }
+        other => panic!("expected a ServerError, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -29,10 +29,11 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::secrets::RegistryAuth;
+use oci_client::transport::EffectiveUrl;
 use oci_client::{transport, Client, Reference};
 use tower::util::BoxCloneSyncService;
 use tower::ServiceBuilder;
-use tower_http::follow_redirect::FollowRedirectLayer;
+use tower_http::follow_redirect::{FollowRedirectLayer, RequestUri};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -68,6 +69,17 @@ fn hyper_transport() -> anyhow::Result<transport::Transport> {
     let service = ServiceBuilder::new()
         // The OCI client needs the transport errors as `BoxError`.
         .map_err(transport::BoxError::from)
+        // After it calls the inner service below, `FollowRedirectLayer`
+        // writes the final URL into a `RequestUri` extension. This layer
+        // runs after `FollowRedirectLayer`, so it copies that URL into the
+        // `EffectiveUrl` extension. The OCI client reads `EffectiveUrl` for
+        // its error messages.
+        .map_response(|mut response: http::Response<transport::Body>| {
+            if let Some(uri) = response.extensions().get::<RequestUri>().cloned() {
+                response.extensions_mut().insert(EffectiveUrl(uri.0));
+            }
+            response
+        })
         // The transport must follow redirects. If a redirect goes to a
         // different origin, this layer removes the `Authorization` header, as
         // reqwest does. As a result, the CDN does not get the registry
