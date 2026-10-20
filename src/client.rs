@@ -183,7 +183,18 @@ impl Client {
         RequestBuilderWrapper::from_client(self, method, url)
     }
 
-    async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
+    /// Sets the maximum size of one chunk when the client pushes a blob
+    /// in chunks.
+    ///
+    /// This method is `pub(crate)`. The blocking client and the tests use
+    /// it to change the chunk size. Applications do not need a public
+    /// setter for this.
+    #[cfg(test)]
+    pub(crate) fn set_push_chunk_size(&mut self, size: usize) {
+        self.push_chunk_size = size;
+    }
+
+    pub(crate) async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
         self.auth_store
             .write()
             .await
@@ -444,7 +455,7 @@ impl Client {
     /// Pushes a blob to the registry as a series of chunks
     ///
     /// Returns the pullable location of the blob
-    async fn push_blob_chunked(
+    pub(crate) async fn push_blob_chunked(
         &self,
         image: &Reference,
         blob_data: impl Into<bytes::Bytes>,
@@ -844,7 +855,10 @@ impl Client {
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
-    async fn _pull_image_manifest(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
+    pub(crate) async fn _pull_image_manifest(
+        &self,
+        image: &Reference,
+    ) -> Result<(OciImageManifest, String)> {
         let (manifest, digest, _list_digest) =
             self._pull_image_manifest_and_list_digest(image).await?;
         Ok((manifest, digest))
@@ -1316,7 +1330,7 @@ impl Client {
     /// Begins a session to push an image to registry as a series of chunks
     ///
     /// Returns URL with session UUID
-    async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
+    pub(crate) async fn begin_push_chunked_session(&self, image: &Reference) -> Result<String> {
         let url = &self.config.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = self
@@ -1335,7 +1349,7 @@ impl Client {
     /// Closes the chunked push session
     ///
     /// Returns the pullable URL for the image
-    async fn end_push_chunked_session(
+    pub(crate) async fn end_push_chunked_session(
         &self,
         location: &str,
         image: &Reference,
@@ -1426,7 +1440,7 @@ impl Client {
     /// The caller is responsible for chunking the blob data into smaller parts, if needed.
     ///
     /// Returns the URL location for the next chunk, alongside the start of the next range to upload.
-    async fn push_chunk(
+    pub(crate) async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
@@ -2204,19 +2218,6 @@ impl TryFrom<&Certificate> for reqwest::Certificate {
     }
 }
 
-/// Converts the certificates of a [`ClientConfig`] into reqwest certificates.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(
-        feature = "native-tls",
-        feature = "rustls-tls",
-        feature = "rustls-tls-no-provider"
-    )
-))]
-pub(crate) fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
-    certs.iter().map(reqwest::Certificate::try_from).collect()
-}
-
 /// A client configuration
 pub struct ClientConfig {
     /// Which protocol the client should use
@@ -2757,6 +2758,32 @@ mod test {
         }
     }
 
+    /// The blocking client takes a custom transport the same way the
+    /// async client does. It runs each request through that transport
+    /// on its background thread.
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn blocking_client_sends_requests_through_a_custom_transport() -> anyhow::Result<()> {
+        let client = crate::blocking::Client::new_with_transport(
+            ClientConfig {
+                user_agent: "configured-agent",
+                ..Default::default()
+            },
+            tower::service_fn(|request: transport::Request| async move {
+                assert_eq!(request.headers()[USER_AGENT], "configured-agent");
+                let body = br#"{"name":"hello-wasm","tags":["v1","v2"]}"#;
+                Ok::<_, Infallible>(http::Response::new(transport::Body::from(body.to_vec())))
+            }),
+        );
+
+        let image = Reference::try_from(HELLO_IMAGE_TAG)?;
+        let response = client.list_tags(&image, &RegistryAuth::Anonymous, None, None)?;
+
+        assert_eq!(response.name, "hello-wasm");
+        assert_eq!(response.tags, vec!["v1", "v2"]);
+        Ok(())
+    }
+
     /// Which client implementation a test runs against.
     ///
     /// Tests exercising behaviour common to the asynchronous and the blocking
@@ -2779,12 +2806,19 @@ mod test {
     /// Test-only adapter exposing the API shared by both clients through a
     /// single asynchronous interface.
     ///
-    /// `reqwest::blocking` must not be driven from an async context, so calls
-    /// into the blocking client run on the tokio blocking thread pool.
+    /// The blocking client runs each call on its own background thread.
+    /// See `blocking::background_runtime` for the details.
+    ///
+    /// The blocking client is `Clone + Send + Sync`, like the async
+    /// client. As a result, the adapter can hold it directly, with no
+    /// lock.
+    ///
+    /// Calls still run inside `spawn_blocking`. This keeps a slow request
+    /// off the test's own async worker thread.
     enum TestClient {
         Async(Client),
         #[cfg(feature = "blocking")]
-        Blocking(Arc<std::sync::Mutex<crate::blocking::Client>>),
+        Blocking(crate::blocking::Client),
     }
 
     /// Dispatches a call to the wrapped client. The async arm is awaited in
@@ -2796,14 +2830,10 @@ mod test {
                 TestClient::Async($c) => $async_call.await,
                 #[cfg(feature = "blocking")]
                 TestClient::Blocking(client) => {
-                    let client = Arc::clone(client);
-                    tokio::task::spawn_blocking(move || {
-                        let mut guard = client.lock().expect("blocking client mutex poisoned");
-                        let $b = &mut *guard;
-                        $blocking_call
-                    })
-                    .await
-                    .expect("blocking client task panicked")
+                    let $b = client.clone();
+                    tokio::task::spawn_blocking(move || $blocking_call)
+                        .await
+                        .expect("blocking client task panicked")
                 }
             }
         };
@@ -2821,7 +2851,7 @@ mod test {
                         tokio::task::spawn_blocking(move || crate::blocking::Client::new(config))
                             .await
                             .expect("cannot build blocking client");
-                    TestClient::Blocking(Arc::new(std::sync::Mutex::new(client)))
+                    TestClient::Blocking(client)
                 }
             }
         }
@@ -2834,12 +2864,7 @@ mod test {
             match self {
                 TestClient::Async(c) => c.push_chunk_size = size,
                 #[cfg(feature = "blocking")]
-                TestClient::Blocking(client) => {
-                    client
-                        .lock()
-                        .expect("blocking client mutex poisoned")
-                        .push_chunk_size = size
-                }
+                TestClient::Blocking(client) => client.set_push_chunk_size(size),
             }
         }
 
@@ -2857,8 +2882,7 @@ mod test {
         ) {
             let image = image.clone();
             dispatch!(self, |c| c.tokens.insert(&image, op, token.clone()), |b| b
-                .tokens
-                .insert(&image, op, token))
+                .insert_token(&image, op, token))
         }
 
         async fn cached_token(
@@ -2868,8 +2892,7 @@ mod test {
         ) -> Option<RegistryTokenType> {
             let image = image.clone();
             dispatch!(self, |c| c.tokens.get(&image, op), |b| b
-                .tokens
-                .get(&image, op))
+                .cached_token(&image, op))
         }
 
         async fn auth(
@@ -2942,6 +2965,31 @@ mod test {
                 .fetch_manifest_digest(&image, &auth))
         }
 
+        async fn blob_exists(
+            &self,
+            image: &Reference,
+            digest: &str,
+        ) -> crate::errors::Result<bool> {
+            let (image, digest) = (image.clone(), digest.to_string());
+            dispatch!(self, |c| c.blob_exists(&image, &digest), |b| b
+                .blob_exists(&image, &digest))
+        }
+
+        async fn catalog(
+            &self,
+            image: &Reference,
+            auth: &RegistryAuth,
+            n: Option<usize>,
+            last: Option<&str>,
+        ) -> crate::errors::Result<CatalogResponse> {
+            let (image, auth, last) = (image.clone(), auth.clone(), last.map(str::to_owned));
+            dispatch!(
+                self,
+                |c| c.catalog(&image, &auth, n, last.as_deref()),
+                |b| b.catalog(&image, &auth, n, last.as_deref())
+            )
+        }
+
         async fn pull_blob(
             &self,
             image: &Reference,
@@ -2999,7 +3047,7 @@ mod test {
         ) -> crate::errors::Result<String> {
             let (image, digest) = (image.clone(), digest.to_string());
             dispatch!(self, |c| c.push_blob(&image, data.clone(), &digest), |b| b
-                .push_blob(&image, &data, &digest))
+                .push_blob(&image, data, &digest))
         }
 
         async fn push_blob_chunked(
@@ -3012,7 +3060,7 @@ mod test {
             dispatch!(
                 self,
                 |c| c.push_blob_chunked(&image, data.clone(), &digest),
-                |b| b.push_blob_chunked(&image, &data, &digest)
+                |b| b.push_blob_chunked(&image, data, &digest)
             )
         }
 
@@ -3036,7 +3084,7 @@ mod test {
             dispatch!(
                 self,
                 |c| c.push_chunk(&location, &image, Bytes::from(data.clone()), start_byte),
-                |b| b.push_chunk(&location, &image, &data, start_byte)
+                |b| b.push_chunk(&location, &image, data, start_byte)
             )
         }
 
@@ -3100,19 +3148,18 @@ mod test {
                 }
                 #[cfg(feature = "blocking")]
                 TestClient::Blocking(client) => {
-                    let client = Arc::clone(client);
+                    let inner = client.inner.clone();
+                    let block_on = client.clone();
                     let url = url.to_string();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<HeaderMap> {
-                        let mut guard = client.lock().expect("blocking client mutex poisoned");
-                        let mut wrapper = crate::blocking::RequestBuilderWrapper::from_client(
-                            &mut guard,
-                            |client| client.request(method.clone(), url.as_str()),
-                        );
-                        let wrapper = match &apply {
-                            Apply::Accept(accept) => wrapper.apply_accept(accept)?,
-                            Apply::Auth(image, op) => wrapper.apply_auth(image, *op)?,
-                        };
-                        Ok(wrapper.into_request_builder().build()?.headers().clone())
+                        block_on.block_on_for_test(async move {
+                            let wrapper = RequestBuilderWrapper::from_client(&inner, method, url)?;
+                            let wrapper = match &apply {
+                                Apply::Accept(accept) => wrapper.apply_accept(accept),
+                                Apply::Auth(image, op) => wrapper.apply_auth(image, *op).await?,
+                            };
+                            Ok(wrapper.build()?.headers().clone())
+                        })
                     })
                     .await
                     .expect("blocking client task panicked")
@@ -3751,8 +3798,11 @@ mod test {
     }
 
     #[cfg(feature = "test-registry")]
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_catalog() {
+    async fn test_catalog(#[case] kind: ClientKind) {
         let test_container = registry_image_edge()
             .start()
             .await
@@ -3764,10 +3814,14 @@ mod test {
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
-            ..Default::default()
-        });
+        let client = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
         client
@@ -3776,7 +3830,7 @@ mod test {
             .expect("cannot authenticate against registry for pull operation");
 
         let (manifest, _digest) = client
-            ._pull_image_manifest(&image)
+            .pull_image_manifest_stored_auth(&image)
             .await
             .expect("failed to pull manifest");
 
@@ -4738,9 +4792,12 @@ mod test {
         );
     }
 
-    #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_blob_exists() {
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn test_blob_exists(#[case] kind: ClientKind) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -4751,10 +4808,14 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
-            ..Default::default()
-        });
+        let client = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let reference = Reference::try_from(format!("localhost:{server_port}/empty"))
             .expect("failed to parse reference");
@@ -4764,7 +4825,11 @@ mod test {
             .await
             .expect("failed to check blob existence"));
         client
-            .push_blob(&reference, EMPTY_JSON_BLOB.as_bytes(), EMPTY_JSON_DIGEST)
+            .push_blob(
+                &reference,
+                EMPTY_JSON_BLOB.as_bytes().to_vec(),
+                EMPTY_JSON_DIGEST,
+            )
             .await
             .expect("failed to push empty json blob");
         assert!(client

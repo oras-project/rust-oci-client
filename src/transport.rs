@@ -343,12 +343,6 @@ pub(crate) fn configured_transport(
 #[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))]
 mod native {
     use super::{Body, BodyKind, BoxError, EffectiveUrl, Request, Transport};
-    #[cfg(any(
-        feature = "native-tls",
-        feature = "rustls-tls",
-        feature = "rustls-tls-no-provider"
-    ))]
-    use crate::client::convert_certificates;
     use crate::client::ClientConfig;
     use crate::errors::OciDistributionError;
     use http_body_util::BodyExt;
@@ -414,6 +408,17 @@ mod native {
         }
 
         Ok(from_reqwest(client_builder.build()?))
+    }
+
+    #[cfg(any(
+        feature = "native-tls",
+        feature = "rustls-tls",
+        feature = "rustls-tls-no-provider"
+    ))]
+    fn convert_certificates(
+        certs: &[crate::client::Certificate],
+    ) -> Result<Vec<reqwest::Certificate>, OciDistributionError> {
+        certs.iter().map(reqwest::Certificate::try_from).collect()
     }
 
     /// Puts a `reqwest::Client` in a [`Transport`].

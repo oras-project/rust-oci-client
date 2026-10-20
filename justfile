@@ -12,20 +12,20 @@ test: && test-native-tls check-rustls-tls-no-provider check-no-tls
 
 # The full test suite under the OpenSSL (native-tls) backend.
 test-native-tls:
-    cargo test --workspace --lib --tests --no-default-features --features native-tls,test-registry
+    cargo test --workspace --lib --tests --no-default-features --features native-tls,test-registry,blocking
 
 # rustls-tls-no-provider cannot run the test suite: it has no crypto provider
 # until the embedding application installs one. A compile check is the
 # strongest test available for this backend.
 check-rustls-tls-no-provider:
-    cargo check --no-default-features --features rustls-tls-no-provider,test-registry
+    cargo check --no-default-features --features rustls-tls-no-provider,test-registry,blocking
 
 # Without a TLS feature, you can use the crate only with your own transport
 # (`Client::new_with_transport`). This transport has its own TLS. Make sure
 # that the crate and the custom-transport example build without TLS.
 check-no-tls:
     cargo check --no-default-features
-    cargo check --no-default-features --all-targets --features test-registry
+    cargo check --no-default-features --all-targets --features test-registry,blocking
 
 check-wasm32:
     cargo clippy --lib --target wasm32-unknown-unknown --no-default-features -- -D warnings

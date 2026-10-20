@@ -69,6 +69,28 @@ fields, the proxies and the timeouts. With a custom transport, the client
 ignores them. The client uses all the other fields, for example `protocol` and
 `user_agent`.
 
+## Blocking client
+
+`oci_client::blocking::Client` mirrors `Client` for synchronous Rust code.
+The `blocking` feature enables it.
+
+Each method runs the matching call on an async `Client`. It runs that
+call on one background thread. Then it waits for the result.
+`reqwest::blocking` uses the same approach on top of `reqwest`.
+
+As a result, the blocking client accepts a custom transport, the same
+way the async client does. Use `blocking::Client::new_with_transport` to
+set it.
+
+The blocking client has no version of the async client's streaming
+methods: `pull_blob_stream`, `pull_blob_stream_partial`, `push_blob_stream`,
+and `push_blob_stream_chunked`. These methods need an async runtime to
+run their request and response bodies. Use `blocking::Client::pull_blob`
+instead. It loads the whole blob into memory.
+
+Do not call this client from async code. Like `reqwest::blocking`, each
+method call blocks one OS thread until the request finishes.
+
 ## Code of Conduct
 
 This project has adopted the [CNCF Code of

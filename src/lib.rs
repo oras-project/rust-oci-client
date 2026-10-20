@@ -32,14 +32,25 @@
 //! policy, observability or traffic shaping. Such an application can give its
 //! stack to [`Client::new_with_transport`]. The [`transport`] module gives the
 //! contract that the stack must obey, and an example.
+//!
+//! # Blocking client
+//!
+//! `blocking::Client` mirrors [`Client`] for use from synchronous Rust
+//! code. It requires the `blocking` feature. It takes a custom transport
+//! the same way [`Client`] does.
 #![deny(missing_docs)]
 
 use sha2::Digest;
 
 pub mod annotations;
 mod blob;
-#[cfg(feature = "blocking")]
+#[cfg(all(feature = "blocking", not(target_arch = "wasm32")))]
 pub mod blocking;
+#[cfg(all(feature = "blocking", target_arch = "wasm32"))]
+compile_error!(
+    "the `blocking` feature needs OS threads for its background thread. \
+     `wasm32` targets have no OS threads"
+);
 pub mod client;
 pub mod config;
 pub(crate) mod digest;
