@@ -72,6 +72,10 @@ pub enum OciDistributionError {
     /// Transparent wrapper around `reqwest::Error`
     #[error(transparent)]
     RequestError(#[from] reqwest::Error),
+    /// An error from the HTTP transport of the client. Refer to
+    /// [`crate::transport`].
+    #[error("HTTP transport error: {0}")]
+    TransportError(#[source] crate::transport::BoxError),
     /// HTTP Server error
     #[error("Server error: url {url}, code: {code}, message: {message}")]
     ServerError {

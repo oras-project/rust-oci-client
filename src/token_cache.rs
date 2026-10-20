@@ -6,9 +6,12 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+// On native targets, `web_time` is the same as `std::time`. On
+// `wasm32-unknown-unknown`, `std::time::SystemTime::now()` panics, but
+// `web_time` gives a clock that works.
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// A token granted during the OAuth2-like workflow for OCI registries.
 #[derive(Deserialize, Clone)]
@@ -155,11 +158,7 @@ impl TokenCache {
                 ref token,
                 expiration,
             }) => {
-                let now = SystemTime::now();
-                let epoch = now
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_secs();
+                let epoch = now_epoch_secs();
                 if epoch > *expiration {
                     debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
                     None
@@ -247,11 +246,14 @@ fn bearer_token_cache_expiration(token_str: &str, default_expiration_secs: usize
 }
 
 fn default_expiration(default_expiration_secs: usize) -> u64 {
+    now_epoch_secs() + default_expiration_secs as u64
+}
+
+fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs()
-        + default_expiration_secs as u64
 }
 
 #[cfg(test)]
@@ -288,10 +290,17 @@ mod tests {
     }
 
     fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+        now_epoch_secs()
+    }
+
+    #[test]
+    fn cache_clock_drives_default_expiration() {
+        let before = now_epoch_secs();
+        let expiration = default_expiration(60);
+        let after = now_epoch_secs();
+
+        assert!(expiration >= before + 60);
+        assert!(expiration <= after + 60);
     }
 
     #[test]

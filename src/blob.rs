@@ -9,7 +9,9 @@ use crate::errors::DigestError;
 
 /// Stream response of a blob with optional content length if available
 pub struct SizedStream {
-    /// The length of the stream if the upstream registry sent a `Content-Length` header
+    /// The length of the stream, taken from the body of the response or from
+    /// the `Content-Length` header. If the client cannot find the length,
+    /// this field is `None`.
     pub content_length: Option<u64>,
     /// The digest header value if the upstream registry sent a `Digest` header. This should be used
     /// (in addition to the layer digest) for validation when using partial requests as the library
