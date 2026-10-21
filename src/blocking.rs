@@ -23,19 +23,49 @@
 //!
 //! # Streaming
 //!
-//! The asynchronous client also gives streaming APIs:
-//! [`crate::Client::pull_blob_stream`], [`crate::Client::pull_blob_stream_partial`],
-//! [`crate::Client::push_blob_stream`] and [`crate::Client::push_blob_stream_chunked`].
-//! Their request and response bodies are [`futures_util::Stream`]s. These
-//! need an async runtime to run them.
+//! [`Client::pull_blob_read`] is the blocking form of
+//! [`crate::Client::pull_blob_stream`]. It returns [`BlobReader`], which
+//! implements [`std::io::Read`]. [`Client::pull_blob`] is
+//! [`std::io::copy`] over a [`BlobReader`].
 //!
-//! This client has no synchronous version of those methods. Use
-//! [`Client::pull_blob`] instead. It loads the whole blob into memory.
+//! [`BlobReader`] owns the response body stream. Each `read` call polls
+//! that stream on the calling thread, the same way
+//! `reqwest::blocking::Response` reads its body. No chunk crosses a
+//! channel, and the transport reads from the network only when the
+//! reader asks for the next chunk.
+//!
+//! [`Client::push_blob_from_read`] is the blocking form of
+//! [`crate::Client::push_blob_stream`]. It reads a plain
+//! [`std::io::Read`] on the calling thread, instead of a
+//! [`futures_util::Stream`].
+//!
+//! [`Client::push_blob_from_read_chunked`] is the same kind of wrapper
+//! around [`crate::Client::push_blob_stream_chunked`]. It computes the
+//! digest while it reads, instead of needing the digest up front.
+//!
+//! For both push methods, a bounded channel carries blob chunks from the
+//! calling thread to the background thread. At most a few chunks sit in
+//! memory at once.
+//!
+//! This client has no version of [`crate::Client::pull_blob_stream_partial`].
+//! That API can return a partial response, and a partial response does
+//! not fit [`BlobReader`] the way a full response does.
+//!
+//! # Timeouts
+//!
+//! [`ClientConfig::read_timeout`] and [`ClientConfig::connect_timeout`]
+//! work as they do for the asynchronous client. The transport applies
+//! them. On a [`BlobReader`], a `read` call that waits longer than
+//! `read_timeout` for the next chunk returns an error.
+//! [`Client::pull_blob`] reports that error as
+//! [`OciDistributionError::IoError`].
 
 use std::convert::TryFrom;
-use std::io::Write;
+use std::io::{Read, Write};
 
+use bytes::Bytes;
 use http::HeaderValue;
+use tokio::sync::mpsc;
 use tower::Service;
 
 pub use crate::client::{
@@ -59,6 +89,11 @@ use crate::Reference;
 mod background_runtime;
 use background_runtime::BackgroundRuntime;
 
+mod blob_io;
+pub use blob_io::BlobReader;
+
+mod wait;
+
 /// A synchronous OCI Distribution client.
 ///
 /// See the [module documentation](self) for how this client relates to
@@ -71,11 +106,7 @@ pub struct Client {
 
 impl Default for Client {
     fn default() -> Self {
-        Self {
-            inner: crate::client::Client::default(),
-            rt: BackgroundRuntime::new()
-                .expect("failed to start the background thread of the blocking client"),
-        }
+        Self::new(ClientConfig::default())
     }
 }
 
@@ -255,6 +286,77 @@ impl Client {
         self.block_on(async move { inner.push_blob(&image_ref, data, &digest).await })
     }
 
+    /// Pushes a blob to the registry. It reads the blob from `reader`
+    /// instead of needing the whole blob in memory first.
+    ///
+    /// This method wraps [`crate::Client::push_blob_stream`]. `reader`
+    /// runs on the calling thread. The method reads it in fixed-size
+    /// chunks, then sends each chunk to the background thread. The
+    /// background thread sends each chunk to the registry. At most a few
+    /// chunks sit in memory at once. See the [module documentation](self)
+    /// for details.
+    ///
+    /// `size` must be `Some` when the client's
+    /// [`ClientConfig::use_monolithic_push`] is set. A monolithic push
+    /// needs the `Content-Length` header up front, and `reader` cannot
+    /// run twice. If `size` is `None` in that case, this method returns
+    /// an error, and does not read from `reader`. Unlike
+    /// [`Client::push_blob`], this method does not fall back to a
+    /// monolithic push when the chunked path returns a
+    /// `SpecViolationError`, for the same reason.
+    ///
+    /// Returns the pullable location of the blob.
+    pub fn push_blob_from_read<R: Read>(
+        &self,
+        image_ref: &Reference,
+        reader: R,
+        digest: &str,
+        size: Option<u64>,
+    ) -> Result<String> {
+        // Select the mode here, on the calling thread, before any code reads
+        // `reader`. A missing `size` fails here. The background task never
+        // starts, so this thread never blocks on a read from a pipe or a
+        // socket.
+        let mode = self.inner.push_mode(size)?;
+        let (image_ref, digest, inner) =
+            (image_ref.clone(), digest.to_string(), self.inner.clone());
+        let (tx, rx) = mpsc::channel::<Result<Bytes>>(blob_io::BLOB_CHANNEL_CAPACITY);
+        let handle = self.rt.spawn(async move {
+            inner
+                .push_blob_stream_with_mode(&image_ref, blob_io::receiver_stream(rx), &digest, mode)
+                .await
+        });
+        blob_io::feed_reader_to_channel(reader, tx);
+        handle.wait()
+    }
+
+    /// Pushes a blob to the registry. It reads the blob from `reader` and
+    /// computes the digest while it reads.
+    ///
+    /// This method wraps [`crate::Client::push_blob_stream_chunked`]. See
+    /// [`Client::push_blob_from_read`] for how `reader` connects to the
+    /// background thread. This method always sends the blob as a series
+    /// of chunked PATCH requests. It ignores the client's
+    /// `use_monolithic_push` setting.
+    ///
+    /// Returns the pullable location of the blob, the computed digest,
+    /// and the blob size.
+    pub fn push_blob_from_read_chunked<R: Read>(
+        &self,
+        image_ref: &Reference,
+        reader: R,
+    ) -> Result<PushBlobStreamChunkedResponse> {
+        let (image_ref, inner) = (image_ref.clone(), self.inner.clone());
+        let (tx, rx) = mpsc::channel::<Result<Bytes>>(blob_io::BLOB_CHANNEL_CAPACITY);
+        let handle = self.rt.spawn(async move {
+            inner
+                .push_blob_stream_chunked(&image_ref, blob_io::receiver_stream(rx))
+                .await
+        });
+        blob_io::feed_reader_to_channel(reader, tx);
+        handle.wait()
+    }
+
     /// Perform an OAuth v2 auth request if necessary.
     ///
     /// This performs authorization and then stores the token internally to be used
@@ -424,6 +526,47 @@ impl Client {
         self.block_on(async move { inner.push_manifest_list(&reference, &auth, manifest).await })
     }
 
+    /// Pull a single layer from an OCI registry, as a [`std::io::Read`].
+    ///
+    /// This pulls the layer for a particular image that is identified by the given layer
+    /// descriptor. The layer descriptor can be anything that can be referenced as a layer
+    /// descriptor. The image reference is used to find the repository and the registry, but it is
+    /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
+    /// that.)
+    ///
+    /// This method is the blocking form of [`crate::Client::pull_blob_stream`].
+    /// It returns once the registry sends a response. [`BlobReader::content_length`]
+    /// and [`BlobReader::digest_header_value`] are ready at that point, before
+    /// the first byte of the body. A read error, including a digest
+    /// mismatch or a read timeout, surfaces from [`std::io::Read::read`]
+    /// on the returned [`BlobReader`]. See the [module documentation](self)
+    /// for how each `read` call gets its data, and [`Client::pull_blob`]
+    /// for a simpler, `Write`-based version.
+    ///
+    /// Drop the returned [`BlobReader`] to stop the pull early. The
+    /// reader can outlive this `Client`; dropping every clone of the
+    /// client does not cancel the pull. See [`BlobReader`] for the exact
+    /// drop and lifetime behavior.
+    pub fn pull_blob_read(
+        &self,
+        image: &Reference,
+        layer: impl AsLayerDescriptor,
+    ) -> Result<BlobReader> {
+        let (image, layer, inner) = (
+            image.clone(),
+            blob_io::OwnedLayerDescriptor::new(layer),
+            self.inner.clone(),
+        );
+        let stream = self.block_on(async move { inner.pull_blob_stream(&image, &layer).await })?;
+        Ok(BlobReader {
+            content_length: stream.content_length,
+            digest_header_value: stream.digest_header_value,
+            state: blob_io::StreamState::Open(stream.stream),
+            current: Bytes::new(),
+            runtime: self.rt.clone(),
+        })
+    }
+
     /// Pull a single layer from an OCI registry.
     ///
     /// This pulls the layer for a particular image that is identified by the given layer
@@ -432,24 +575,22 @@ impl Client {
     /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
     /// that.)
     ///
-    /// This method buffers the whole blob in memory before it writes to `out`.
+    /// This method streams the blob to `out` as the blob arrives over the
+    /// network. It does not buffer the whole blob in memory; see
+    /// [`Client::pull_blob_read`], which this method wraps. Because of
+    /// this, some bytes can already be in `out` when this method returns
+    /// a digest-mismatch error or a read-timeout error. If you need
+    /// all-or-nothing behavior, write to a temporary file. Rename the
+    /// file into place only after this method returns `Ok`.
     pub fn pull_blob<T: Write>(
         &self,
         image: &Reference,
         layer: impl AsLayerDescriptor,
         mut out: T,
     ) -> Result<()> {
-        let (image, layer, inner) = (
-            image.clone(),
-            OwnedLayerDescriptor::new(layer),
-            self.inner.clone(),
-        );
-        let bytes = self.block_on(async move {
-            let mut buf = Vec::new();
-            inner.pull_blob(&image, &layer, &mut buf).await?;
-            Ok::<_, OciDistributionError>(buf)
-        })?;
-        out.write_all(&bytes)?;
+        let mut reader = self.pull_blob_read(image, layer)?;
+        std::io::copy(&mut reader, &mut out).map_err(blob_io::io_error_to_oci)?;
+        out.flush()?;
         Ok(())
     }
 
@@ -524,38 +665,6 @@ impl Client {
             self.inner.clone(),
         );
         self.block_on(async move { inner.catalog(&image, &auth, n, last.as_deref()).await })
-    }
-}
-
-/// An owned [`AsLayerDescriptor`].
-///
-/// [`Client::pull_blob`] runs on the background thread. Its layer
-/// descriptor must be `'static`.
-///
-/// [`LayerDescriptor`] borrows its fields instead of owning them. This
-/// type copies those fields out of the caller's value. It does this
-/// copy before the value moves to the background thread.
-struct OwnedLayerDescriptor {
-    digest: String,
-    urls: Option<Vec<String>>,
-}
-
-impl OwnedLayerDescriptor {
-    fn new(layer: impl AsLayerDescriptor) -> Self {
-        let layer = layer.as_layer_descriptor();
-        Self {
-            digest: layer.digest.to_string(),
-            urls: layer.urls.clone(),
-        }
-    }
-}
-
-impl AsLayerDescriptor for OwnedLayerDescriptor {
-    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
-        LayerDescriptor {
-            digest: &self.digest,
-            urls: &self.urls,
-        }
     }
 }
 

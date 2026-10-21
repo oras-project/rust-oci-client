@@ -28,6 +28,11 @@ name = "blocking-get-manifest"
 path = "examples/blocking-get-manifest/main.rs"
 required-features = ["blocking"]
 
+[[example]]
+name = "blocking-pull-layer"
+path = "examples/blocking-pull-layer/main.rs"
+required-features = ["blocking"]
+
 [features]
 default = ["rustls-tls", "test-registry"]
 native-tls = ["reqwest/native-tls"]

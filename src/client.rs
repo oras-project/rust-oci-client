@@ -109,6 +109,15 @@ impl TryFrom<ClientConfig> for Client {
     }
 }
 
+/// How the client sends a blob. [`Client::push_mode`] selects it from
+/// the client configuration.
+pub(crate) enum PushMode {
+    /// One PUT request with a `Content-Length` header of `size`.
+    Monolithic { size: u64 },
+    /// A series of PATCH requests. The size is not needed up front.
+    Chunked,
+}
+
 impl Client {
     /// Create a new client with the supplied config
     pub fn new(config: ClientConfig) -> Self {
@@ -417,24 +426,29 @@ impl Client {
         data: impl Into<bytes::Bytes>,
         digest: &str,
     ) -> Result<String> {
-        if self.config.use_monolithic_push {
-            return self.push_blob_monolithically(image_ref, data, digest).await;
-        }
         let data = data.into();
-        // Cloning the bytes here is cheap (e.g. doesn't allocate anything except some space for
-        // some pointers). If any cloning happened, it is because the caller's passed data was not
-        // already a `Bytes` type or static data.
-        match self
-            .push_blob_chunked(image_ref, data.clone(), digest)
-            .await
-        {
-            Ok(url) => Ok(url),
-            Err(OciDistributionError::SpecViolationError(violation)) => {
-                warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
-                warn!("Attempting monolithic push");
+        // `size` is `Some` here, so `push_mode` is never going to fail.
+        match self.push_mode(Some(data.len() as u64))? {
+            PushMode::Monolithic { .. } => {
                 self.push_blob_monolithically(image_ref, data, digest).await
             }
-            Err(e) => Err(e),
+            PushMode::Chunked => {
+                // Cloning the bytes here is cheap (e.g. doesn't allocate anything except some space for
+                // some pointers). If any cloning happened, it is because the caller's passed data was not
+                // already a `Bytes` type or static data.
+                match self
+                    .push_blob_chunked(image_ref, data.clone(), digest)
+                    .await
+                {
+                    Ok(url) => Ok(url),
+                    Err(OciDistributionError::SpecViolationError(violation)) => {
+                        warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
+                        warn!("Attempting monolithic push");
+                        self.push_blob_monolithically(image_ref, data, digest).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 
@@ -474,6 +488,24 @@ impl Client {
             .await
     }
 
+    /// Selects the push mode from the client configuration and `size`.
+    ///
+    /// A monolithic push sends the whole blob in one PUT request. That
+    /// request needs the `Content-Length` header up front, so the push
+    /// needs `size`.
+    ///
+    /// Returns an error when the client uses monolithic
+    /// push and `size` is `None`.
+    pub(crate) fn push_mode(&self, size: Option<u64>) -> Result<PushMode> {
+        match (self.config.use_monolithic_push, size) {
+            (true, Some(size)) => Ok(PushMode::Monolithic { size }),
+            (true, None) => Err(OciDistributionError::GenericError(Some(
+                "size must be provided when use_monolithic_push is enabled".to_string(),
+            ))),
+            (false, _) => Ok(PushMode::Chunked),
+        }
+    }
+
     /// Pushes a blob to the registry from an input stream.
     ///
     /// If `use_monolithic_push` is set in the client config, a single PUT is used (monolithic
@@ -495,12 +527,24 @@ impl Client {
         blob_digest: &str,
         size: Option<u64>,
     ) -> Result<String> {
-        if self.config.use_monolithic_push {
-            let size = size.ok_or_else(|| {
-                OciDistributionError::GenericError(Some(
-                    "size must be provided when use_monolithic_push is enabled".to_string(),
-                ))
-            })?;
+        let mode = self.push_mode(size)?;
+        self.push_blob_stream_with_mode(image, blob_data_stream, blob_digest, mode)
+            .await
+    }
+
+    /// Pushes a blob from a stream in the given `mode`. Callers get `mode`
+    /// from [`Self::push_mode`], so this method does not look at the
+    /// client configuration again.
+    pub(crate) async fn push_blob_stream_with_mode<
+        T: Stream<Item = Result<bytes::Bytes>> + Send + 'static,
+    >(
+        &self,
+        image: &Reference,
+        blob_data_stream: T,
+        blob_digest: &str,
+        mode: PushMode,
+    ) -> Result<String> {
+        if let PushMode::Monolithic { size } = mode {
             let location = self.begin_push_monolithical_session(image).await?;
             return self
                 .push_stream_monolithically(&location, image, blob_data_stream, size, blob_digest)
@@ -3009,6 +3053,43 @@ mod test {
             )
         }
 
+        /// Pulls a layer through the streaming API of each client, and
+        /// reads it to the end.
+        ///
+        /// The async arm calls [`Client::pull_blob_stream`]. The
+        /// blocking arm calls
+        /// [`crate::blocking::Client::pull_blob_read`]. Returns the
+        /// bytes and the content length that each API reports before the
+        /// first byte of the body.
+        async fn pull_blob_stream(
+            &self,
+            image: &Reference,
+            layer: &OciDescriptor,
+        ) -> crate::errors::Result<(Vec<u8>, Option<u64>)> {
+            let (image, layer) = (image.clone(), layer.clone());
+            dispatch!(
+                self,
+                |c| async {
+                    let stream = c.pull_blob_stream(&image, &layer).await?;
+                    let content_length = stream.content_length;
+                    let mut out = Vec::new();
+                    tokio::io::AsyncReadExt::read_to_end(
+                        &mut tokio_util::io::StreamReader::new(stream.stream),
+                        &mut out,
+                    )
+                    .await?;
+                    Ok((out, content_length))
+                },
+                |b| {
+                    let mut reader = b.pull_blob_read(&image, &layer)?;
+                    let content_length = reader.content_length;
+                    let mut out = Vec::new();
+                    std::io::Read::read_to_end(&mut reader, &mut out)?;
+                    Ok((out, content_length))
+                }
+            )
+        }
+
         async fn pull(
             &self,
             image: &Reference,
@@ -3061,6 +3142,63 @@ mod test {
                 self,
                 |c| c.push_blob_chunked(&image, data.clone(), &digest),
                 |b| b.push_blob_chunked(&image, data, &digest)
+            )
+        }
+
+        /// Pushes `data` as a single-chunk stream.
+        ///
+        /// The async arm calls [`Client::push_blob_stream`]. The blocking
+        /// arm calls [`crate::blocking::Client::push_blob_from_read`]. The
+        /// blocking arm uses a [`std::io::Cursor`] as the blocking
+        /// [`std::io::Read`] for that method.
+        async fn push_blob_stream(
+            &self,
+            image: &Reference,
+            data: Vec<u8>,
+            digest: &str,
+            size: Option<u64>,
+        ) -> crate::errors::Result<String> {
+            let (image, digest) = (image.clone(), digest.to_string());
+            dispatch!(
+                self,
+                |c| async {
+                    let bytes = Bytes::from(data.clone());
+                    c.push_blob_stream(
+                        &image,
+                        futures_util::stream::once(async move { Ok(bytes) }),
+                        &digest,
+                        size,
+                    )
+                    .await
+                },
+                |b| b.push_blob_from_read(&image, std::io::Cursor::new(data), &digest, size)
+            )
+        }
+
+        /// Pushes `data` as a single-chunk stream. This method computes
+        /// the digest while it sends the data, instead of needing the
+        /// digest up front.
+        ///
+        /// The async arm calls [`Client::push_blob_stream_chunked`]. The
+        /// blocking arm calls
+        /// [`crate::blocking::Client::push_blob_from_read_chunked`].
+        async fn push_blob_stream_chunked(
+            &self,
+            image: &Reference,
+            data: Vec<u8>,
+        ) -> crate::errors::Result<PushBlobStreamChunkedResponse> {
+            let image = image.clone();
+            dispatch!(
+                self,
+                |c| async {
+                    let bytes = Bytes::from(data.clone());
+                    c.push_blob_stream_chunked(
+                        &image,
+                        futures_util::stream::once(async move { Ok(bytes) }),
+                    )
+                    .await
+                },
+                |b| b.push_blob_from_read_chunked(&image, std::io::Cursor::new(data))
             )
         }
 
@@ -4053,9 +4191,12 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
-    async fn test_pull_blob_stream() {
-        let c = Client::default();
+    async fn test_pull_blob_stream(#[case] kind: ClientKind) {
+        let c = TestClient::with_default_config(kind).await;
 
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
@@ -4067,23 +4208,19 @@ mod test {
             .await
             .expect("authenticated");
             let (manifest, _) = c
-                ._pull_image_manifest(&reference)
+                .pull_image_manifest_stored_auth(&reference)
                 .await
                 .expect("failed to pull manifest");
 
             // Pull one specific layer
-            let mut file: Vec<u8> = Vec::new();
             let layer0 = &manifest.layers[0];
 
-            let layer_stream = c
+            let (file, content_length) = c
                 .pull_blob_stream(&reference, layer0)
                 .await
                 .expect("failed to pull blob stream");
 
-            assert_eq!(layer_stream.content_length, Some(layer0.size as u64));
-            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream.stream), &mut file)
-                .await
-                .unwrap();
+            assert_eq!(content_length, Some(layer0.size as u64));
 
             // The manifest says how many bytes we should expect.
             assert_eq!(file.len(), layer0.size as usize);
@@ -4839,11 +4976,14 @@ mod test {
     }
 
     #[rstest]
-    #[case::chunked(false)]
-    #[case::monolithic(true)]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_push_stream(#[case] use_monolithic_push: bool) {
+    async fn test_push_stream(
+        #[case] kind: ClientKind,
+        #[values(false, true)] use_monolithic_push: bool,
+    ) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -4854,48 +4994,48 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let mut client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
-            use_monolithic_push,
-            ..Default::default()
-        });
-        client.push_chunk_size = 253;
+        let mut c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+                use_monolithic_push,
+                ..Default::default()
+            },
+        )
+        .await;
+        c.set_push_chunk_size(253);
 
         // hash for a byte array counting 16 times from 0 to 255 ([0, 1, 2, ..., 255] * 16)
         let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
         let repeat = 16usize;
-        let chunk_size = 256usize; // Bytes::from_iter(0u8..=255)
-        let data_stream = |n| {
-            futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
-                .take(n)
-                .map(Ok)
-        };
-        let size = Some((repeat * chunk_size) as u64);
+        let block: Vec<u8> = (0u8..=255).collect();
+        let size = Some((repeat * block.len()) as u64);
 
         let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
             .expect("failed to parse reference");
 
         // Sanity check: verify that the server rejects the push if the blob has a mismatched digest
-        client
-            .push_blob_stream(&reference, data_stream(1), data_hash, None)
+        c.push_blob_stream(&reference, block.clone(), data_hash, None)
             .await
             .expect_err("expected push to fail with mismatched digest");
 
         // Now push the stream with the correct digest
-        client
-            .push_blob_stream(&reference, data_stream(repeat), data_hash, size)
+        c.push_blob_stream(&reference, block.repeat(repeat), data_hash, size)
             .await
             .expect("failed to push stream");
 
-        assert!(client
+        assert!(c
             .blob_exists(&reference, data_hash)
             .await
             .expect("failed to check blob existence"));
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_push_stream_monolithic_requires_size() {
+    async fn test_push_stream_monolithic_requires_size(#[case] kind: ClientKind) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -4906,29 +5046,33 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
-            use_monolithic_push: true,
-            ..Default::default()
-        });
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+                use_monolithic_push: true,
+                ..Default::default()
+            },
+        )
+        .await;
 
         let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
-        let data_stream = futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
-            .take(16)
-            .map(Ok);
+        let data: Vec<u8> = (0u8..=255).collect::<Vec<u8>>().repeat(16);
 
         let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
             .expect("failed to parse reference");
 
-        client
-            .push_blob_stream(&reference, data_stream, data_hash, None)
+        c.push_blob_stream(&reference, data, data_hash, None)
             .await
             .expect_err("expected error when use_monolithic_push is true but size is None");
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_push_stream_chunked_without_digest() {
+    async fn test_push_stream_chunked_without_digest(#[case] kind: ClientKind) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -4939,26 +5083,28 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let mut client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
-            use_monolithic_push: true,
-            ..Default::default()
-        });
-        client.push_chunk_size = 253;
+        let mut c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+                use_monolithic_push: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        c.set_push_chunk_size(253);
 
         // hash for a byte array counting 16 times from 0 to 255 ([0, 1, 2, ..., 255] * 16)
         let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
         let repeat = 16usize;
-        let data_stream = futures_util::stream::repeat(Bytes::from_iter(0u8..=255))
-            .take(repeat)
-            .map(Ok);
+        let data: Vec<u8> = (0u8..=255).collect::<Vec<u8>>().repeat(repeat);
 
         let reference =
             Reference::try_from(format!("localhost:{server_port}/test-push-stream-chunked"))
                 .expect("failed to parse reference");
 
-        let response = client
-            .push_blob_stream_chunked(&reference, data_stream)
+        let response = c
+            .push_blob_stream_chunked(&reference, data)
             .await
             .expect("failed to push stream with chunked-only API");
 
@@ -4966,15 +5112,18 @@ mod test {
         assert_eq!(response.size, (repeat * 256) as u64);
         assert!(response.blob_url.ends_with(data_hash));
 
-        assert!(client
+        assert!(c
             .blob_exists(&reference, data_hash)
             .await
             .expect("failed to check blob existence"));
     }
 
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
     #[tokio::test]
     #[cfg(feature = "test-registry")]
-    async fn test_push_stream_chunked_empty_stream() {
+    async fn test_push_stream_chunked_empty_stream(#[case] kind: ClientKind) {
         let real_registry = registry_image_edge()
             .start()
             .await
@@ -4985,20 +5134,22 @@ mod test {
             .await
             .expect("Failed to get port");
 
-        let client = Client::new(ClientConfig {
-            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
-            ..Default::default()
-        });
-
-        let data_stream = futures_util::stream::empty::<crate::errors::Result<Bytes>>();
+        let c = TestClient::new(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let reference = Reference::try_from(format!(
             "localhost:{server_port}/test-push-stream-chunked-empty"
         ))
         .expect("failed to parse reference");
 
-        let err = client
-            .push_blob_stream_chunked(&reference, data_stream)
+        let err = c
+            .push_blob_stream_chunked(&reference, Vec::new())
             .await
             .expect_err("expected error when pushing an empty stream");
 

@@ -82,11 +82,29 @@ As a result, the blocking client accepts a custom transport, the same
 way the async client does. Use `blocking::Client::new_with_transport` to
 set it.
 
-The blocking client has no version of the async client's streaming
-methods: `pull_blob_stream`, `pull_blob_stream_partial`, `push_blob_stream`,
-and `push_blob_stream_chunked`. These methods need an async runtime to
-run their request and response bodies. Use `blocking::Client::pull_blob`
-instead. It loads the whole blob into memory.
+The blocking client has no version of `pull_blob_stream_partial`. That
+method needs an async runtime to run its response body.
+
+`blocking::Client::pull_blob_read` covers `pull_blob_stream`. It returns
+a type that implements `Read`, with the content length and the digest
+header ready before the first byte. `blocking::Client::pull_blob` is
+`std::io::copy` over that type, for a simpler `Write`-based call. The
+[`blocking-pull-layer`](examples/blocking-pull-layer/main.rs) example
+uses `pull_blob_read` to show progress against the content length while
+it writes a layer to a file. Run it with this command:
+
+```sh
+cargo run --features blocking --example blocking-pull-layer -- docker.io/library/hello-world:latest
+```
+
+`blocking::Client::push_blob_from_read` covers `push_blob_stream`. It
+reads a plain `Read` on the calling thread, instead of a `Stream`.
+
+None of these three methods buffers the whole blob in memory. A
+`BlobReader` polls the response body on the calling thread, the way
+`reqwest::blocking::Response` does. The push methods send chunks to the
+background thread through a bounded channel. `ClientConfig::read_timeout`
+and `connect_timeout` work as they do for the async client.
 
 Do not call this client from async code. Like `reqwest::blocking`, each
 method call blocks one OS thread until the request finishes.

@@ -105,17 +105,43 @@ impl BackgroundRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.spawn(future).wait()
+    }
+
+    /// Starts `future` on the background runtime. Returns a handle for
+    /// its result at once. It does not wait for `future` to finish.
+    ///
+    /// Unlike [`Self::block_on`], the calling thread does not wait until
+    /// it calls [`ResultHandle::wait`] on the returned handle. Because of
+    /// this, the calling thread can do other work while `future` runs on
+    /// the background thread. For example, it can fill a channel that
+    /// `future` drains.
+    pub(super) fn spawn<F>(&self, future: F) -> ResultHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
         let (tx, rx) = mpsc::channel();
         self.handle.spawn(async move {
-            // `send` fails only when the receiver below no longer
-            // exists. That happens only if the calling thread
-            // panicked while it waited. In that case, no one is left
-            // to receive the result.
+            // `send` fails when the receiver below no longer exists.
+            // That happens either because the caller dropped its
+            // `ResultHandle` without calling `wait`, or, more rarely,
+            // because the calling thread panicked while it waited. In
+            // both cases, no one is left to receive the result.
             let _ = tx.send(future.await);
         });
-        rx.recv().expect(
-            "the blocking client's background thread most likely panicked before sending a result",
-        )
+        ResultHandle { rx }
+    }
+
+    /// Enters the context of the background runtime on the calling
+    /// thread, until the returned guard drops.
+    ///
+    /// Inside this context, code on the calling thread can create Tokio
+    /// resources that need a runtime, for example a `tokio::time::Sleep`.
+    /// The background thread drives those resources. This does not run
+    /// any task on the calling thread.
+    pub(super) fn enter(&self) -> runtime::EnterGuard<'_> {
+        self.handle.enter()
     }
 }
 
@@ -133,8 +159,29 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
+/// The result of a future that [`BackgroundRuntime::spawn`] started.
+///
+/// You can drop a handle without calling [`Self::wait`]. The future keeps
+/// running on the background runtime until it finishes. Its result is
+/// then discarded.
+pub(super) struct ResultHandle<T> {
+    rx: mpsc::Receiver<T>,
+}
+
+impl<T> ResultHandle<T> {
+    /// Blocks the calling thread until the future finishes. Then returns
+    /// its result.
+    pub(super) fn wait(self) -> T {
+        self.rx.recv().expect(
+            "the blocking client's background thread most likely panicked before sending a result",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::blocking::wait;
+
     use super::BackgroundRuntime;
 
     #[test]
@@ -161,5 +208,35 @@ mod tests {
         let cloned = rt.clone();
         assert_eq!(rt.block_on(async { 1 }), 1);
         assert_eq!(cloned.block_on(async { 2 }), 2);
+    }
+
+    /// `spawn` returns before `future` finishes. Because of this, the
+    /// calling thread can do other work before it collects the result
+    /// with `wait`. For example, it can drain a channel that the future
+    /// fills.
+    #[test]
+    fn spawn_runs_concurrently_with_the_caller() {
+        let rt = BackgroundRuntime::new().expect("failed to start the background runtime");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = rt.spawn(async move {
+            tx.send(1).unwrap();
+            tx.send(2).unwrap();
+            "done"
+        });
+        assert_eq!(rx.recv().unwrap(), 1);
+        assert_eq!(rx.recv().unwrap(), 2);
+        assert_eq!(handle.wait(), "done");
+    }
+
+    /// Inside `enter`, the calling thread can create a Tokio timer. The
+    /// background thread fires the timer, and the waker of
+    /// `wait::block_on` unparks the calling thread. Without `enter`, the
+    /// `sleep` call panics because the calling thread has no runtime.
+    #[test]
+    fn enter_lets_the_calling_thread_use_tokio_timers() {
+        let rt = BackgroundRuntime::new().expect("failed to start the background runtime");
+        let _guard = rt.enter();
+
+        wait::block_on(tokio::time::sleep(std::time::Duration::from_millis(10)));
     }
 }
