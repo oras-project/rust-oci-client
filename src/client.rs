@@ -1532,6 +1532,13 @@ impl Client {
     /// `on_chunk` is invoked with each chunk right before it is sent, allowing callers to
     /// incrementally compute a digest or otherwise observe the data without buffering it.
     ///
+    /// `stream` can hand this function chunks of any size, for example the small, uneven
+    /// pieces a [`std::io::Read`] with short reads produces. This function combines them
+    /// into `self.push_chunk_size` batches before it sends each one, so the number of PATCH
+    /// requests tracks the blob size, not how finely the input arrived. It still splits a
+    /// stream item bigger than `self.push_chunk_size` into more than one PATCH. At most one
+    /// batch's worth of bytes sits in memory beyond what `stream` itself buffers.
+    ///
     /// Returns the upload location to use for the final commit request, alongside the total
     /// number of bytes sent.
     async fn push_stream_chunks(
@@ -1544,19 +1551,59 @@ impl Client {
         let mut location = location;
         let mut range_start = 0;
         let mut size = 0u64;
+        // Bytes carried over from an earlier, smaller stream item,
+        // until there are enough of them for a full chunk. Usually
+        // stays empty: most callers already hand this function items
+        // of `push_chunk_size` or more.
+        let mut pending = bytes::BytesMut::new();
 
         let mut blob_data_stream = pin!(blob_data_stream);
 
         while let Some(blob_data) = blob_data_stream.next().await {
             let mut blob_data = blob_data?;
-            while !blob_data.is_empty() {
-                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+            if blob_data.is_empty() {
+                continue;
+            }
+
+            // Send leftovers from the previous stream item first, if any. This is the only place
+            // where `pending` is used, so it never grows beyond `push_chunk_size`.
+            if !pending.is_empty() {
+                let take = (self.push_chunk_size - pending.len()).min(blob_data.len());
+                pending.extend_from_slice(&blob_data.split_to(take));
+                if pending.len() < self.push_chunk_size {
+                    continue;
+                }
+                let chunk = pending.split().freeze();
                 size += chunk.len() as u64;
                 on_chunk(&chunk);
                 (location, range_start) = self
                     .push_chunk(&location, image, chunk, range_start)
                     .await?;
             }
+
+            // Now send as many full chunks as we can from the current stream item. If the stream item is
+            // larger than `push_chunk_size`, this will send multiple PATCH requests, each with a full chunk.
+            // If the stream item is smaller than `push_chunk_size`, it will be carried over to the next iteration.
+            while blob_data.len() >= self.push_chunk_size {
+                let chunk = blob_data.split_to(self.push_chunk_size);
+                size += chunk.len() as u64;
+                on_chunk(&chunk);
+                (location, range_start) = self
+                    .push_chunk(&location, image, chunk, range_start)
+                    .await?;
+            }
+            if !blob_data.is_empty() {
+                pending.extend_from_slice(&blob_data);
+            }
+        }
+
+        if !pending.is_empty() {
+            let chunk = pending.freeze();
+            size += chunk.len() as u64;
+            on_chunk(&chunk);
+            (location, _) = self
+                .push_chunk(&location, image, chunk, range_start)
+                .await?;
         }
 
         Ok((location, size))
@@ -2663,7 +2710,7 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::convert::{Infallible, TryFrom};
     use std::result::Result;
 
@@ -2883,6 +2930,41 @@ mod test {
         };
     }
 
+    /// A [`std::io::Read`] that yields the elements of `pieces` one at
+    /// a time, each from its own `read` call. Used to send the
+    /// blocking client's push methods an input of a chosen shape, for
+    /// example many pieces smaller than a configured chunk size.
+    #[cfg(feature = "blocking")]
+    struct PieceReader {
+        pieces: VecDeque<Vec<u8>>,
+    }
+
+    #[cfg(feature = "blocking")]
+    impl PieceReader {
+        fn new(pieces: Vec<Vec<u8>>) -> Self {
+            Self {
+                pieces: pieces.into_iter().collect(),
+            }
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    impl std::io::Read for PieceReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(piece) = self.pieces.pop_front() else {
+                return Ok(0);
+            };
+            assert!(
+                piece.len() <= buf.len(),
+                "test piece of {} bytes does not fit the {}-byte read buffer",
+                piece.len(),
+                buf.len(),
+            );
+            buf[..piece.len()].copy_from_slice(&piece);
+            Ok(piece.len())
+        }
+    }
+
     // Some methods are only exercised by the `test-registry` tests.
     #[cfg_attr(not(feature = "test-registry"), allow(dead_code))]
     impl TestClient {
@@ -2895,6 +2977,38 @@ mod test {
                         tokio::task::spawn_blocking(move || crate::blocking::Client::new(config))
                             .await
                             .expect("cannot build blocking client");
+                    TestClient::Blocking(client)
+                }
+            }
+        }
+
+        /// Builds a client that sends its requests through `transport`,
+        /// instead of the default reqwest-based one.
+        async fn new_with_transport<T, E>(
+            kind: ClientKind,
+            config: ClientConfig,
+            transport: T,
+        ) -> Self
+        where
+            T: Service<transport::Request, Response = transport::Response, Error = E>
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+            T::Future: Send + 'static,
+            E: Into<transport::BoxError> + 'static,
+        {
+            match kind {
+                ClientKind::Async => {
+                    TestClient::Async(Client::new_with_transport(config, transport))
+                }
+                #[cfg(feature = "blocking")]
+                ClientKind::Blocking => {
+                    let client = tokio::task::spawn_blocking(move || {
+                        crate::blocking::Client::new_with_transport(config, transport)
+                    })
+                    .await
+                    .expect("cannot build blocking client");
                     TestClient::Blocking(client)
                 }
             }
@@ -3202,6 +3316,66 @@ mod test {
             )
         }
 
+        /// Pushes `pieces`, each as its own stream item (async arm) or
+        /// its own [`std::io::Read::read`] call (blocking arm, through
+        /// [`PieceReader`]). This exercises `push_stream_chunks`'s
+        /// aggregation with input arriving in whatever sizes `pieces`
+        /// names, for example many pieces smaller than the configured
+        /// `push_chunk_size`.
+        ///
+        /// The async arm calls [`Client::push_blob_stream`]. The
+        /// blocking arm calls
+        /// [`crate::blocking::Client::push_blob_from_read`].
+        async fn push_blob_stream_from_pieces(
+            &self,
+            image: &Reference,
+            pieces: Vec<Vec<u8>>,
+            digest: &str,
+            size: Option<u64>,
+        ) -> crate::errors::Result<String> {
+            let (image, digest) = (image.clone(), digest.to_string());
+            dispatch!(
+                self,
+                |c| {
+                    let stream = futures_util::stream::iter(
+                        pieces
+                            .clone()
+                            .into_iter()
+                            .map(|piece| Ok(Bytes::from(piece))),
+                    );
+                    c.push_blob_stream(&image, stream, &digest, size)
+                },
+                |b| b.push_blob_from_read(&image, PieceReader::new(pieces), &digest, size)
+            )
+        }
+
+        /// The same as [`Self::push_blob_stream_from_pieces`], but
+        /// through the digest-computing API.
+        ///
+        /// The async arm calls [`Client::push_blob_stream_chunked`]. The
+        /// blocking arm calls
+        /// [`crate::blocking::Client::push_blob_from_read_chunked`].
+        async fn push_blob_stream_chunked_from_pieces(
+            &self,
+            image: &Reference,
+            pieces: Vec<Vec<u8>>,
+        ) -> crate::errors::Result<PushBlobStreamChunkedResponse> {
+            let image = image.clone();
+            dispatch!(
+                self,
+                |c| {
+                    let stream = futures_util::stream::iter(
+                        pieces
+                            .clone()
+                            .into_iter()
+                            .map(|piece| Ok(Bytes::from(piece))),
+                    );
+                    c.push_blob_stream_chunked(&image, stream)
+                },
+                |b| b.push_blob_from_read_chunked(&image, PieceReader::new(pieces))
+            )
+        }
+
         async fn begin_push_chunked_session(
             &self,
             image: &Reference,
@@ -3304,6 +3478,147 @@ mod test {
                 }
             }
         }
+    }
+
+    /// A `202 Accepted` response with a `Location` header, the shape a
+    /// registry answers `POST` (begin upload) and `PATCH` (chunk
+    /// accepted) with.
+    fn chunk_accepted_response() -> http::Response<transport::Body> {
+        http::Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .header(
+                LOCATION,
+                "http://registry.example/v2/repo/blobs/uploads/session",
+            )
+            .body(transport::Body::empty())
+            .unwrap()
+    }
+
+    /// A custom transport for the chunked-push tests below. It answers
+    /// `POST` and `PATCH` with `202 Accepted`, and `PUT` with
+    /// `201 Created`, so a push through it reaches completion. It
+    /// records the body size of every `PATCH` request it receives, in
+    /// order, in the returned list.
+    fn push_chunk_recording_transport() -> (
+        impl Service<
+                transport::Request,
+                Response = transport::Response,
+                Error = Infallible,
+                Future: Send,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        let patch_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&patch_sizes);
+        let service = tower::service_fn(move |request: transport::Request| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let response = match *request.method() {
+                    Method::PATCH => {
+                        let body = transport::collect(request.into_body())
+                            .await
+                            .expect("failed to collect the PATCH body");
+                        recorded.lock().unwrap().push(body.len());
+                        chunk_accepted_response()
+                    }
+                    Method::POST => chunk_accepted_response(),
+                    Method::PUT => http::Response::builder()
+                        .status(StatusCode::CREATED)
+                        .header(
+                            LOCATION,
+                            "http://registry.example/v2/repo/blobs/sha256:final",
+                        )
+                        .body(transport::Body::empty())
+                        .unwrap(),
+                    _ => http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(transport::Body::empty())
+                        .unwrap(),
+                };
+                Ok::<_, Infallible>(response)
+            }
+        });
+        (service, patch_sizes)
+    }
+
+    /// `push_stream_chunks` combines small or uneven input chunks into
+    /// batches of `push_chunk_size` bytes, instead of sending one PATCH
+    /// request per input chunk. A caller can hand it chunks this
+    /// small, for example a [`std::io::Read`] with short reads, on the
+    /// blocking client.
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn push_stream_chunks_combines_small_input_chunks(#[case] kind: ClientKind) {
+        // Ten 1-byte pieces. With a chunk size of 3, that is three
+        // full 3-byte chunks, then a final 1-byte chunk, not ten
+        // 1-byte PATCH requests.
+        let pieces: Vec<Vec<u8>> = (0u8..10).map(|byte| vec![byte]).collect();
+        let data: Vec<u8> = pieces.iter().flatten().copied().collect();
+        let digest = sha256_digest(&data);
+
+        let (service, patch_sizes) = push_chunk_recording_transport();
+        let mut client = TestClient::new_with_transport(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::Http,
+                ..Default::default()
+            },
+            service,
+        )
+        .await;
+        client.set_push_chunk_size(3);
+        let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+        client
+            .push_blob_stream_from_pieces(&reference, pieces, &digest, None)
+            .await
+            .expect("failed to push the blob");
+
+        assert_eq!(*patch_sizes.lock().unwrap(), vec![3, 3, 3, 1]);
+    }
+
+    /// The digest-computing push API gets the same aggregation as
+    /// [`push_stream_chunks_combines_small_input_chunks`]. Combining
+    /// small pieces into bigger PATCH bodies must not change the
+    /// digest or the reported size: `on_chunk` still sees every byte,
+    /// in order, just grouped differently.
+    #[rstest]
+    #[case::async_client(ClientKind::Async)]
+    #[cfg_attr(feature = "blocking", case::blocking_client(ClientKind::Blocking))]
+    #[tokio::test]
+    async fn push_stream_chunks_chunked_api_combines_small_input_chunks(#[case] kind: ClientKind) {
+        // Uneven pieces. With a chunk size of 4, that is two full
+        // 4-byte chunks, then a final 2-byte chunk.
+        let pieces: Vec<Vec<u8>> = vec![vec![0, 1], vec![2], vec![3, 4, 5, 6], vec![7, 8, 9]];
+        let data: Vec<u8> = pieces.iter().flatten().copied().collect();
+        let expected_digest = sha256_digest(&data);
+
+        let (service, patch_sizes) = push_chunk_recording_transport();
+        let mut client = TestClient::new_with_transport(
+            kind,
+            ClientConfig {
+                protocol: ClientProtocol::Http,
+                ..Default::default()
+            },
+            service,
+        )
+        .await;
+        client.set_push_chunk_size(4);
+        let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+        let response = client
+            .push_blob_stream_chunked_from_pieces(&reference, pieces)
+            .await
+            .expect("failed to push the blob");
+
+        assert_eq!(*patch_sizes.lock().unwrap(), vec![4, 4, 2]);
+        assert_eq!(response.blob_digest, expected_digest);
+        assert_eq!(response.size, data.len() as u64);
     }
 
     #[rstest]
