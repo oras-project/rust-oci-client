@@ -18,7 +18,7 @@ jobs:
       # Tool version comes from the manifests bundled in the pinned
       # install-action commit, so dependabot bumps of install-action also
       # advance it.
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny
       - run: cargo deny --all-features check advisories
