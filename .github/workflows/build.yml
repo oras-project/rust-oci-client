@@ -74,6 +74,28 @@ jobs:
       - name: Check
         run: just check-wasm32
 
+  # Builds the published docs the way docs.rs does: all features, with the
+  # labels that mark a feature-gated item. A broken intra-doc link or a
+  # bad `cfg` fails this job instead of only showing up on docs.rs.
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      # Tool version comes from the manifests bundled in the pinned
+      # install-action commit, so dependabot bumps of install-action also
+      # advance it.
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: just
+      - name: Doc
+        run: just doc
+
   cargo-deny:
     name: Run cargo deny
     runs-on: ubuntu-latest

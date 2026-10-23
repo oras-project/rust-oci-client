@@ -39,6 +39,7 @@
 //! code. It requires the `blocking` feature. It takes a custom transport
 //! the same way [`Client`] does.
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use sha2::Digest;
 
