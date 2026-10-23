@@ -87,14 +87,21 @@ pub struct BlobReader {
 
 /// The state of the response body stream of a [`BlobReader`].
 ///
-/// A stream that already reached its end, or that already reported an
-/// error, must not be polled again. Polling most streams again after
-/// that point panics, hangs, or, for the registry's digest-verifying
-/// stream specifically, finalizes its digest a second time over no
-/// bytes and reports a false mismatch. This type remembers that the
-/// stream finished, so [`Read::read`](std::io::Read::read) can stop on
-/// its own, without relying on the stream to behave a particular way
-/// once it is done.
+/// After a stream returns `None`, the [`Stream`](futures_util::Stream)
+/// contract does not say what a later poll does. A poll like this can
+/// panic or hang. It can also give a result that does not belong
+/// there. One example is a digest check: it resets on every finalize,
+/// so a second finalize reports a false mismatch on nothing.
+///
+/// A stream can still give more items after an error item. The
+/// `Stream` contract allows that. `BlobReader` does not do this. It
+/// treats the first error as the end of the blob, and stops polling.
+/// A blob with a gap in it is no use to the caller. The chunks after
+/// the gap gain nothing.
+///
+/// This type remembers that the stream finished, whether by `None` or
+/// by an error. [`Read::read`](std::io::Read::read) can then stop on
+/// its own, instead of polling the stream again to find out.
 pub(super) enum StreamState {
     /// The stream can still yield more chunks.
     Open(BoxStream<'static, std::io::Result<Bytes>>),
@@ -344,12 +351,13 @@ mod tests {
     }
 
     /// After `read` returns `Ok(0)` at the end of the stream, a later
-    /// `read` returns `Ok(0)` again, and it must not poll the stream a
-    /// second time. A second poll of a stream that already finished is
-    /// what produced the false digest mismatch this test guards
-    /// against: the registry's digest-verifying stream finalizes its
-    /// digest on every `None` it gives out, and finalizing twice checks
-    /// the blob's digest against the digest of nothing the second time.
+    /// `read` returns `Ok(0)` again. It must not poll the stream a
+    /// second time to find that out. This guard exists because of a
+    /// real bug: the registry's digest-verifying stream used to
+    /// finalize its digest on every `None` it gave out. A second
+    /// finalize reset the digest and checked it against nothing, and
+    /// reported a false mismatch. That stream no longer does this, but
+    /// `BlobReader` still guards against a stream that does.
     #[test]
     fn read_returns_ok_zero_again_after_eof_without_polling_the_stream() {
         let mut polls_after_eof = 0;
