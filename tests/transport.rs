@@ -678,3 +678,669 @@ fn public_transport_types_and_client_futures_are_send() {
             .unwrap();
     });
 }
+
+/// A response body split across more than one frame. A consumer that
+/// reads the body sees more than one chunk arrive over time. A real
+/// registry's TCP stream splits a body this way. A plain in-memory body
+/// does not.
+#[cfg(feature = "blocking")]
+fn multi_frame_body(chunks: Vec<&'static [u8]>) -> transport::Body {
+    let stream = futures_util::stream::iter(chunks.into_iter().map(|chunk| {
+        Ok::<_, transport::BoxError>(http_body::Frame::data(Bytes::from_static(chunk)))
+    }));
+    transport::Body::wrap(http_body_util::StreamBody::new(stream))
+}
+
+/// [`Client::pull_blob`] streams a blob to the caller's [`std::io::Write`]
+/// as the blob arrives. It does not buffer the whole blob in memory
+/// first. This test sends the blob as more than one frame. It checks
+/// that the writer gets more than one `write` call, and that the bytes
+/// and the digest are still correct.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_streams_to_the_writer() {
+    use std::io::Write;
+
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::GET);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(multi_frame_body(vec![&BLOB[..4], &BLOB[4..]]))
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    #[derive(Default)]
+    struct CountingWriter {
+        buf: Vec<u8>,
+        writes: usize,
+    }
+    impl Write for CountingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter::default();
+    client
+        .pull_blob(&reference, BLOB_DIGEST, &mut writer)
+        .expect("failed to pull blob");
+
+    assert_eq!(writer.buf, BLOB);
+    assert!(
+        writer.writes >= 2,
+        "expected the blob to arrive in more than one write call, got {}",
+        writer.writes
+    );
+}
+
+/// When the caller's [`std::io::Write`] fails partway through,
+/// [`Client::pull_blob`] reports that error. It does not hang, even
+/// though more of the blob is still waiting to be read.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_propagates_writer_errors() {
+    use std::io::Write;
+
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::GET);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(multi_frame_body(vec![&BLOB[..4], &BLOB[4..]]))
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    struct FailingWriter {
+        calls: usize,
+    }
+    impl Write for FailingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Ok(data.len())
+            } else {
+                Err(std::io::Error::other("write boom"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let error = client
+        .pull_blob(&reference, BLOB_DIGEST, &mut FailingWriter { calls: 0 })
+        .expect_err("expected the writer's error to be reported");
+
+    assert!(
+        matches!(error, OciDistributionError::IoError(_)),
+        "{error:?}"
+    );
+}
+
+/// When the caller's [`std::io::Read`] fails partway through,
+/// [`Client::push_blob_from_read`] reports that error. It does not hang,
+/// even though the background thread still drives the chunked upload.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_push_blob_from_read_propagates_reader_errors() {
+    let service = tower::service_fn(|request: transport::Request| async move {
+        let response = match *request.method() {
+            Method::POST | Method::PATCH => http::Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header(
+                    "Location",
+                    "http://registry.example/v2/repo/blobs/uploads/session",
+                )
+                .body(transport::Body::empty())
+                .unwrap(),
+            _ => http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(transport::Body::empty())
+                .unwrap(),
+        };
+        Ok::<_, Infallible>(response)
+    });
+    let client = oci_client::blocking::Client::new_with_transport(ClientConfig::default(), service);
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    struct FailingReader {
+        yielded: bool,
+    }
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.yielded {
+                self.yielded = true;
+                let n = BLOB.len().min(buf.len());
+                buf[..n].copy_from_slice(&BLOB[..n]);
+                Ok(n)
+            } else {
+                Err(std::io::Error::other("read boom"))
+            }
+        }
+    }
+
+    let error = client
+        .push_blob_from_read(
+            &reference,
+            FailingReader { yielded: false },
+            BLOB_DIGEST,
+            None,
+        )
+        .expect_err("expected the reader's error to be reported");
+
+    assert!(
+        matches!(error, OciDistributionError::IoError(_)),
+        "{error:?}"
+    );
+}
+
+/// When the client uses monolithic push and `size` is `None`,
+/// [`Client::push_blob_from_read`] returns an error at once. It does not
+/// read from the reader. It does not send a request to the registry.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_push_blob_from_read_monolithic_without_size_does_not_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    let service = tower::service_fn(move |_request: transport::Request| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .header(
+                        "Location",
+                        "http://registry.example/v2/repo/blobs/uploads/session",
+                    )
+                    .body(transport::Body::empty())
+                    .unwrap(),
+            )
+        }
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            use_monolithic_push: true,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    struct NeverRead;
+    impl std::io::Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("push_blob_from_read must not read the reader when size is None and use_monolithic_push is set")
+        }
+    }
+
+    let error = client
+        .push_blob_from_read(&reference, NeverRead, BLOB_DIGEST, None)
+        .expect_err("expected a missing size error");
+
+    assert!(
+        matches!(&error, OciDistributionError::GenericError(Some(m)) if m == "size must be provided when use_monolithic_push is enabled"),
+        "{error:?}"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+/// [`Client::pull_blob_read`] reports `content_length` before the first
+/// byte. It then returns the blob across more than one `read` call, as
+/// the data arrives in more than one piece.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_exposes_content_length_and_streams() {
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::GET);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_LENGTH, BLOB.len())
+                .body(multi_frame_body(vec![&BLOB[..4], &BLOB[4..]]))
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    assert_eq!(reader.content_length, Some(BLOB.len() as u64));
+
+    // Read one byte at a time. A 1-byte buffer forces one `read` call
+    // per byte of `BLOB`, which checks that `BlobReader` hands out a
+    // chunk across more than one call, not just as a single copy.
+    let mut out = Vec::new();
+    let mut reads = 0;
+    let mut buf = [0u8; 1];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).expect("failed to read the blob");
+        if n == 0 {
+            break;
+        }
+        reads += 1;
+        out.extend_from_slice(&buf[..n]);
+    }
+
+    assert_eq!(out, BLOB);
+    assert_eq!(reads, BLOB.len());
+}
+
+/// Reading a [`BlobReader`] again after it already reached the end of
+/// the blob returns `Ok(0)` again. It must not poll the response body
+/// a second time: the registry's digest-verifying stream finalizes its
+/// digest on every `None` it returns, so polling it again after it
+/// already finished would check the blob's digest against the digest
+/// of an empty body, and report a false mismatch.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_returns_eof_again_after_the_blob() {
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::GET);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(multi_frame_body(vec![&BLOB[..4], &BLOB[4..]]))
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut out).expect("failed to read the blob");
+    assert_eq!(out, BLOB);
+
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        std::io::Read::read(&mut reader, &mut buf).expect("expected Ok(0), not a digest error"),
+        0
+    );
+}
+
+/// A failed open, for example a `404` response, is reported by
+/// [`Client::pull_blob_read`] itself. The caller does not have to call
+/// `read` to see it.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_reports_open_errors_before_reading() {
+    let service = tower::service_fn(|_: transport::Request| async {
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(transport::Body::empty())
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let error = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect_err("expected the 404 to be reported");
+
+    assert!(
+        matches!(error, OciDistributionError::ServerError { code: 404, .. }),
+        "{error:?}"
+    );
+}
+
+/// A digest mismatch is reported as [`OciDistributionError::DigestError`],
+/// by [`Client::pull_blob`] and by the last `read` of
+/// [`Client::pull_blob_read`]. Both clients report the same error
+/// variant, instead of the generic [`OciDistributionError::IoError`] that
+/// a plain [`std::io::Error`] would become.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_reports_digest_mismatch_as_a_digest_error() {
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::GET);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(transport::Body::from(b"wrong content".as_slice()))
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let error = client
+        .pull_blob(&reference, BLOB_DIGEST, &mut Vec::new())
+        .expect_err("expected the digest mismatch to be reported");
+    assert!(
+        matches!(error, OciDistributionError::DigestError(_)),
+        "{error:?}"
+    );
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut out).expect_err("expected a read error");
+}
+
+/// A [`oci_client::blocking::BlobReader`] can outlive the
+/// [`oci_client::blocking::Client`] that created it. Dropping every
+/// clone of the client while a read is still in progress must not stop
+/// the pull or panic the reader.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_outlives_its_client() {
+    // Sends the blob one byte at a time, through a Tokio task that
+    // `tower::service_fn` spawns onto whatever runtime drives the
+    // request. That is the background runtime of the blocking client.
+    // The task waits on `release` right after the first byte, so the
+    // test can drop the client first. If `BlobReader` did not hold its
+    // own clone of the background runtime, dropping the last client
+    // clone would shut that runtime down at this point, and the
+    // runtime would drop this task before it sent the rest of the
+    // blob. `notify_one` stores its permit even with no task waiting
+    // yet, so this works regardless of how far the task has progressed
+    // by the time the test calls it; no sleep or polling is needed.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_for_service = Arc::clone(&release);
+    let service = tower::service_fn(move |request: transport::Request| {
+        let release = Arc::clone(&release_for_service);
+        async move {
+            assert_eq!(request.method(), Method::GET);
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                Result<http_body::Frame<Bytes>, transport::BoxError>,
+            >(1);
+            tokio::spawn(async move {
+                for index in 0..BLOB.len() {
+                    if index == 1 {
+                        release.notified().await;
+                    }
+                    let frame =
+                        http_body::Frame::data(Bytes::copy_from_slice(&BLOB[index..index + 1]));
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(transport::Body::wrap(http_body_util::StreamBody::new(
+                        stream,
+                    )))
+                    .unwrap(),
+            )
+        }
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    let mut first_byte = [0u8; 1];
+    std::io::Read::read(&mut reader, &mut first_byte).expect("failed to read the first byte");
+
+    drop(client);
+    release.notify_one();
+
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut rest).expect("failed to read the rest");
+
+    let mut out = first_byte.to_vec();
+    out.extend_from_slice(&rest);
+    assert_eq!(out, BLOB);
+}
+
+/// Dropping a [`BlobReader`] releases the response body at once, even
+/// when the registry never sends the next chunk. The reader owns the
+/// body stream, so dropping the reader drops the stream. No other task
+/// holds the stream, and nothing waits for the registry.
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_drop_releases_a_stalled_download() {
+    // Sends a value when the response stream drops. The test waits on
+    // this, with a timeout, instead of guessing how long "stalled"
+    // needs to be.
+    struct DropSignal(std::sync::mpsc::Sender<()>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+    let service = tower::service_fn(move |request: transport::Request| {
+        let dropped_tx = dropped_tx.clone();
+        async move {
+            assert_eq!(request.method(), Method::GET);
+            let stream = futures_util::stream::unfold(
+                (false, DropSignal(dropped_tx)),
+                |(sent_first, guard)| async move {
+                    if !sent_first {
+                        return Some((
+                            Ok::<_, transport::BoxError>(http_body::Frame::data(
+                                Bytes::copy_from_slice(&BLOB[..1]),
+                            )),
+                            (true, guard),
+                        ));
+                    }
+                    // The registry stalls here, forever. It already
+                    // sent the first frame, and never sends the next
+                    // one or closes the connection.
+                    std::future::pending::<()>().await;
+                    unreachable!("the stall above never resolves");
+                },
+            );
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(transport::Body::wrap(http_body_util::StreamBody::new(
+                        stream,
+                    )))
+                    .unwrap(),
+            )
+        }
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    let mut buf = [0u8; 1];
+    std::io::Read::read(&mut reader, &mut buf).expect("failed to read the first byte");
+    drop(reader);
+
+    dropped_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the response stream did not drop after the reader dropped");
+}
+
+/// With [`ClientConfig::read_timeout`] set, a `read` on a
+/// [`oci_client::blocking::BlobReader`] fails when the registry stalls
+/// between chunks. The default transport applies the timeout with a
+/// Tokio timer inside the body. The reader polls that body on the
+/// calling thread, so this test also checks that the timer finds a
+/// runtime there. [`oci_client::blocking::Client::pull_blob`] reports
+/// the error as [`OciDistributionError::IoError`].
+#[test]
+#[cfg(feature = "blocking")]
+fn blocking_pull_blob_read_times_out_when_the_registry_stalls() {
+    use std::io::Write;
+
+    /// A raw HTTP server on a background thread. It answers each
+    /// request with the headers and the first byte of the blob, then
+    /// keeps the connection open and never sends the rest.
+    ///
+    /// Dropping this stops the thread: it sets a flag the thread checks
+    /// after each `accept`, opens one throwaway connection to wake the
+    /// blocking `accept` call, then joins the thread. This runs during
+    /// unwinding too, so a failing assertion earlier in the test does
+    /// not leave the thread blocked in `accept` with its listener and
+    /// connections alive for the rest of the test process.
+    struct StallingServer {
+        address: String,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StallingServer {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let shutdown_for_server = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                let mut connections = Vec::new();
+                for connection in listener.incoming() {
+                    // The throwaway connection that `Drop` opens only
+                    // exists to wake up the blocking `accept` call.
+                    // Check the flag before reading from it; it never
+                    // sends a request head.
+                    if shutdown_for_server.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut connection = connection.unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if std::io::Read::read(&mut connection, &mut byte).unwrap() == 0 {
+                            break;
+                        }
+                        head.push(byte[0]);
+                    }
+                    write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        BLOB.len()
+                    )
+                    .unwrap();
+                    connection.write_all(&BLOB[..1]).unwrap();
+                    connection.flush().unwrap();
+                    // Keep the connection open, so the client sees a
+                    // stall and not a closed connection.
+                    connections.push(connection);
+                }
+            });
+            Self {
+                address,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for StallingServer {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // `accept` blocks with no timeout; connecting once more is
+            // what wakes it up to see the flag.
+            let _ = std::net::TcpStream::connect(&self.address);
+            if let Some(handle) = self.handle.take() {
+                let result = handle.join();
+                // A second panic during unwinding aborts the process
+                // and hides the test's real failure. Only treat a
+                // server panic as a test failure on the happy path.
+                if !std::thread::panicking() {
+                    result.expect("the server thread panicked");
+                }
+            }
+        }
+    }
+
+    // Declared first, so it drops last: the client's connections close
+    // before this stops and joins the server thread, on the happy path
+    // and while unwinding from a panic alike.
+    let server = StallingServer::start();
+
+    let client = oci_client::blocking::Client::new(ClientConfig {
+        protocol: ClientProtocol::Http,
+        read_timeout: Some(std::time::Duration::from_millis(100)),
+        ..Default::default()
+    });
+    let reference = Reference::try_from(format!("{}/repo:latest", server.address)).unwrap();
+
+    let mut reader = client
+        .pull_blob_read(&reference, BLOB_DIGEST)
+        .expect("failed to open the blob");
+    let mut buf = [0u8; 1];
+    std::io::Read::read(&mut reader, &mut buf).expect("failed to read the first byte");
+    std::io::Read::read(&mut reader, &mut buf).expect_err("expected the second read to time out");
+
+    let error = client
+        .pull_blob(&reference, BLOB_DIGEST, &mut Vec::new())
+        .expect_err("expected the pull to time out");
+    assert!(
+        matches!(error, OciDistributionError::IoError(_)),
+        "{error:?}"
+    );
+}

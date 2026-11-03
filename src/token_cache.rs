@@ -90,6 +90,17 @@ struct TokenCacheKey {
     operation: RegistryOperation,
 }
 
+impl TokenCacheKey {
+    fn new(reference: &Reference, op: RegistryOperation) -> Self {
+        TokenCacheKey {
+            registry: reference.resolve_registry().to_string(),
+            repository: reference.repository().to_string(),
+            operation: op,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TokenCacheValue {
     token: RegistryTokenType,
     expiration: u64,
@@ -128,17 +139,12 @@ impl TokenCache {
                 }
             }
         };
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens.write().await.insert(
-            TokenCacheKey {
-                registry,
-                repository,
-                operation: op,
-            },
-            TokenCacheValue { token, expiration },
-        );
+        let key = TokenCacheKey::new(reference, op);
+        debug!(%key.registry, %key.repository, ?key.operation, %expiration, "Inserting token");
+        self.tokens
+            .write()
+            .await
+            .insert(key, TokenCacheValue { token, expiration });
     }
 
     pub(crate) async fn get(
@@ -146,13 +152,7 @@ impl TokenCache {
         reference: &Reference,
         op: RegistryOperation,
     ) -> Option<RegistryTokenType> {
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        let key = TokenCacheKey {
-            registry,
-            repository,
-            operation: op,
-        };
+        let key = TokenCacheKey::new(reference, op);
         match self.tokens.read().await.get(&key) {
             Some(TokenCacheValue {
                 ref token,
