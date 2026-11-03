@@ -95,7 +95,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 testcontainers = "0.28"
 tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["compat", "io"] }
-tower-http = { version = "0.6", default-features = false, features = [
+tower-http = { version = "0.7", default-features = false, features = [
   "follow-redirect",
   "trace",
 ] }
