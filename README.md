@@ -73,3 +73,15 @@ ignores them. The client uses all the other fields, for example `protocol` and
 
 This project has adopted the [CNCF Code of
 Conduct](https://github.com/cncf/foundation/blob/master/code-of-conduct.md).
+
+## Logging compatibility
+
+The `log` feature is enabled by default. It lets `tracing` forward events to
+`log` when no tracing subscriber is installed. Applications that install their
+own tracing subscriber can disable this fallback with `default-features = false`
+and select the TLS features they need, or provide their own HTTP transport.
+
+This preserves the default logging behavior while allowing applications to avoid
+enabling `tracing/log` throughout their dependency graph.
+
+To retain log forwarding with default features disabled, enable `log` explicitly.

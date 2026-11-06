@@ -24,7 +24,7 @@ version = "0.19.0"
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["rustls-tls", "test-registry"]
+default = ["rustls-tls", "test-registry", "log"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls"]
 # Like `rustls-tls`, but without a bundled crypto provider. You must install
@@ -32,6 +32,8 @@ rustls-tls = ["reqwest/rustls"]
 # with `rustls::crypto::ring::default_provider().install_default()`.
 rustls-tls-no-provider = ["reqwest/rustls-no-provider"]
 hickory-dns = ["reqwest/hickory-dns"]
+# Forward tracing events to log when no tracing subscriber is installed.
+log = ["tracing/log"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
 
@@ -59,7 +61,7 @@ sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "io-util", "sync"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tracing = { version = "0.1", features = ['log'] }
+tracing = "0.1"
 unicase = "2.8"
 url = "2"
 web-time = "1"
