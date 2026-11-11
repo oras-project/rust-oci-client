@@ -86,8 +86,27 @@ struct BearerTokenClaims {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TokenCacheKey {
     registry: String,
-    repository: String,
-    operation: RegistryOperation,
+    /// The scopes that the token was requested for.
+    scopes: Vec<String>,
+}
+
+impl TokenCacheKey {
+    fn new(reference: &Reference, op: RegistryOperation) -> Self {
+        Self {
+            registry: reference.resolve_registry().to_string(),
+            scopes: scopes_for(reference, op),
+        }
+    }
+}
+
+/// Returns the scopes that a token needs for `op` on the repository of `reference`.
+pub(crate) fn scopes_for(reference: &Reference, op: RegistryOperation) -> Vec<String> {
+    let repository = reference.repository();
+    let scope = match op {
+        RegistryOperation::Pull => format!("repository:{repository}:pull"),
+        RegistryOperation::Push => format!("repository:{repository}:pull,push"),
+    };
+    vec![scope]
 }
 
 struct TokenCacheValue {
@@ -98,7 +117,7 @@ struct TokenCacheValue {
 #[derive(Clone)]
 /// A cache to hold authentication tokens
 pub struct TokenCache {
-    // (registry, repository, scope) -> (token, expiration)
+    // (registry, scopes) -> (token, expiration)
     tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
     /// Default token expiration in seconds, to use when claim doesn't specify a value
     pub default_expiration_secs: usize,
@@ -128,17 +147,12 @@ impl TokenCache {
                 }
             }
         };
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens.write().await.insert(
-            TokenCacheKey {
-                registry,
-                repository,
-                operation: op,
-            },
-            TokenCacheValue { token, expiration },
-        );
+        let key = TokenCacheKey::new(reference, op);
+        debug!(%key.registry, ?key.scopes, %expiration, "Inserting token");
+        self.tokens
+            .write()
+            .await
+            .insert(key, TokenCacheValue { token, expiration });
     }
 
     pub(crate) async fn get(
@@ -146,13 +160,7 @@ impl TokenCache {
         reference: &Reference,
         op: RegistryOperation,
     ) -> Option<RegistryTokenType> {
-        let registry = reference.resolve_registry().to_string();
-        let repository = reference.repository().to_string();
-        let key = TokenCacheKey {
-            registry,
-            repository,
-            operation: op,
-        };
+        let key = TokenCacheKey::new(reference, op);
         match self.tokens.read().await.get(&key) {
             Some(TokenCacheValue {
                 ref token,
@@ -160,15 +168,15 @@ impl TokenCache {
             }) => {
                 let epoch = now_epoch_secs();
                 if epoch > *expiration {
-                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
+                    debug!(%key.registry, ?key.scopes, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
-                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=false, "Fetching token");
+                    debug!(%key.registry, ?key.scopes, %expiration, miss=false, expired=false, "Fetching token");
                     Some(token.clone())
                 }
             }
             None => {
-                debug!(%key.registry, %key.repository, ?key.operation, miss = true, "Fetching token");
+                debug!(%key.registry, ?key.scopes, miss = true, "Fetching token");
                 None
             }
         }
@@ -411,5 +419,14 @@ mod tests {
         let lookup: Reference = lookup.parse().unwrap();
 
         assert_eq!(cache.get(&lookup, op).await.is_some(), found);
+    }
+
+    #[rstest]
+    #[case::pull(RegistryOperation::Pull, "repository:library/repo:pull")]
+    #[case::push(RegistryOperation::Push, "repository:library/repo:pull,push")]
+    fn scopes_of_a_repository_operation(#[case] op: RegistryOperation, #[case] scope: &str) {
+        let reference: Reference = "registry.example/library/repo:tag".parse().unwrap();
+
+        assert_eq!(scopes_for(&reference, op), vec![scope.to_string()]);
     }
 }

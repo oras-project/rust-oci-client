@@ -39,7 +39,9 @@ use crate::manifest::{
 };
 use crate::secrets::RegistryAuth;
 use crate::sha256_digest;
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::token_cache::{
+    scopes_for, RegistryOperation, RegistryToken, RegistryTokenType, TokenCache,
+};
 use crate::transport::{self, Transport};
 use crate::Reference;
 
@@ -889,19 +891,19 @@ impl Client {
         };
 
         // Allow for either push or pull authentication
-        let scope = match operation {
-            RegistryOperation::Pull => format!("repository:{}:pull", image.repository()),
-            RegistryOperation::Push => format!("repository:{}:pull,push", image.repository()),
-        };
+        let scopes = scopes_for(image, operation);
 
         let realm = challenge.realm.as_ref();
         let service = challenge.service.as_ref();
 
         // TODO: At some point in the future, we should support sending a secret to the
         // server for auth. This particular workflow is for read-only public auth.
-        debug!(?realm, ?service, ?scope, "Making authentication call");
+        debug!(?realm, ?service, ?scopes, "Making authentication call");
 
-        let mut request = self.request(Method::GET, realm)?.query("scope", &scope);
+        let mut request = self.request(Method::GET, realm)?;
+        for scope in &scopes {
+            request = request.query("scope", scope);
+        }
         if let Some(service) = service {
             request = request.query("service", service);
         }
