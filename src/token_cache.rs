@@ -382,4 +382,34 @@ mod tests {
             "opaque bearer token should be cached"
         );
     }
+
+    #[rstest]
+    #[case::same("registry.example/repo:tag", RegistryOperation::Pull, true)]
+    #[case::other_tag_of_the_repository(
+        "registry.example/repo:other",
+        RegistryOperation::Pull,
+        true
+    )]
+    #[case::other_operation("registry.example/repo:tag", RegistryOperation::Push, false)]
+    #[case::other_repository("registry.example/other:tag", RegistryOperation::Pull, false)]
+    #[case::other_registry("other.example/repo:tag", RegistryOperation::Pull, false)]
+    #[tokio::test]
+    async fn token_is_cached_for_one_registry_repository_and_operation(
+        #[case] lookup: &str,
+        #[case] op: RegistryOperation,
+        #[case] found: bool,
+    ) {
+        let cache = TokenCache::new(60);
+        let reference: Reference = "registry.example/repo:tag".parse().unwrap();
+        let token = RegistryTokenType::Bearer(RegistryToken::Token {
+            token: OPAQUE_TOKEN.to_string(),
+        });
+        cache
+            .insert(&reference, RegistryOperation::Pull, token)
+            .await;
+
+        let lookup: Reference = lookup.parse().unwrap();
+
+        assert_eq!(cache.get(&lookup, op).await.is_some(), found);
+    }
 }
