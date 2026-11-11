@@ -179,7 +179,6 @@ fn request(path: &str, authorization: Option<&str>) -> Request {
 #[case::distribution("registry:catalog:*", &["registry:catalog:*"])]
 #[case::zot("repository::pull", &["registry:catalog:*", "repository::pull"])]
 #[tokio::test]
-#[ignore = "fails until the fix in a later commit"]
 async fn the_catalog_gets_a_token_for_the_scope_of_the_challenge(
     #[case] catalog_scope: &'static str,
     #[case] token_scopes: &[&str],
@@ -196,7 +195,6 @@ async fn the_catalog_gets_a_token_for_the_scope_of_the_challenge(
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in a later commit"]
 async fn a_token_is_fetched_after_the_challenge_and_used_again() {
     let (registry, image) = spawn(Authentication::Bearer {
         catalog_scope: "registry:catalog:*",
@@ -227,7 +225,6 @@ async fn a_token_is_fetched_after_the_challenge_and_used_again() {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in a later commit"]
 async fn basic_credentials_are_sent_after_the_challenge_and_used_again() {
     let (registry, image) = spawn(Authentication::Basic).await;
     let client = client();
@@ -250,7 +247,6 @@ async fn basic_credentials_are_sent_after_the_challenge_and_used_again() {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in a later commit"]
 async fn a_registry_without_authentication_gets_the_request_only() {
     let (registry, image) = spawn(Authentication::None).await;
 
