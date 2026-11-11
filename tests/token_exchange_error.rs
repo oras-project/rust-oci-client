@@ -111,7 +111,6 @@ fn assert_token_service_refusal(err: &OciDistributionError) {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn a_refused_token_request_is_reported() {
     let seen = Seen::default();
     let registry = spawn(Refuse::Every, seen.clone()).await;
@@ -132,7 +131,6 @@ async fn a_refused_token_request_is_reported() {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn a_refused_anonymous_token_request_is_reported() {
     let seen = Seen::default();
     let registry = spawn(Refuse::Every, seen.clone()).await;
@@ -148,7 +146,6 @@ async fn a_refused_anonymous_token_request_is_reported() {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn a_token_request_refused_for_another_scope_is_reported() {
     let seen = Seen::default();
     let registry = spawn(Refuse::PushScope, seen.clone()).await;
