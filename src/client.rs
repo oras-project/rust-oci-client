@@ -1892,6 +1892,12 @@ impl Client {
 
     /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
     ///
+    /// The referrers API is defined on the digest of a manifest, so `image` must be a
+    /// reference by digest. For a reference by tag, this function returns
+    /// [`OciDistributionError::DigestRequired`] and sends no request. To get the
+    /// referrers of a tag, resolve the tag with [`Client::fetch_manifest_digest`] and
+    /// build the reference by digest with [`Reference::clone_with_digest`].
+    ///
     /// Implements the [OCI Distribution Spec referrers API][oci-referrers] with an automatic
     /// fallback to the [referrers tag schema][oci-tag-schema] when the registry returns a
     /// `404 Not Found` for the native endpoint (as required by the spec).
@@ -1964,11 +1970,9 @@ impl Client {
         image: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<OciImageIndex> {
-        let digest = image.digest().ok_or_else(|| {
-            OciDistributionError::GenericError(Some(
-                "Getting referrers for a tag is not supported".into(),
-            ))
-        })?;
+        let digest = image
+            .digest()
+            .ok_or_else(|| OciDistributionError::DigestRequired(image.whole()))?;
 
         let fallback_tag = digest.replace(':', "-");
         let fallback_ref = Reference::with_tag(
@@ -2187,11 +2191,9 @@ impl Client {
         reference: &Reference,
         artifact_type: Option<&str>,
     ) -> Result<String> {
-        let digest = reference.digest().ok_or_else(|| {
-            OciDistributionError::GenericError(Some(
-                "Getting referrers for a tag is not supported".into(),
-            ))
-        })?;
+        let digest = reference
+            .digest()
+            .ok_or_else(|| OciDistributionError::DigestRequired(reference.whole()))?;
 
         let registry = reference.resolve_registry();
         let base = format!(

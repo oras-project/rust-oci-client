@@ -14,6 +14,7 @@ use axum::{
 };
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
+    errors::OciDistributionError,
     Client, Reference,
 };
 use tokio::net::TcpListener;
@@ -56,7 +57,6 @@ fn client() -> Client {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn the_referrers_of_a_reference_by_tag_need_a_digest() {
     let seen = Seen::default();
     let registry = spawn(seen.clone()).await;
@@ -64,6 +64,10 @@ async fn the_referrers_of_a_reference_by_tag_need_a_digest() {
 
     let err = client().pull_referrers(&image, None).await.unwrap_err();
 
+    assert!(
+        matches!(&err, OciDistributionError::DigestRequired(reference) if *reference == image.whole()),
+        "expected DigestRequired, got {err:?}"
+    );
     assert_eq!(
         err.to_string(),
         format!("Reference {registry}/repo:latest has no digest, and this operation requires one")
