@@ -115,13 +115,11 @@ fn as_the_registry_sent_it() -> Vec<Option<String>> {
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn filters_when_the_registry_reports_no_filter() {
     assert_eq!(sbom_referrers(Report::Nothing).await, only_sbom());
 }
 
 #[tokio::test]
-#[ignore = "fails until the fix in the next commit"]
 async fn filters_when_the_registry_reports_another_filter() {
     assert_eq!(sbom_referrers(Report::Header("digest")).await, only_sbom());
 }
