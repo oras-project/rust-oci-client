@@ -201,6 +201,17 @@ impl Body {
     }
 }
 
+impl Body {
+    /// Returns a copy of a buffered body. Returns `None` for a streamed body, which
+    /// can be read only one time.
+    pub(crate) fn try_clone(&self) -> Option<Self> {
+        match &self.0 {
+            BodyKind::Buffered(data) => Some(Self::from_bytes(data.clone())),
+            BodyKind::Streaming(_) => None,
+        }
+    }
+}
+
 impl Default for Body {
     fn default() -> Self {
         Self::empty()

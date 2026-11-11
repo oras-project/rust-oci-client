@@ -3,7 +3,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use oci_spec::distribution::Reference;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -91,10 +91,10 @@ struct TokenCacheKey {
 }
 
 impl TokenCacheKey {
-    fn new(reference: &Reference, op: RegistryOperation) -> Self {
+    fn new(registry: &str, scopes: &[String]) -> Self {
         Self {
-            registry: reference.resolve_registry().to_string(),
-            scopes: scopes_for(reference, op),
+            registry: registry.to_string(),
+            scopes: scopes.to_vec(),
         }
     }
 }
@@ -107,6 +107,29 @@ pub(crate) fn scopes_for(reference: &Reference, op: RegistryOperation) -> Vec<St
         RegistryOperation::Push => format!("repository:{repository}:pull,push"),
     };
     vec![scope]
+}
+
+/// Merges `scopes` into the scopes of one token request: one scope for each
+/// resource, with all the actions that `scopes` name for the resource.
+///
+/// The result is sorted, so that equal sets of scopes give equal results.
+pub(crate) fn merge_scopes(scopes: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut actions_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for scope in scopes {
+        // A scope is `<type>:<name>:<actions>`, and the name can contain colons.
+        let (resource, actions) = scope.rsplit_once(':').unwrap_or((&scope, ""));
+        actions_of
+            .entry(resource.to_string())
+            .or_default()
+            .extend(actions.split(',').map(String::from));
+    }
+    actions_of
+        .into_iter()
+        .map(|(resource, actions)| {
+            let actions: Vec<String> = actions.into_iter().collect();
+            format!("{resource}:{}", actions.join(","))
+        })
+        .collect()
 }
 
 struct TokenCacheValue {
@@ -138,6 +161,22 @@ impl TokenCache {
         op: RegistryOperation,
         token: RegistryTokenType,
     ) {
+        self.insert_for_scopes(
+            reference.resolve_registry(),
+            &scopes_for(reference, op),
+            token,
+        )
+        .await
+    }
+
+    /// Inserts a token that covers `scopes` at `registry`. HTTP Basic credentials
+    /// have no scopes.
+    pub(crate) async fn insert_for_scopes(
+        &self,
+        registry: &str,
+        scopes: &[String],
+        token: RegistryTokenType,
+    ) {
         let expiration = match token {
             RegistryTokenType::Basic(_, _) => u64::MAX,
             RegistryTokenType::Bearer(ref t) => {
@@ -147,7 +186,7 @@ impl TokenCache {
                 }
             }
         };
-        let key = TokenCacheKey::new(reference, op);
+        let key = TokenCacheKey::new(registry, scopes);
         debug!(%key.registry, ?key.scopes, %expiration, "Inserting token");
         self.tokens
             .write()
@@ -155,12 +194,24 @@ impl TokenCache {
             .insert(key, TokenCacheValue { token, expiration });
     }
 
+    #[cfg(test)]
     pub(crate) async fn get(
         &self,
         reference: &Reference,
         op: RegistryOperation,
     ) -> Option<RegistryTokenType> {
-        let key = TokenCacheKey::new(reference, op);
+        self.get_for_scopes(reference.resolve_registry(), &scopes_for(reference, op))
+            .await
+    }
+
+    /// Returns the token that covers exactly `scopes` at `registry`, if the cache
+    /// holds one that has not expired.
+    pub(crate) async fn get_for_scopes(
+        &self,
+        registry: &str,
+        scopes: &[String],
+    ) -> Option<RegistryTokenType> {
+        let key = TokenCacheKey::new(registry, scopes);
         match self.tokens.read().await.get(&key) {
             Some(TokenCacheValue {
                 ref token,
@@ -428,5 +479,30 @@ mod tests {
         let reference: Reference = "registry.example/library/repo:tag".parse().unwrap();
 
         assert_eq!(scopes_for(&reference, op), vec![scope.to_string()]);
+    }
+
+    #[rstest]
+    #[case::one(&["repository:repo:pull"], &["repository:repo:pull"])]
+    #[case::same_twice(&["repository:repo:pull", "repository:repo:pull"], &["repository:repo:pull"])]
+    #[case::actions_of_one_resource(
+        &["repository:repo:push", "repository:repo:pull"],
+        &["repository:repo:pull,push"]
+    )]
+    #[case::resources_are_sorted(
+        &["repository:repo:pull", "registry:catalog:*"],
+        &["registry:catalog:*", "repository:repo:pull"]
+    )]
+    #[case::name_with_a_port(
+        &["repository:localhost:5000/repo:pull"],
+        &["repository:localhost:5000/repo:pull"]
+    )]
+    #[case::empty_name(
+        &["registry:catalog:*", "repository::pull"],
+        &["registry:catalog:*", "repository::pull"]
+    )]
+    fn scopes_are_merged(#[case] scopes: &[&str], #[case] merged: &[&str]) {
+        let scopes = scopes.iter().map(|scope| scope.to_string());
+
+        assert_eq!(merge_scopes(scopes), merged);
     }
 }

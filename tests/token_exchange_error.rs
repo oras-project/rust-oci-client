@@ -1,7 +1,7 @@
 // When the token service of a registry refuses a token request, the client must report that
-// refusal. It must not go on to send the request to the registry without credentials, which
-// hides the reason (a wrong password, a scope the account does not have) behind a generic 401
-// from the registry.
+// refusal. It must not return the `401 Unauthorized` response that the registry gave to the
+// request without credentials, which hides the reason (a wrong password, a scope the account
+// does not have).
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -152,8 +152,8 @@ async fn a_refused_token_request_is_reported() {
     assert_token_service_refusal(&err);
     assert_eq!(
         *seen.lock().unwrap(),
-        vec![],
-        "the registry should not receive the request once the token request was refused"
+        vec![("/v2/repo/tags/list".to_string(), None)],
+        "the registry should not receive the request again once the token request was refused"
     );
 }
 
@@ -169,7 +169,10 @@ async fn a_refused_anonymous_token_request_is_reported() {
         .unwrap_err();
 
     assert_token_service_refusal(&err);
-    assert_eq!(*seen.lock().unwrap(), vec![]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("/v2/repo/tags/list".to_string(), None)]
+    );
 }
 
 #[tokio::test]
@@ -191,11 +194,15 @@ async fn a_token_request_refused_for_another_scope_is_reported() {
     assert_token_service_refusal(&err);
     assert_eq!(
         *seen.lock().unwrap(),
-        vec![(
-            "/v2/repo/tags/list".to_string(),
-            Some(format!("Bearer {BEARER_TOKEN}"))
-        )],
-        "the registry should receive the pull request only"
+        vec![
+            ("/v2/repo/tags/list".to_string(), None),
+            (
+                "/v2/repo/tags/list".to_string(),
+                Some(format!("Bearer {BEARER_TOKEN}"))
+            ),
+            ("/v2/repo/blobs/uploads/".to_string(), None),
+        ],
+        "the registry should not receive the upload request again"
     );
 }
 
