@@ -1902,6 +1902,10 @@ impl Client {
     /// under a tag derived from the subject digest by replacing `:` with `-`
     /// (e.g. `sha256:abc…` → tag `sha256-abc…`).
     ///
+    /// A registry may ignore the `artifact_type` filter. It reports a filter that it
+    /// applied in the `OCI-Filters-Applied` header of the response. When the registry
+    /// does not report the filter, it is applied client-side.
+    ///
     /// When the fallback is used, `artifact_type` filtering is applied client-side,
     /// since the tag schema stores a single unfiltered index with no query-parameter
     /// support.
@@ -1928,6 +1932,11 @@ impl Client {
             .await?;
         let status = res.status();
         let effective_url = response_url(&res, &url);
+        let filters_header = res
+            .headers()
+            .get(OCI_FILTERS_APPLIED_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = transport::collect(res.into_body()).await?;
 
         // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
@@ -1943,10 +1952,27 @@ impl Client {
         }
 
         validate_registry_response(status, &body, &effective_url)?;
-        let manifest = serde_json::from_slice(&body)
+        let mut index: OciImageIndex = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
 
-        Ok(manifest)
+        // The registry may ignore the filter. It reports a filter that it applied in a
+        // header (spec v1.1.1), or in an annotation of the index (spec v1.1.0-rc1).
+        if let Some(at) = artifact_type {
+            let filters_annotation = index
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(REFERRERS_FILTERS_APPLIED_ANNOTATION))
+                .map(String::as_str);
+            if !is_referrers_filter_applied(filters_header.as_deref(), ARTIFACT_TYPE_FILTER)
+                && !is_referrers_filter_applied(filters_annotation, ARTIFACT_TYPE_FILTER)
+            {
+                index
+                    .manifests
+                    .retain(|entry| entry.artifact_type.as_deref() == Some(at));
+            }
+        }
+
+        Ok(index)
     }
 
     /// Pulls the referrers index using the OCI referrers tag schema fallback.
@@ -2299,6 +2325,20 @@ fn response_url(response: &transport::Response, requested: &str) -> String {
 /// Returns the value of the `Content-Length` header of `headers`.
 fn content_length_header(headers: &HeaderMap) -> Option<u64> {
     headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+}
+
+/// The header in which a registry lists the filters it applied to a referrers response.
+const OCI_FILTERS_APPLIED_HEADER: &str = "OCI-Filters-Applied";
+/// The index annotation which had the role of [`OCI_FILTERS_APPLIED_HEADER`] in version
+/// 1.1.0-rc1 of the distribution specification.
+const REFERRERS_FILTERS_APPLIED_ANNOTATION: &str = "org.opencontainers.referrers.filtersApplied";
+/// The name of the `artifactType` filter in the list of applied filters.
+const ARTIFACT_TYPE_FILTER: &str = "artifactType";
+
+/// Returns whether `requested` is in `applied`, the comma-separated list of the filters
+/// that a registry applied to a referrers response.
+fn is_referrers_filter_applied(applied: Option<&str>, requested: &str) -> bool {
+    applied.is_some_and(|applied| applied.split(',').any(|filter| filter == requested))
 }
 
 /// Returns an empty OCI Image Index, as used when no referrers exist.
