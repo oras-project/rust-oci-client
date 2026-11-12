@@ -521,17 +521,21 @@ async fn custom_transport_receives_token_and_registry_requests() {
                 .headers()
                 .get(AUTHORIZATION)
                 .map(|value| (value.is_sensitive(), format!("{value:?}")));
-            seen.lock().unwrap().push((target.clone(), authorization));
+            seen.lock()
+                .unwrap()
+                .push((target.clone(), authorization.clone()));
 
             let response = match target.as_str() {
-                "registry.example/v2/" => http::Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(
-                        "WWW-Authenticate",
-                        r#"Bearer realm="https://auth.example/token",service="registry.example""#,
-                    )
-                    .body(transport::Body::empty())
-                    .unwrap(),
+                "registry.example/v2/repo/tags/list" if authorization.is_none() => {
+                    http::Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(
+                            "WWW-Authenticate",
+                            r#"Bearer realm="https://auth.example/token",service="registry.example""#,
+                        )
+                        .body(transport::Body::empty())
+                        .unwrap()
+                }
                 "auth.example/token" => http::Response::builder()
                     .status(StatusCode::OK)
                     .body(transport::Body::from(r#"{"token":"transport-token"}"#))
@@ -564,7 +568,7 @@ async fn custom_transport_receives_token_and_registry_requests() {
     assert_eq!(
         *requests.lock().unwrap(),
         vec![
-            ("registry.example/v2/".to_string(), None),
+            ("registry.example/v2/repo/tags/list".to_string(), None),
             (
                 "auth.example/token".to_string(),
                 Some((true, "Sensitive".to_string())),
@@ -613,16 +617,10 @@ async fn custom_constructor_applies_config_without_building_reqwest() {
     assert_eq!(response.tags, vec!["latest"]);
     assert_eq!(
         *requests.lock().unwrap(),
-        vec![
-            (
-                Some("http".to_string()),
-                Some(HeaderValue::from_static("custom-transport-agent")),
-            ),
-            (
-                Some("http".to_string()),
-                Some(HeaderValue::from_static("custom-transport-agent")),
-            ),
-        ]
+        vec![(
+            Some("http".to_string()),
+            Some(HeaderValue::from_static("custom-transport-agent")),
+        )]
     );
 }
 
