@@ -461,19 +461,25 @@ impl Client {
     }
 
     /// Checks if we got a token, if we don't - create it and store it in cache.
+    ///
+    /// Returns an error if the token cannot be obtained.
     async fn get_auth_token(
         &self,
         reference: &Reference,
         op: RegistryOperation,
-    ) -> Option<RegistryTokenType> {
+    ) -> Result<Option<RegistryTokenType>> {
         let registry = reference.resolve_registry();
-        let auth = self.auth_store.read().await.get(registry)?.clone();
+        let Some(auth) = self.auth_store.read().await.get(registry).cloned() else {
+            return Ok(None);
+        };
         match self.tokens.get(reference, op).await {
-            Some(token) => Some(token),
+            Some(token) => Ok(Some(token)),
             None => {
-                let token = self._auth(reference, &auth, op).await.ok()??;
+                let Some(token) = self._auth(reference, &auth, op).await? else {
+                    return Ok(None);
+                };
                 self.tokens.insert(reference, op, token.clone()).await;
-                Some(token)
+                Ok(Some(token))
             }
         }
     }
@@ -2498,7 +2504,7 @@ impl<'a> RequestBuilderWrapper<'a> {
             return Ok(self);
         }
 
-        let Some(token) = self.client.get_auth_token(image, op).await else {
+        let Some(token) = self.client.get_auth_token(image, op).await? else {
             return Ok(self);
         };
         let authorization = match token {
