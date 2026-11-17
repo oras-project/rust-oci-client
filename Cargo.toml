@@ -38,13 +38,13 @@ test-registry = []
 [dependencies]
 base64 = "0.23"
 bytes = "1"
-chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = { package = "const-hex", version = "1.19.3", default-features = false, features = ["std"] }
 http = "1.3"
 http-auth = { version = "0.1", default-features = false }
 http-body = "1"
 http-body-util = "0.1"
+jiff = { version = "1", default-features = false, features = ["std", "serde"] }
 oci-spec = "0.10"
 olpc-cjson = "0.1"
 regex = "1.11"
