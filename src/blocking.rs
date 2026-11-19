@@ -47,6 +47,16 @@
 //! calling thread to the background thread. At most a few chunks sit in
 //! memory at once.
 //!
+//! Both push methods read nothing from the reader until the upload asks
+//! for the first chunk. The upload asks for the first chunk only after
+//! the registry accepts the request that opens the upload. If this
+//! request fails, the method returns its error and does not read from
+//! the reader.
+//!
+//! Another thread cannot interrupt a blocking `read` call. Because of
+//! this, after the first read, a failure on the background thread
+//! reaches the caller only after the current `read` call returns.
+//!
 //! This client has no version of [`crate::Client::pull_blob_stream_partial`].
 //! That API can return a partial response, and a partial response does
 //! not fit [`BlobReader`] the way a full response does.
@@ -65,7 +75,6 @@ use std::io::{Read, Write};
 
 use bytes::Bytes;
 use http::HeaderValue;
-use tokio::sync::mpsc;
 use tower::Service;
 
 pub use crate::client::{
@@ -296,6 +305,12 @@ impl Client {
     /// chunks sit in memory at once. See the [module documentation](self)
     /// for details.
     ///
+    /// This method does not read from `reader` until the upload asks for
+    /// the first chunk. The upload asks for the first chunk only after the
+    /// registry accepts the request that opens the upload. If this
+    /// request fails, this method returns its error and does not read
+    /// from `reader`.
+    ///
     /// `size` must be `Some` when the client's
     /// [`ClientConfig::use_monolithic_push`] is set. A monolithic push
     /// needs the `Content-Length` header up front, and `reader` cannot
@@ -320,14 +335,11 @@ impl Client {
         let mode = self.inner.push_mode(size)?;
         let (image_ref, digest, inner) =
             (image_ref.clone(), digest.to_string(), self.inner.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes>>(blob_io::BLOB_CHANNEL_CAPACITY);
-        let handle = self.rt.spawn(async move {
+        blob_io::upload_from_reader(&self.rt, reader, move |input| async move {
             inner
-                .push_blob_stream_with_mode(&image_ref, blob_io::receiver_stream(rx), &digest, mode)
+                .push_blob_stream_with_mode(&image_ref, input, &digest, mode)
                 .await
-        });
-        blob_io::feed_reader_to_channel(reader, tx);
-        handle.wait()
+        })
     }
 
     /// Pushes a blob to the registry. It reads the blob from `reader` and
@@ -335,9 +347,9 @@ impl Client {
     ///
     /// This method wraps [`crate::Client::push_blob_stream_chunked`]. See
     /// [`Client::push_blob_from_read`] for how `reader` connects to the
-    /// background thread. This method always sends the blob as a series
-    /// of chunked PATCH requests. It ignores the client's
-    /// `use_monolithic_push` setting.
+    /// background thread, and for the time of the first read. This
+    /// method always sends the blob as a series of chunked PATCH
+    /// requests. It ignores the client's `use_monolithic_push` setting.
     ///
     /// Returns the pullable location of the blob, the computed digest,
     /// and the blob size.
@@ -347,14 +359,9 @@ impl Client {
         reader: R,
     ) -> Result<PushBlobStreamChunkedResponse> {
         let (image_ref, inner) = (image_ref.clone(), self.inner.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes>>(blob_io::BLOB_CHANNEL_CAPACITY);
-        let handle = self.rt.spawn(async move {
-            inner
-                .push_blob_stream_chunked(&image_ref, blob_io::receiver_stream(rx))
-                .await
-        });
-        blob_io::feed_reader_to_channel(reader, tx);
-        handle.wait()
+        blob_io::upload_from_reader(&self.rt, reader, move |input| async move {
+            inner.push_blob_stream_chunked(&image_ref, input).await
+        })
     }
 
     /// Perform an OAuth v2 auth request if necessary.

@@ -911,6 +911,74 @@ fn blocking_push_blob_from_read_monolithic_without_size_does_not_read() {
     assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
 
+/// A blocking push method, for
+/// [`blocking_push_does_not_read_when_the_upload_cannot_start`].
+#[cfg(feature = "blocking")]
+#[derive(Debug, Clone, Copy)]
+enum BlockingPush {
+    /// `push_blob_from_read`, with a chunked upload.
+    Chunked,
+    /// `push_blob_from_read`, with `use_monolithic_push` and a size.
+    Monolithic,
+    /// `push_blob_from_read_chunked`, which computes the digest.
+    ComputedDigest,
+}
+
+/// When the registry rejects the request that opens the upload, the
+/// blocking push methods return that error. They do not read from the
+/// reader. If the reader is an idle pipe or socket, a read can block the
+/// caller forever, after the upload failed. Another thread cannot
+/// interrupt this read.
+#[cfg(feature = "blocking")]
+#[rstest]
+#[case::push_blob_from_read(BlockingPush::Chunked)]
+#[case::push_blob_from_read_monolithic(BlockingPush::Monolithic)]
+#[case::push_blob_from_read_chunked(BlockingPush::ComputedDigest)]
+fn blocking_push_does_not_read_when_the_upload_cannot_start(#[case] push: BlockingPush) {
+    let service = tower::service_fn(|request: transport::Request| async move {
+        assert_eq!(request.method(), Method::POST);
+        Ok::<_, Infallible>(
+            http::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(transport::Body::empty())
+                .unwrap(),
+        )
+    });
+    let client = oci_client::blocking::Client::new_with_transport(
+        ClientConfig {
+            use_monolithic_push: matches!(push, BlockingPush::Monolithic),
+            ..Default::default()
+        },
+        service,
+    );
+    let reference = Reference::try_from("registry.example/repo:latest").unwrap();
+
+    struct NeverRead;
+    impl std::io::Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the push must not read the reader when the upload cannot start")
+        }
+    }
+
+    let result = match push {
+        BlockingPush::Chunked => client
+            .push_blob_from_read(&reference, NeverRead, BLOB_DIGEST, None)
+            .map(drop),
+        BlockingPush::Monolithic => client
+            .push_blob_from_read(&reference, NeverRead, BLOB_DIGEST, Some(BLOB.len() as u64))
+            .map(drop),
+        BlockingPush::ComputedDigest => client
+            .push_blob_from_read_chunked(&reference, NeverRead)
+            .map(drop),
+    };
+    let error = result.expect_err("expected the error of the request that opens the upload");
+
+    assert!(
+        matches!(error, OciDistributionError::ServerError { code: 500, .. }),
+        "{error:?}"
+    );
+}
+
 /// [`Client::pull_blob_read`] reports `content_length` before the first
 /// byte. It then returns the blob across more than one `read` call, as
 /// the data arrives in more than one piece.

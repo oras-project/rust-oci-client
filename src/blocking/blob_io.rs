@@ -10,7 +10,10 @@
 //! For a push, the calling thread's [`std::io::Read`] fills a bounded
 //! channel. The background thread drains it, and sends the chunks to
 //! the registry. Memory use stays at a few chunks, not the whole blob.
+//! The calling thread starts to read only after the upload asks for the
+//! first chunk. See [`upload_from_reader`].
 
+use std::future::Future;
 use std::io::Read;
 
 use bytes::{Buf, Bytes};
@@ -28,7 +31,7 @@ use super::wait;
 /// thread and the background runtime during a push. Bounds the memory
 /// `Client::push_blob_from_read` and `Client::push_blob_from_read_chunked`
 /// use to about `BLOB_CHANNEL_CAPACITY` chunks, not the whole blob.
-pub(super) const BLOB_CHANNEL_CAPACITY: usize = 8;
+const BLOB_CHANNEL_CAPACITY: usize = 8;
 
 /// The size of the buffer [`feed_reader_to_channel`] uses to read from
 /// the caller's [`std::io::Read`]. Each read fills one buffer, then
@@ -198,7 +201,7 @@ pub(super) fn io_error_to_oci(error: std::io::Error) -> OciDistributionError {
 ///
 /// This crate does not depend on `tokio-stream`, which gives the same
 /// kind of wrapper. `unfold` does the same job for this one use.
-pub(super) fn receiver_stream<T: Send + 'static>(
+fn receiver_stream<T: Send + 'static>(
     rx: mpsc::Receiver<T>,
 ) -> impl futures_util::Stream<Item = T> + Send + 'static {
     futures_util::stream::unfold(rx, |mut rx| async move {
@@ -208,9 +211,8 @@ pub(super) fn receiver_stream<T: Send + 'static>(
 
 /// Reads `reader` on the calling thread, in fixed-size chunks. Sends each
 /// chunk to `tx`. When the channel is full, this function waits. This
-/// keeps memory use bounded. `Client::push_blob_from_read` and
-/// `Client::push_blob_from_read_chunked` pair this function with
-/// [`receiver_stream`] on the background thread.
+/// keeps memory use bounded. [`upload_from_reader`] pairs this function
+/// with [`receiver_stream`] on the background thread.
 ///
 /// A read that fails with [`std::io::ErrorKind::Interrupted`] reads
 /// again, as [`std::io::copy`] does. Every other error goes to `tx`,
@@ -219,7 +221,7 @@ pub(super) fn receiver_stream<T: Send + 'static>(
 /// In that case, no one reads the error this function sends. The caller
 /// still sees the background task's own error, through the result
 /// handle's `wait`.
-pub(super) fn feed_reader_to_channel<R: Read>(mut reader: R, tx: mpsc::Sender<Result<Bytes>>) {
+fn feed_reader_to_channel<R: Read>(mut reader: R, tx: mpsc::Sender<Result<Bytes>>) {
     let mut buf = vec![0u8; READ_CHUNK_SIZE];
     loop {
         match reader.read(&mut buf) {
@@ -246,6 +248,96 @@ pub(super) fn feed_reader_to_channel<R: Read>(mut reader: R, tx: mpsc::Sender<Re
             }
         }
     }
+}
+
+/// A message from the upload task to [`upload_from_reader`]. The calling
+/// thread waits for the first message before it reads from the caller's
+/// [`std::io::Read`].
+enum UploadSignal {
+    /// The upload asked for the first chunk.
+    InputRequested,
+    /// The upload task ended. Three cases are possible: the task
+    /// finished, the task panicked, or the runtime dropped the task.
+    Finished,
+}
+
+/// Sends [`UploadSignal::Finished`] at its drop. The upload task owns
+/// this guard. The guard drops in all three cases that
+/// [`UploadSignal::Finished`] lists.
+struct SignalFinishedOnDrop(std::sync::mpsc::Sender<UploadSignal>);
+
+impl Drop for SignalFinishedOnDrop {
+    fn drop(&mut self) {
+        // If this send fails, `upload_from_reader` already returned. No
+        // one waits for the signal then.
+        let _ = self.0.send(UploadSignal::Finished);
+    }
+}
+
+/// Runs an upload on the background thread, and feeds it the bytes of
+/// `reader` from the calling thread.
+///
+/// The `upload` closure gets the input stream. It returns the future that
+/// sends this stream to the registry. This future runs on `runtime`. The
+/// calling thread reads `reader` with [`feed_reader_to_channel`].
+///
+/// The calling thread does not read from `reader` until the upload asks
+/// for the first chunk. To ask for the first chunk, the upload polls its
+/// input stream for the first time. The upload does this only after the
+/// registry accepts the request that opens the upload. If the upload
+/// ends before that, this function returns the result of the upload and
+/// does not read from `reader`.
+///
+/// Another thread cannot interrupt a blocking `read` call. Without this
+/// wait, a read from an idle pipe or socket can block the caller forever,
+/// after the upload failed.
+///
+/// The upload task also sends a signal at its end. If a transport keeps
+/// the input stream alive but never polls it, this signal still ends the
+/// wait.
+///
+/// After the first read, a failure of the upload reaches the caller only
+/// after the current `read` call returns.
+pub(super) fn upload_from_reader<R, U, F>(
+    runtime: &BackgroundRuntime,
+    reader: R,
+    upload: U,
+) -> F::Output
+where
+    R: Read,
+    U: FnOnce(BoxStream<'static, Result<Bytes>>) -> F,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes>>(BLOB_CHANNEL_CAPACITY);
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    // `once` runs this future at the first poll of the input stream, and
+    // not before.
+    let input_requested = signal_tx.clone();
+    let input = futures_util::stream::once(async move {
+        let _ = input_requested.send(UploadSignal::InputRequested);
+        receiver_stream(rx)
+    })
+    .flatten()
+    .boxed();
+
+    let finished = SignalFinishedOnDrop(signal_tx);
+    let upload = upload(input);
+    let handle = runtime.spawn(async move {
+        let _finished = finished;
+        upload.await
+    });
+
+    if let Ok(UploadSignal::InputRequested) = signal_rx.recv() {
+        feed_reader_to_channel(reader, tx);
+    } else {
+        // The upload ended before it asked for the first chunk. A
+        // transport can still hold the input stream. If so, this drop
+        // makes the stream end at its next poll.
+        drop(tx);
+    }
+    handle.wait()
 }
 
 /// An owned [`AsLayerDescriptor`].
@@ -627,6 +719,67 @@ mod tests {
         let items: Vec<u32> = rt.block_on(async move { receiver_stream(rx).collect().await });
 
         assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    /// A reader that fails the test on any read.
+    struct UnreadableReader;
+
+    impl Read for UnreadableReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the reader must not be read before the upload asks for input")
+        }
+    }
+
+    /// The upload drops its input stream without a poll. If the request
+    /// that opens the upload fails, a real upload does the same.
+    /// `upload_from_reader` must return the result of the upload, and
+    /// must not read from the reader.
+    #[test]
+    fn upload_from_reader_does_not_read_when_the_upload_drops_its_input() {
+        let rt = BackgroundRuntime::new().expect("failed to start the background runtime");
+
+        let result = upload_from_reader(&rt, UnreadableReader, |input| async move {
+            drop(input);
+            "upload failed"
+        });
+
+        assert_eq!(result, "upload failed");
+    }
+
+    /// A transport can return a response, keep the request body alive,
+    /// and never poll the body. In that case, the upload ends while its
+    /// input stream is still alive. `upload_from_reader` must not wait
+    /// for a poll that never comes.
+    #[test]
+    fn upload_from_reader_does_not_read_when_the_upload_ends_but_keeps_its_input() {
+        let rt = BackgroundRuntime::new().expect("failed to start the background runtime");
+
+        let result = upload_from_reader(&rt, UnreadableReader, |input| async move {
+            std::mem::forget(input);
+            "upload failed"
+        });
+
+        assert_eq!(result, "upload failed");
+    }
+
+    #[test]
+    fn upload_from_reader_feeds_the_reader_once_the_upload_polls_its_input() {
+        let rt = BackgroundRuntime::new().expect("failed to start the background runtime");
+        let data = vec![7u8; READ_CHUNK_SIZE + 1];
+
+        let uploaded = upload_from_reader(
+            &rt,
+            std::io::Cursor::new(data.clone()),
+            |mut input| async move {
+                let mut uploaded = Vec::new();
+                while let Some(chunk) = input.next().await {
+                    uploaded.extend_from_slice(&chunk.expect("unexpected error item"));
+                }
+                uploaded
+            },
+        );
+
+        assert_eq!(uploaded, data);
     }
 
     #[test]
