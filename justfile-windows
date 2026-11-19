@@ -5,5 +5,5 @@ build +FLAGS='--no-default-features --features rustls-tls':
 
 test:
     cargo fmt --all -- --check
-    cargo clippy --no-default-features --features rustls-tls
-    cargo test --no-default-features --features rustls-tls
+    cargo clippy --no-default-features --features rustls-tls,blocking
+    cargo test --no-default-features --features rustls-tls,blocking

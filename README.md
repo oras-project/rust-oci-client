@@ -69,6 +69,46 @@ fields, the proxies and the timeouts. With a custom transport, the client
 ignores them. The client uses all the other fields, for example `protocol` and
 `user_agent`.
 
+## Blocking client
+
+`oci_client::blocking::Client` mirrors `Client` for synchronous Rust code.
+The `blocking` feature enables it.
+
+Each method runs the matching call on an async `Client`. It runs that
+call on one background thread. Then it waits for the result.
+`reqwest::blocking` uses the same approach on top of `reqwest`.
+
+As a result, the blocking client accepts a custom transport, the same
+way the async client does. Use `blocking::Client::new_with_transport` to
+set it.
+
+The blocking client has no version of `pull_blob_stream_partial`. That
+method needs an async runtime to run its response body.
+
+`blocking::Client::pull_blob_read` covers `pull_blob_stream`. It returns
+a type that implements `Read`, with the content length and the digest
+header ready before the first byte. `blocking::Client::pull_blob` is
+`std::io::copy` over that type, for a simpler `Write`-based call. The
+[`blocking-pull-layer`](examples/blocking-pull-layer/main.rs) example
+uses `pull_blob_read` to show progress against the content length while
+it writes a layer to a file. Run it with this command:
+
+```sh
+cargo run --features blocking --example blocking-pull-layer -- docker.io/library/hello-world:latest
+```
+
+`blocking::Client::push_blob_from_read` covers `push_blob_stream`. It
+reads a plain `Read` on the calling thread, instead of a `Stream`.
+
+None of these three methods buffers the whole blob in memory. A
+`BlobReader` polls the response body on the calling thread, the way
+`reqwest::blocking::Response` does. The push methods send chunks to the
+background thread through a bounded channel. `ClientConfig::read_timeout`
+and `connect_timeout` work as they do for the async client.
+
+Do not call this client from async code. Like `reqwest::blocking`, each
+method call blocks one OS thread until the request finishes.
+
 ## Code of Conduct
 
 This project has adopted the [CNCF Code of

@@ -23,6 +23,20 @@ version = "0.19.0"
 [badges]
 maintenance = { status = "actively-developed" }
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "blocking-get-manifest"
+path = "examples/blocking-get-manifest/main.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "blocking-pull-layer"
+path = "examples/blocking-pull-layer/main.rs"
+required-features = ["blocking"]
+
 [features]
 default = ["rustls-tls", "test-registry"]
 native-tls = ["reqwest/native-tls"]
@@ -32,6 +46,10 @@ rustls-tls = ["reqwest/rustls"]
 # with `rustls::crypto::ring::default_provider().install_default()`.
 rustls-tls-no-provider = ["reqwest/rustls-no-provider"]
 hickory-dns = ["reqwest/hickory-dns"]
+# Enables a synchronous client, `oci_client::blocking`, built as a thin
+# wrapper around the async `Client`. It runs the async client on a
+# dedicated background thread.
+blocking = ["dep:tokio"]
 # This features is used by tests that use docker to create a registry
 test-registry = []
 
@@ -64,6 +82,16 @@ unicase = "2.8"
 url = "2"
 web-time = "1"
 
+# Gives `tokio::runtime` to the background thread of the blocking client
+# (`blocking::background_runtime`).
+#
+# This dependency applies only to non-wasm32 targets. A wasm32 build
+# cannot use the `blocking` feature. It has no OS threads, and `lib.rs`
+# blocks that combination with a `compile_error!`. Wasm32 also lacks
+# Tokio's `net` driver, which the background thread needs too.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", optional = true, features = ["rt", "net", "time"] }
+
 # The default transport on `wasm32-unknown-unknown` uses the Fetch API of the
 # browser, see `transport::browser`. The condition is the one that reqwest uses
 # to select its browser backend.
@@ -92,7 +120,7 @@ rustls = "0.23"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # This should stay pinned here until testcontainers makes sure all of its deps using rustls are
 # using the ring feature. Otherwise this fails to compile on Windows
-testcontainers = "0.28"
+testcontainers = { version = "0.28", features = ["blocking"] }
 tokio = { version = "1", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["compat", "io"] }
 tower-http = { version = "0.6", default-features = false, features = [
