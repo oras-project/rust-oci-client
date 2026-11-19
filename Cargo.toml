@@ -76,6 +76,13 @@ assert-json-diff = "2.0"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
+# Makes the RSA key and the certificate of the token service in the tests of
+# registries with token authentication. The `aws_lc_rs` backend can generate
+# RSA keys, and `hyper-rustls` already brings it in.
+rcgen = { version = "0.14", default-features = false, features = [
+  "aws_lc_rs",
+  "pem",
+] }
 rstest = "0.28"
 docker_credential = "1.3"
 hmac = "0.13"

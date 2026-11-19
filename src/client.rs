@@ -39,7 +39,9 @@ use crate::manifest::{
 };
 use crate::secrets::RegistryAuth;
 use crate::sha256_digest;
-use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
+use crate::token_cache::{
+    merge_scopes, scopes_for, RegistryOperation, RegistryToken, RegistryTokenType, TokenCache,
+};
 use crate::transport::{self, Transport};
 use crate::Reference;
 
@@ -435,6 +437,15 @@ impl Client {
         RequestBuilderWrapper::from_client(self, method, url)
     }
 
+    /// Sends `request` through the transport of the client.
+    async fn send_request(&self, request: transport::Request) -> Result<transport::Response> {
+        self.transport
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(transport::into_oci_error)
+    }
+
     async fn store_auth(&self, registry: &str, auth: RegistryAuth) {
         self.auth_store
             .write()
@@ -460,22 +471,86 @@ impl Client {
         }
     }
 
-    /// Checks if we got a token, if we don't - create it and store it in cache.
-    async fn get_auth_token(
-        &self,
-        reference: &Reference,
-        op: RegistryOperation,
-    ) -> Option<RegistryTokenType> {
-        let registry = reference.resolve_registry();
-        let auth = self.auth_store.read().await.get(registry)?.clone();
-        match self.tokens.get(reference, op).await {
+    /// Returns what the client already holds to authenticate a request that needs
+    /// `scopes` at `registry`: a bearer token for these scopes, or the HTTP Basic
+    /// credentials that the registry accepted before.
+    async fn cached_token(&self, registry: &str, scopes: &[String]) -> Option<RegistryTokenType> {
+        match self.tokens.get_for_scopes(registry, scopes).await {
             Some(token) => Some(token),
-            None => {
-                let token = self._auth(reference, &auth, op).await.ok()??;
-                self.tokens.insert(reference, op, token.clone()).await;
-                Some(token)
-            }
+            None => self.tokens.get_for_scopes(registry, &[]).await,
         }
+    }
+
+    /// Answers the challenge in `headers`, the headers of a `401 Unauthorized`
+    /// response to a request that carried the `sent` `Authorization` header.
+    ///
+    /// Returns the `Authorization` header to send the request again with. Returns
+    /// `None` if the client has nothing more to offer than what it sent.
+    ///
+    /// For a bearer challenge, the token covers the scopes that the client expected
+    /// the request to need and the scopes that the registry names in the challenge.
+    /// Returns an error if the token service refuses the token.
+    async fn answer_challenge(
+        &self,
+        auth: &RequestAuth,
+        headers: &HeaderMap,
+        sent: Option<&HeaderValue>,
+    ) -> Result<Option<HeaderValue>> {
+        // A token that the caller supplied cannot be exchanged for another one.
+        if let RegistryAuth::Bearer(_) = auth.credentials {
+            return Ok(None);
+        }
+        let Some(header) = headers.get(WWW_AUTHENTICATE) else {
+            return Ok(None);
+        };
+
+        let challenge = match BearerChallenge::try_from(header) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                debug!(error = ?e, "Falling back to HTTP Basic Auth");
+                let RegistryAuth::Basic(username, password) = &auth.credentials else {
+                    return Ok(None);
+                };
+                let authorization = basic_authorization(username, password)?;
+                if sent == Some(&authorization) {
+                    // The registry refused these credentials.
+                    return Ok(None);
+                }
+                let token = RegistryTokenType::Basic(username.clone(), password.clone());
+                self.tokens
+                    .insert_for_scopes(&auth.registry, &[], token)
+                    .await;
+                return Ok(Some(authorization));
+            }
+        };
+
+        let challenged = challenge
+            .scope
+            .iter()
+            .flat_map(|scope| scope.split_whitespace())
+            .map(String::from);
+        let scopes = merge_scopes(auth.scopes.iter().cloned().chain(challenged));
+
+        // If the registry requires more than the client expected, the client did not
+        // look for a token under these scopes before it sent the request.
+        let cached = if scopes == auth.scopes {
+            None
+        } else {
+            self.tokens.get_for_scopes(&auth.registry, &scopes).await
+        };
+        let token = match cached {
+            Some(token) => token,
+            None => {
+                let token = self
+                    .fetch_token(&challenge, &scopes, &auth.credentials)
+                    .await?;
+                self.tokens
+                    .insert_for_scopes(&auth.registry, &scopes, token.clone())
+                    .await;
+                token
+            }
+        };
+        token_authorization(&token).map(Some)
     }
 
     /// Fetches the available Tags for the given Reference
@@ -883,23 +958,39 @@ impl Client {
         };
 
         // Allow for either push or pull authentication
-        let scope = match operation {
-            RegistryOperation::Pull => format!("repository:{}:pull", image.repository()),
-            RegistryOperation::Push => format!("repository:{}:pull,push", image.repository()),
-        };
+        let scopes = scopes_for(image, operation);
+        let token = self
+            .fetch_token(&challenge, &scopes, authentication)
+            .await?;
+        debug!("Successfully authorized for image '{:?}'", image);
+        Ok(Some(token))
+    }
 
+    /// Asks the token service that `challenge` names for a token that covers `scopes`.
+    async fn fetch_token(
+        &self,
+        challenge: &BearerChallenge,
+        scopes: &[String],
+        authentication: &RegistryAuth,
+    ) -> Result<RegistryTokenType> {
         let realm = challenge.realm.as_ref();
         let service = challenge.service.as_ref();
 
         // TODO: At some point in the future, we should support sending a secret to the
         // server for auth. This particular workflow is for read-only public auth.
-        debug!(?realm, ?service, ?scope, "Making authentication call");
+        debug!(?realm, ?service, ?scopes, "Making authentication call");
 
-        let mut request = self.request(Method::GET, realm)?.query("scope", &scope);
+        let mut request = self.request(Method::GET, realm)?;
+        for scope in scopes {
+            request = request.query("scope", scope);
+        }
         if let Some(service) = service {
             request = request.query("service", service);
         }
-        let auth_res = request.apply_credentials(authentication)?.send().await?;
+        let auth_res = request
+            .apply_credentials(authentication)?
+            .send_once()
+            .await?;
 
         match auth_res.status() {
             StatusCode::OK => {
@@ -907,12 +998,11 @@ impl Client {
                 debug!("Received response from auth request");
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
-                debug!("Successfully authorized for image '{:?}'", image);
-                Ok(Some(RegistryTokenType::Bearer(token)))
+                Ok(RegistryTokenType::Bearer(token))
             }
             _ => {
                 let reason = response_text(auth_res).await?;
-                debug!("Failed to authenticate for image '{:?}': {}", image, reason);
+                debug!(?scopes, "Failed to authenticate: {}", reason);
                 Err(OciDistributionError::AuthenticationFailure(reason))
             }
         }
@@ -2035,7 +2125,6 @@ impl Client {
         n: Option<usize>,
         last: Option<&str>,
     ) -> Result<CatalogResponse> {
-        let op = RegistryOperation::Pull;
         let url = self.to_catalog_url(image);
 
         self.store_auth_if_needed(image.resolve_registry(), auth)
@@ -2048,7 +2137,11 @@ impl Client {
         if let Some(last) = last {
             request = request.query("last", last);
         }
-        let res = request.apply_auth(image, op).await?.send().await?;
+        let res = request
+            .apply_auth_for_scopes(image, vec![CATALOG_SCOPE.to_string()])
+            .await?
+            .send()
+            .await?;
         let status = res.status();
         let effective_url = response_url(&res, &url);
         let body = transport::collect(res.into_body()).await?;
@@ -2301,6 +2394,10 @@ fn content_length_header(headers: &HeaderMap) -> Option<u64> {
     headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
 }
 
+/// The scope that the client expects the catalog to need. Registries do not agree on
+/// the scope of the catalog, so the challenge of the registry can name another one.
+const CATALOG_SCOPE: &str = "registry:catalog:*";
+
 /// Returns an empty OCI Image Index, as used when no referrers exist.
 fn empty_image_index() -> OciImageIndex {
     OciImageIndex {
@@ -2376,6 +2473,18 @@ struct RequestBuilderWrapper<'a> {
     url: Url,
     builder: http::request::Builder,
     body: transport::Body,
+    /// How to answer a challenge of the registry. `None` for a request that
+    /// carries no registry credentials.
+    auth: Option<RequestAuth>,
+}
+
+/// What a request needs to answer an authentication challenge of the registry.
+struct RequestAuth {
+    registry: String,
+    /// The scopes that the client expects the request to need.
+    scopes: Vec<String>,
+    /// The credentials that the client holds for the registry.
+    credentials: RegistryAuth,
 }
 
 impl<'a> RequestBuilderWrapper<'a> {
@@ -2393,6 +2502,7 @@ impl<'a> RequestBuilderWrapper<'a> {
             url,
             builder,
             body: transport::Body::empty(),
+            auth: None,
         })
     }
 
@@ -2481,12 +2591,24 @@ impl<'a> RequestBuilderWrapper<'a> {
     ///
     /// If the client has a bearer token for `image` and `op`, this function
     /// puts the token in an `Authorization` header. If the client has HTTP
-    /// Basic Auth credentials, this function puts them in that header.
+    /// Basic Auth credentials that the registry accepted before, this function
+    /// puts them in that header. Otherwise the request goes out without
+    /// credentials, and [`Self::send`] answers the challenge of the registry.
     ///
     /// If the request goes to a host that is not the registry of the
     /// credentials, this function does not add credentials. Refer to
     /// [`Self::targets_credential_registry`].
     async fn apply_auth(self, image: &Reference, op: RegistryOperation) -> Result<Self> {
+        self.apply_auth_for_scopes(image, scopes_for(image, op))
+            .await
+    }
+
+    /// Like [`Self::apply_auth`], for a request that is expected to need `scopes`.
+    async fn apply_auth_for_scopes(
+        mut self,
+        image: &Reference,
+        scopes: Vec<String>,
+    ) -> Result<Self> {
         // NOTE: we must not authenticate requests addressed outside of the
         // registry, as those can be abused to leak credentials or tokens.
         // Please refer to CVE-2020-15157 for more information.
@@ -2498,20 +2620,26 @@ impl<'a> RequestBuilderWrapper<'a> {
             return Ok(self);
         }
 
-        let Some(token) = self.client.get_auth_token(image, op).await else {
+        let registry = image.resolve_registry();
+        let Some(credentials) = self.client.auth_store.read().await.get(registry).cloned() else {
             return Ok(self);
         };
-        let authorization = match token {
-            RegistryTokenType::Bearer(token) => {
-                debug!("Using bearer token authentication.");
-                bearer_authorization(token.token())?
-            }
-            RegistryTokenType::Basic(username, password) => {
-                debug!("Using HTTP basic authentication.");
-                basic_authorization(&username, &password)?
-            }
+        let authorization = match &credentials {
+            RegistryAuth::Bearer(token) => Some(bearer_authorization(token)?),
+            _ => match self.client.cached_token(registry, &scopes).await {
+                Some(token) => Some(token_authorization(&token)?),
+                None => None,
+            },
         };
-        Ok(self.header(AUTHORIZATION, authorization))
+        self.auth = Some(RequestAuth {
+            registry: registry.to_string(),
+            scopes,
+            credentials,
+        });
+        Ok(match authorization {
+            Some(authorization) => self.header(AUTHORIZATION, authorization),
+            None => self,
+        })
     }
 
     /// Builds the request.
@@ -2523,15 +2651,70 @@ impl<'a> RequestBuilderWrapper<'a> {
     }
 
     /// Sends the request through the transport of the client.
-    async fn send(self) -> Result<transport::Response> {
+    ///
+    /// If the registry answers a request that [`Self::apply_auth`] prepared with
+    /// `401 Unauthorized`, this function answers the challenge of the registry and
+    /// sends the request one more time. A request with a streamed body cannot be
+    /// sent again: the function then returns the `401 Unauthorized` response.
+    async fn send(mut self) -> Result<transport::Response> {
+        let Some(auth) = self.auth.take() else {
+            return self.send_once().await;
+        };
+        let client = self.client;
+        let (parts, body) = self.build()?.into_parts();
+        let again = body.try_clone();
+
+        let response = client.send_request(request_from(&parts, body)).await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let sent = parts.headers.get(AUTHORIZATION);
+        let Some(authorization) = client
+            .answer_challenge(&auth, response.headers(), sent)
+            .await?
+        else {
+            return Ok(response);
+        };
+        let Some(body) = again else {
+            debug!("Not sending a request with a streamed body again");
+            return Ok(response);
+        };
+
+        let mut request = request_from(&parts, body);
+        request.headers_mut().insert(AUTHORIZATION, authorization);
+        client.send_request(request).await
+    }
+
+    /// Sends the request through the transport of the client, and returns the
+    /// response whatever its status is.
+    async fn send_once(self) -> Result<transport::Response> {
         let client = self.client;
         let request = self.build()?;
-        client
-            .transport
-            .clone()
-            .oneshot(request)
-            .await
-            .map_err(transport::into_oci_error)
+        client.send_request(request).await
+    }
+}
+
+/// Builds a request with `body` from the parts of another request.
+fn request_from(parts: &http::request::Parts, body: transport::Body) -> transport::Request {
+    let mut request = http::Request::new(body);
+    *request.method_mut() = parts.method.clone();
+    *request.uri_mut() = parts.uri.clone();
+    *request.version_mut() = parts.version;
+    *request.headers_mut() = parts.headers.clone();
+    request
+}
+
+/// Builds the value of an `Authorization` header for a token of the token cache.
+fn token_authorization(token: &RegistryTokenType) -> Result<HeaderValue> {
+    match token {
+        RegistryTokenType::Bearer(token) => {
+            debug!("Using bearer token authentication.");
+            bearer_authorization(token.token())
+        }
+        RegistryTokenType::Basic(username, password) => {
+            debug!("Using HTTP basic authentication.");
+            basic_authorization(username, password)
+        }
     }
 }
 
@@ -2775,6 +2958,8 @@ impl ClientProtocol {
 struct BearerChallenge {
     pub realm: Box<str>,
     pub service: Option<String>,
+    /// The scopes that the registry requires, separated by spaces.
+    pub scope: Option<String>,
 }
 
 impl TryFrom<&HeaderValue> for BearerChallenge {
@@ -2812,6 +2997,7 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
         }
         let mut realm = None;
         let mut service = None;
+        let mut scope = None;
         for (k, v) in &value.params {
             if k.eq_ignore_ascii_case("realm") {
                 realm = Some(v.to_unescaped());
@@ -2820,6 +3006,10 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
             if k.eq_ignore_ascii_case("service") {
                 service = Some(v.to_unescaped());
             }
+
+            if k.eq_ignore_ascii_case("scope") {
+                scope = Some(v.to_unescaped());
+            }
         }
 
         let realm = realm.ok_or("missing required parameter realm")?;
@@ -2827,6 +3017,7 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
         Ok(BearerChallenge {
             realm: realm.into_boxed_str(),
             service,
+            scope,
         })
     }
 }

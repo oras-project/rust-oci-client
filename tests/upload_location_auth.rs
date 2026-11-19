@@ -58,26 +58,35 @@ fn registry(challenge: Challenge, location: String, seen: Seen) -> Router {
         get(|| async { format!(r#"{{"token":"{BEARER_TOKEN}"}}"#) }),
     );
 
+    // The `401 Unauthorized` response of the registry to a request without credentials.
+    let unauthorized = move |headers: &HeaderMap| {
+        let www_authenticate = match challenge {
+            Challenge::Basic => "Basic realm=\"registry\"".to_string(),
+            Challenge::Bearer => {
+                let host = headers.get("Host").unwrap().to_str().unwrap();
+                format!("Bearer realm=\"http://{host}/token\",service=\"registry\"")
+            }
+        };
+        (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", www_authenticate)],
+        )
+    };
+
     Router::new()
         .route(
             "/v2/",
-            get(move |headers: HeaderMap| async move {
-                let www_authenticate = match challenge {
-                    Challenge::Basic => "Basic realm=\"registry\"".to_string(),
-                    Challenge::Bearer => {
-                        let host = headers.get("Host").unwrap().to_str().unwrap();
-                        format!("Bearer realm=\"http://{host}/token\",service=\"registry\"")
-                    }
-                };
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [("WWW-Authenticate", www_authenticate)],
-                )
-            }),
+            get(move |headers: HeaderMap| async move { unauthorized(&headers) }),
         )
         .route(
             "/v2/repo/blobs/uploads/",
-            post(|| async { (StatusCode::ACCEPTED, [("Location", location)]) }),
+            post(move |headers: HeaderMap| async move {
+                if headers.contains_key("Authorization") {
+                    (StatusCode::ACCEPTED, [("Location", location)])
+                } else {
+                    unauthorized(&headers)
+                }
+            }),
         )
         .route("/upload", any(upload_session))
         .merge(token_endpoint)
