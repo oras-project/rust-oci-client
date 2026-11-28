@@ -16,6 +16,9 @@ pub enum OciDistributionError {
     /// An error occurred with a digest operation
     #[error("Digest error: {0}")]
     DigestError(#[from] DigestError),
+    /// The operation needs a reference by digest, and the reference has none
+    #[error("Reference {0} has no digest, and this operation requires one")]
+    DigestRequired(String),
     /// Generic error, might provide an explanation message
     #[error("Generic error: {0:?}")]
     GenericError(Option<String>),
